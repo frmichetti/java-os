@@ -1,0 +1,151 @@
+use core::cell::UnsafeCell;
+use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+const COM1_BASE: u16 = 0x3F8;
+
+#[inline(always)]
+unsafe fn outb(port: u16, val: u8) {
+    unsafe {
+        core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
+    }
+}
+
+#[inline(always)]
+unsafe fn inb(port: u16) -> u8 {
+    let val: u8;
+    unsafe {
+        core::arch::asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack, preserves_flags));
+    }
+    val
+}
+
+/// Driver mínimo para a UART 16550 (porta serial COM1), usado como canal
+/// primário de saída de boot — é trivialmente capturável pelo QEMU sem
+/// depender de framebuffer (ver "Decisões desta Change" em design.md).
+pub struct SerialPort {
+    base: u16,
+}
+
+impl SerialPort {
+    const fn new(base: u16) -> Self {
+        Self { base }
+    }
+
+    fn init(&mut self) {
+        unsafe {
+            outb(self.base + 1, 0x00); // desabilita interrupções da UART
+            outb(self.base + 3, 0x80); // habilita DLAB para configurar o divisor de baud rate
+            outb(self.base, 0x03); // divisor = 3 -> 38400 baud (byte baixo)
+            outb(self.base + 1, 0x00); // divisor (byte alto)
+            outb(self.base + 3, 0x03); // 8 bits, sem paridade, 1 stop bit; desabilita DLAB
+            outb(self.base + 2, 0xC7); // habilita e limpa FIFOs, threshold de 14 bytes
+            outb(self.base + 4, 0x0B); // IRQs habilitadas nos pinos, RTS/DSR ativos
+        }
+    }
+
+    fn line_status(&self) -> u8 {
+        unsafe { inb(self.base + 5) }
+    }
+
+    fn transmitter_empty(&self) -> bool {
+        self.line_status() & 0x20 != 0
+    }
+
+    fn write_byte(&mut self, byte: u8) {
+        while !self.transmitter_empty() {
+            core::hint::spin_loop();
+        }
+        unsafe { outb(self.base, byte) };
+    }
+}
+
+impl Write for SerialPort {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for byte in s.bytes() {
+            if byte == b'\n' {
+                self.write_byte(b'\r');
+            }
+            self.write_byte(byte);
+        }
+        Ok(())
+    }
+}
+
+/// Spinlock mínimo: o kernel é single-core nesta change, mas as estruturas
+/// de dados compartilhadas já nascem `Sync`/`Send`-safe (ver design.md,
+/// seção "1. Arquitetura do Kernel" — Concorrência no kernel) para não
+/// exigir reescrita quando SMP for adicionado.
+pub struct Spinlock<T> {
+    locked: AtomicBool,
+    data: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Sync for Spinlock<T> {}
+
+pub struct SpinlockGuard<'a, T> {
+    lock: &'a Spinlock<T>,
+}
+
+impl<T> Spinlock<T> {
+    pub const fn new(data: T) -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            data: UnsafeCell::new(data),
+        }
+    }
+
+    pub fn lock(&self) -> SpinlockGuard<'_, T> {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        SpinlockGuard { lock: self }
+    }
+}
+
+impl<T> core::ops::Deref for SpinlockGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T> core::ops::DerefMut for SpinlockGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T> Drop for SpinlockGuard<'_, T> {
+    fn drop(&mut self) {
+        self.lock.locked.store(false, Ordering::Release);
+    }
+}
+
+pub static SERIAL1: Spinlock<SerialPort> = Spinlock::new(SerialPort::new(COM1_BASE));
+
+/// Deve ser chamada uma única vez, no início de `kernel_main`, antes de
+/// qualquer uso de `serial_println!`.
+pub fn init() {
+    SERIAL1.lock().init();
+}
+
+#[doc(hidden)]
+pub fn _print(args: fmt::Arguments) {
+    SERIAL1.lock().write_fmt(args).expect("falha ao escrever na porta serial");
+}
+
+#[macro_export]
+macro_rules! serial_print {
+    ($($arg:tt)*) => ($crate::serial::_print(format_args!($($arg)*)));
+}
+
+#[macro_export]
+macro_rules! serial_println {
+    () => ($crate::serial_print!("\n"));
+    ($($arg:tt)*) => ($crate::serial_print!("{}\n", format_args!($($arg)*)));
+}

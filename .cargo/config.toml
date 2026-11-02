@@ -1,0 +1,6 @@
+[unstable]
+json-target-spec = true
+
+[alias]
+xtask = "run --package xtask --"
+kernel-build = "build -p kernel --target x86_64-java_os.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"

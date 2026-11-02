@@ -1,0 +1,41 @@
+name: kernel-ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Instalar dependências de sistema (QEMU, OVMF, ferramentas de imagem)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential qemu-system-x86 ovmf xorriso mtools dosfstools gdisk
+
+      - name: Instalar toolchain Rust pinada (rust-toolchain.toml)
+        run: |
+          rustup show
+          rustc --version
+
+      - name: Vendorizar o Limine (v11.x-binary)
+        run: |
+          mkdir -p boot
+          git clone https://github.com/limine-bootloader/limine.git \
+            --branch v11.x-binary --depth=1 boot/limine
+          make -C boot/limine
+
+      - name: Build do kernel
+        run: cargo build -p kernel --target x86_64-java_os.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem
+
+      - name: Testes unitários do kernel (host)
+        run: cargo test -p kernel --lib
+
+      - name: Smoke test de boot (QEMU headless)
+        run: cargo xtask test

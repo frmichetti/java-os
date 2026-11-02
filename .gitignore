@@ -1,0 +1,24 @@
+# Build artifacts
+/target/
+**/target/
+
+# Disk images gerados pelo xtask (boot/imagem do Limine)
+*.img
+*.iso
+/boot/dist/
+
+# Binários/ferramentas do Limine baixados pelo provisionamento
+/boot/limine/
+/third_party/limine/
+
+# Firmware OVMF baixado localmente (quando não provisionado via sistema)
+*.fd
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
