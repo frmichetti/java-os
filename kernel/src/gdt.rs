@@ -15,6 +15,21 @@ static mut DOUBLE_FAULT_STACK: DoubleFaultStack = DoubleFaultStack([0; DOUBLE_FA
 /// Índice (1-based) da entrada de IST usada pelo handler de double fault.
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 1;
 
+/// Tamanho da stack dedicada ao handler de page fault (IST2). Mesmo
+/// racional/tamanho de `DOUBLE_FAULT_STACK`: o handler de `#PF` precisa ser
+/// entregável mesmo quando a stack corrente já estourou para dentro da
+/// guard page do kernel (ver `design.md` da change `kernel-stack-guard-page`
+/// — "Page fault também precisa de stack dedicada (IST)").
+const PAGE_FAULT_STACK_SIZE: usize = 16 * 1024;
+
+#[repr(align(16))]
+struct PageFaultStack([u8; PAGE_FAULT_STACK_SIZE]);
+
+static mut PAGE_FAULT_STACK: PageFaultStack = PageFaultStack([0; PAGE_FAULT_STACK_SIZE]);
+
+/// Índice (1-based) da entrada de IST usada pelo handler de page fault.
+pub const PAGE_FAULT_IST_INDEX: u16 = 2;
+
 const ACCESS_PRESENT: u8 = 1 << 7;
 const ACCESS_NOT_SYSTEM: u8 = 1 << 4; // S=1: descritor de código/dados (não de sistema)
 const ACCESS_EXECUTABLE: u8 = 1 << 3;
@@ -160,6 +175,9 @@ pub unsafe fn init() {
     unsafe {
         let double_fault_stack_top = core::ptr::addr_of!(DOUBLE_FAULT_STACK) as u64 + DOUBLE_FAULT_STACK_SIZE as u64;
         (*core::ptr::addr_of_mut!(TSS)).ist[(DOUBLE_FAULT_IST_INDEX - 1) as usize] = double_fault_stack_top;
+
+        let page_fault_stack_top = core::ptr::addr_of!(PAGE_FAULT_STACK) as u64 + PAGE_FAULT_STACK_SIZE as u64;
+        (*core::ptr::addr_of_mut!(TSS)).ist[(PAGE_FAULT_IST_INDEX - 1) as usize] = page_fault_stack_top;
 
         let tss_addr = core::ptr::addr_of!(TSS) as u64;
         let tss_limit = (core::mem::size_of::<TaskStateSegment>() - 1) as u16;

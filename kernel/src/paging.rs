@@ -213,6 +213,41 @@ impl<'a, S: FrameStore> Mapper<'a, S> {
         Ok(frame)
     }
 
+    /// Consulta somente-leitura: retorna o endereço físico mapeado para a
+    /// página virtual em `virt`, ou `None` se qualquer nível da caminhada
+    /// (PML4/PDPT/PD/PT) não estiver presente, ou se `virt` não for alinhado
+    /// a `PAGE_SIZE`. Ao contrário de [`unmap`], nunca cria nem remove
+    /// nenhuma tabela — usada para verificar que uma página (ex.: a guard
+    /// page de `kernel::stack`) permanece deliberadamente não mapeada.
+    pub fn translate(&self, virt: u64) -> Option<u64> {
+        if virt % PAGE_SIZE != 0 {
+            return None;
+        }
+        let idx = decompose(virt);
+
+        let pml4 = unsafe { self.table_mut(read_cr3()) };
+        let pml4e = pml4.entries[idx.pml4];
+        if !pml4e.is_present() {
+            return None;
+        }
+        let pdpt = unsafe { self.table_mut(pml4e.addr()) };
+        let pdpte = pdpt.entries[idx.pdpt];
+        if !pdpte.is_present() {
+            return None;
+        }
+        let pd = unsafe { self.table_mut(pdpte.addr()) };
+        let pde = pd.entries[idx.pd];
+        if !pde.is_present() {
+            return None;
+        }
+        let pt = unsafe { self.table_mut(pde.addr()) };
+        let pte = pt.entries[idx.pt];
+        if !pte.is_present() {
+            return None;
+        }
+        Some(pte.addr())
+    }
+
     /// Desmapeia a página virtual em `virt`, retornando o frame físico que
     /// estava mapeado. `Err(MapError::NotMapped)` se não houver mapeamento.
     pub fn unmap(&mut self, virt: u64) -> Result<u64, MapError> {
@@ -284,6 +319,19 @@ mod tests {
     fn page_flags_user_accessible_sets_user_bit() {
         let flags = PageFlags { writable: true, user_accessible: true, executable: false };
         assert_eq!(flags.to_pte_bits() & PTE_USER, PTE_USER);
+    }
+
+    #[test]
+    fn translate_rejects_misaligned_address_without_touching_cr3() {
+        // O guard de desalinhamento retorna antes de qualquer acesso a
+        // CR3/HHDM, então é seguro chamar `translate` em host mesmo sem uma
+        // página real por trás do `HhdmFrameStore` (nunca usado aqui). A
+        // caminhada real de tabelas (endereço mapeado/não mapeado) só é
+        // verificável em boot real — ver tasks.md.
+        use crate::phys::{FrameAllocator, HhdmFrameStore};
+        let mut allocator = FrameAllocator::new(HhdmFrameStore);
+        let mapper = Mapper::new(&mut allocator);
+        assert_eq!(mapper.translate(0x1001), None);
     }
 
     #[test]

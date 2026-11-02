@@ -116,6 +116,50 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
 
+    // A partir daqui o alocador de frames (e, por consequência, a
+    // paginação) já estão prontos: troca-se para a stack dedicada do
+    // kernel, protegida por guard page, o quanto antes (ver design.md da
+    // change `kernel-stack-guard-page`). O lock do alocador de frames
+    // precisa ser liberado (escopo normal, abaixo) antes do salto: como
+    // `switch_to` nunca retorna, qualquer guard ainda vivo no momento da
+    // chamada nunca seria destruído, deixando o lock preso para sempre.
+    let stack_top = {
+        let mut frame_allocator = kernel::phys::FRAME_ALLOCATOR.lock();
+        match kernel::stack::map(&mut frame_allocator) {
+            Ok(top) => top,
+            Err(e) => {
+                kernel::serial_println_emergency!(
+                    "ERRO FATAL: falha ao mapear a stack dedicada do kernel: {:?}. Abortando o boot.",
+                    e
+                );
+                hlt_loop();
+            }
+        }
+    };
+
+    unsafe { kernel::stack::switch_to(stack_top, continue_boot) };
+}
+
+/// Continuação de `kernel_main` depois da troca para a stack dedicada do
+/// kernel (ver [`kernel::stack::switch_to`]). Não deve depender de nenhum
+/// estado local de `kernel_main` — apenas dos `static`s globais já
+/// inicializados antes da troca.
+extern "C" fn continue_boot() -> ! {
+    {
+        let mut frame_allocator = kernel::phys::FRAME_ALLOCATOR.lock();
+        let mapper = kernel::paging::Mapper::new(&mut frame_allocator);
+        kernel::serial_println!(
+            "stack do kernel: 0x{:x}-0x{:x}; guard page em 0x{:x} ({})",
+            kernel::stack::KERNEL_STACK_BASE,
+            kernel::stack::KERNEL_STACK_BASE + kernel::stack::KERNEL_STACK_SIZE,
+            kernel::stack::GUARD_PAGE_ADDR,
+            match mapper.translate(kernel::stack::GUARD_PAGE_ADDR) {
+                None => "nao mapeada, como esperado",
+                Some(_) => "MAPEADA - inesperado",
+            },
+        );
+    }
+
     let heap_init_result = kernel::heap::init(&mut kernel::phys::FRAME_ALLOCATOR.lock());
     match heap_init_result {
         Ok(()) => {

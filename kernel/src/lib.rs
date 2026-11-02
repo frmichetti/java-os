@@ -13,6 +13,7 @@ pub mod phys;
 pub mod pic;
 pub mod port;
 pub mod serial;
+pub mod stack;
 pub mod sync;
 pub mod timer;
 

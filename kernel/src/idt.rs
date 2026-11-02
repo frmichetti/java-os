@@ -163,7 +163,16 @@ fn populate_exception_handlers(idt: &mut Idt) {
         crate::gdt::DOUBLE_FAULT_IST_INDEX as u8,
     );
     idt.set_handler(VECTOR_GENERAL_PROTECTION_FAULT, general_protection_fault_handler as *const () as u64, 0);
-    idt.set_handler(VECTOR_PAGE_FAULT, page_fault_handler as *const () as u64, 0);
+    // IST dedicada (não 0): necessária para que a exceção continue sendo
+    // entregue mesmo quando a stack corrente já estourou para dentro da
+    // guard page do kernel — ver `design.md` da change
+    // `kernel-stack-guard-page`, "Page fault também precisa de stack
+    // dedicada (IST)".
+    idt.set_handler(
+        VECTOR_PAGE_FAULT,
+        page_fault_handler as *const () as u64,
+        crate::gdt::PAGE_FAULT_IST_INDEX as u8,
+    );
 }
 
 fn populate_default_handlers(idt: &mut Idt) {
@@ -245,7 +254,7 @@ mod tests {
         );
 
         assert!(idt.entries[VECTOR_PAGE_FAULT].is_present());
-        assert_eq!(idt.entries[VECTOR_PAGE_FAULT].ist(), 0);
+        assert_eq!(idt.entries[VECTOR_PAGE_FAULT].ist(), crate::gdt::PAGE_FAULT_IST_INDEX as u8);
         assert_eq!(idt.entries[VECTOR_PAGE_FAULT].offset(), page_fault_handler as *const () as u64);
     }
 
