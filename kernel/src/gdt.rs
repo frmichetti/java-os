@@ -35,6 +35,8 @@ const ACCESS_NOT_SYSTEM: u8 = 1 << 4; // S=1: descritor de código/dados (não d
 const ACCESS_EXECUTABLE: u8 = 1 << 3;
 const ACCESS_READ_WRITE: u8 = 1 << 1;
 const ACCESS_TSS_AVAILABLE: u8 = 0b1001; // Type=1001: TSS de 64 bits disponível
+/// DPL=3 (bits 5-6 do byte de access) — privilégio de anel 3 (modo usuário).
+const ACCESS_DPL_USER: u8 = 0b011 << 5;
 
 const FLAG_LONG_MODE: u8 = 1 << 1; // bit 53 do descritor (L)
 
@@ -66,6 +68,22 @@ impl GdtEntry {
 
     pub const fn kernel_data() -> Self {
         Self::new(ACCESS_PRESENT | ACCESS_NOT_SYSTEM | ACCESS_READ_WRITE, 0)
+    }
+
+    /// Segmento de dados de modo usuário (DPL=3) — ver `design.md` da
+    /// change `kernel-syscalls`, "Layout do GDT para `syscall`/`sysret`":
+    /// precisa vir imediatamente antes de `user_code64()` no GDT (dados
+    /// antes de código), para bater com a aritmética do MSR `STAR`.
+    pub const fn user_data() -> Self {
+        Self::new(ACCESS_PRESENT | ACCESS_DPL_USER | ACCESS_NOT_SYSTEM | ACCESS_READ_WRITE, 0)
+    }
+
+    /// Segmento de código de 64 bits de modo usuário (DPL=3).
+    pub const fn user_code64() -> Self {
+        Self::new(
+            ACCESS_PRESENT | ACCESS_DPL_USER | ACCESS_NOT_SYSTEM | ACCESS_EXECUTABLE | ACCESS_READ_WRITE,
+            FLAG_LONG_MODE,
+        )
     }
 
     pub fn raw(&self) -> u64 {
@@ -135,19 +153,28 @@ impl TaskStateSegment {
 
 static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
-/// GDT do kernel: nulo, código (seletor 0x08), dados (seletor 0x10), TSS
-/// (seletor 0x18, ocupando também o slot em 0x20).
+/// GDT do kernel: nulo, código de kernel (0x08), dados de kernel (0x10),
+/// dados de usuário (0x18), código de usuário (0x20), TSS (0x28, ocupando
+/// também o slot em 0x30). Dados de usuário vêm **antes** de código de
+/// usuário deliberadamente — ver `design.md` da change `kernel-syscalls`,
+/// "Layout do GDT para `syscall`/`sysret`".
 #[repr(C)]
 pub struct Gdt {
     pub null: GdtEntry,
     pub kernel_code: GdtEntry,
     pub kernel_data: GdtEntry,
+    pub user_data: GdtEntry,
+    pub user_code: GdtEntry,
     pub tss: TssDescriptor,
 }
 
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
 pub const KERNEL_DATA_SELECTOR: u16 = 0x10;
-pub const TSS_SELECTOR: u16 = 0x18;
+/// Já inclui o RPL 3 (modo usuário) — pronto para uso direto em CS/SS.
+pub const USER_DATA_SELECTOR: u16 = 0x18 | 3;
+/// Já inclui o RPL 3 (modo usuário) — pronto para uso direto em CS/SS.
+pub const USER_CODE_SELECTOR: u16 = 0x20 | 3;
+pub const TSS_SELECTOR: u16 = 0x28;
 
 /// Formato aceito por `lgdt`/`lidt`: tamanho da tabela em bytes menos 1, e
 /// seu endereço linear.
@@ -161,8 +188,26 @@ static mut GDT: Gdt = Gdt {
     null: GdtEntry::null(),
     kernel_code: GdtEntry::kernel_code64(),
     kernel_data: GdtEntry::kernel_data(),
+    user_data: GdtEntry::user_data(),
+    user_code: GdtEntry::user_code64(),
     tss: TssDescriptor::empty(),
 };
+
+/// Atualiza `TSS.rsp0` — a stack que a CPU usa automaticamente sempre que
+/// uma interrupção ou exceção chega com troca de privilégio (anel 3 →
+/// anel 0). Deve ser chamada a cada troca de contexto para o escalonador
+/// manter esse valor sempre coerente com a stack de kernel da thread
+/// corrente — ver `design.md` da change `kernel-syscalls`, "`TSS.rsp0`
+/// atualizado a cada troca de contexto".
+///
+/// # Safety
+/// Deve ser chamada depois de `init()` (o TSS já montado e carregado via
+/// `ltr`).
+pub unsafe fn set_kernel_stack(top: u64) {
+    unsafe {
+        (*core::ptr::addr_of_mut!(TSS)).rsp[0] = top;
+    }
+}
 
 /// Monta o TSS (com a stack de IST1 para double fault), monta o GDT
 /// (completando o descritor de TSS com o endereço real do `static` acima),
@@ -242,6 +287,36 @@ mod tests {
         let access = (entry >> 40) & 0xff;
         assert_eq!(access & ACCESS_EXECUTABLE as u64, 0);
         assert_eq!(access & ACCESS_PRESENT as u64, ACCESS_PRESENT as u64);
+    }
+
+    fn dpl_of(entry: GdtEntry) -> u64 {
+        ((entry.raw() >> 40) & 0xff) & (ACCESS_DPL_USER as u64)
+    }
+
+    #[test]
+    fn user_code64_has_dpl_3_present_executable_long_mode() {
+        let entry = GdtEntry::user_code64();
+        let access = (entry.raw() >> 40) & 0xff;
+        let flags = (entry.raw() >> 52) & 0x0f;
+        assert_eq!(dpl_of(entry), ACCESS_DPL_USER as u64, "user_code64 deve ter DPL=3");
+        assert_eq!(access & ACCESS_PRESENT as u64, ACCESS_PRESENT as u64);
+        assert_eq!(access & ACCESS_EXECUTABLE as u64, ACCESS_EXECUTABLE as u64);
+        assert_eq!(flags & FLAG_LONG_MODE as u64, FLAG_LONG_MODE as u64);
+    }
+
+    #[test]
+    fn user_data_has_dpl_3_and_is_not_executable() {
+        let entry = GdtEntry::user_data();
+        let access = (entry.raw() >> 40) & 0xff;
+        assert_eq!(dpl_of(entry), ACCESS_DPL_USER as u64, "user_data deve ter DPL=3");
+        assert_eq!(access & ACCESS_EXECUTABLE as u64, 0);
+        assert_eq!(access & ACCESS_PRESENT as u64, ACCESS_PRESENT as u64);
+    }
+
+    #[test]
+    fn kernel_segments_have_dpl_0() {
+        assert_eq!(dpl_of(GdtEntry::kernel_code64()), 0);
+        assert_eq!(dpl_of(GdtEntry::kernel_data()), 0);
     }
 
     #[test]

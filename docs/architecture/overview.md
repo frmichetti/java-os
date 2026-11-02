@@ -5,11 +5,12 @@
 > `openspec/changes/kernel-boot-foundation/design.md` (seção "Arquitetura do Sistema
 > (Referência)"). Ele cobre as 15 áreas de arquitetura do Java OS. Apenas as áreas
 > 1 (Kernel, incluindo interrupções/timer e stack própria com guard page), 2 (Memória,
-> exceto huge pages), 3 (Processos e Threads, exceto modo usuário/anel 3 — ver a seção),
-> e 12-14 (repositório/build/testes) estão implementadas até o momento (changes
-> `kernel-boot-foundation`, `kernel-memory-management`, `kernel-interrupts-timer`,
-> `kernel-stack-guard-page` e `kernel-process-scheduler`); as demais ficam registradas
-> aqui para orientar changes futuras.
+> exceto huge pages), 3 (Processos e Threads), 4 (System Calls, exceto carregador de
+> executáveis e isolamento de falhas — ver a seção), e 12-14 (repositório/build/testes)
+> estão implementadas até o momento (changes `kernel-boot-foundation`,
+> `kernel-memory-management`, `kernel-interrupts-timer`, `kernel-stack-guard-page`,
+> `kernel-process-scheduler` e `kernel-syscalls`); as demais ficam registradas aqui
+> para orientar changes futuras.
 
 ## 1. Arquitetura do Kernel
 
@@ -102,12 +103,32 @@
   quanto uma aplicação Java rodando dentro de uma JVM isolada — ainda não implementado
   (depende do porte da JVM, roadmap itens 7-9).
 
-## 4. System Calls (futuro)
+## 4. System Calls
 
-- Interface prevista: `syscall`/`sysret` (x86_64), por desempenho.
-- ABI e numeração de syscalls serão definidos na change que implementar a primeira
-  syscall real.
-- Separação esperada entre syscalls "de sistema" e a superfície exposta à JVM.
+- **Modo usuário** (`kernel-user-mode`, change `kernel-syscalls`): o kernel pode
+  executar uma thread em anel 3, com código e stack próprios mapeados como
+  acessíveis por usuário (`PageFlags.user_accessible`), sem acesso a memória
+  exclusiva do kernel. Novos segmentos de GDT (`USER_CODE_SELECTOR`/
+  `USER_DATA_SELECTOR`) na ordem específica exigida por `syscall`/`sysret`
+  (dados de usuário antes de código de usuário).
+- **Interface de chamada de sistema** (`kernel-syscalls`): `syscall`/`sysret`
+  (x86_64, por desempenho, via MSRs `STAR`/`LSTAR`/`SFMASK` e `EFER.SCE`). A
+  rotina de entrada troca para a stack de kernel da thread corrente antes de
+  tocar qualquer dado vindo do modo usuário — o escalonador mantém essa stack
+  (`TSS.rsp0` e uma variável global, já que o kernel é single-core) sempre
+  coerente com a thread corrente, a cada troca de contexto.
+- **ABI definida nesta primeira implementação**: número da chamada em `RAX`,
+  até quatro argumentos em `RDI`/`RSI`/`RDX`/`R10`, retorno em `RAX`; um número
+  de chamada desconhecido é rejeitado explicitamente. Duas chamadas
+  implementadas: escrita no console e consulta do contador de ticks do kernel.
+- **Limitação atual**: sem carregador de executáveis — o único código de
+  modo usuário existente é um programa de teste gerado em compilação e copiado
+  para uma página de usuário em runtime (`kernel::user_demo`), usado para
+  provar o mecanismo ponta a ponta. Uma exceção causada por código de modo
+  usuário ainda halta o kernel inteiro (sem isolamento de falhas por
+  processo/thread ainda).
+- Separação esperada entre syscalls "de sistema" e a superfície exposta à JVM
+  fica para quando a JVM existir (roadmap itens 7-9).
 
 ## 5. HAL e Drivers (futuro)
 
@@ -227,7 +248,11 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    próprio, threads com stack protegida por guard page e contexto de registradores,
    escalonador preemptivo round-robin disparado pelo timer — tudo ainda em modo kernel
    (anel 0), sem modo usuário/syscalls.
-5. **System calls**: ABI `syscall`/`sysret`, primeiras chamadas.
+5. **`kernel-syscalls`** (concluída): modo usuário (anel 3), interface
+   `syscall`/`sysret` (STAR/LSTAR/SFMASK, EFER.SCE), ABI mínima (número +
+   4 argumentos + retorno), duas primeiras chamadas (escrita no console,
+   consulta de ticks) — ainda sem carregador de executáveis nem isolamento de
+   falhas por processo.
 6. **HAL e drivers essenciais**: console/framebuffer, teclado, armazenamento, timer,
    (depois) rede.
 7. **Pesquisa e decisão de estratégia de porte do OpenJDK/HotSpot** (change dedicada).

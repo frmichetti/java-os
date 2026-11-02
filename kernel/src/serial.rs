@@ -37,7 +37,11 @@ impl SerialPort {
         self.line_status() & 0x20 != 0
     }
 
-    fn write_byte(&mut self, byte: u8) {
+    /// Escreve um byte bruto na UART, sem nenhuma interpretação de texto
+    /// (ex.: sem o `\r` automático que `write_str` insere antes de `\n`).
+    /// Usado pela syscall de escrita (`kernel::syscall`), que recebe bytes
+    /// arbitrários do chamador, não necessariamente texto UTF-8 válido.
+    pub fn write_byte(&mut self, byte: u8) {
         while !self.transmitter_empty() {
             core::hint::spin_loop();
         }

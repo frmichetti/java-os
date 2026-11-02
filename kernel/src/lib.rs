@@ -17,7 +17,9 @@ pub mod scheduler;
 pub mod serial;
 pub mod stack;
 pub mod sync;
+pub mod syscall;
 pub mod timer;
+pub mod user_demo;
 
 /// Halt definitivo de erro: interrupções desabilitadas, `hlt` em loop.
 /// Usado a partir do `panic_handler`/`alloc_error_handler` e de qualquer

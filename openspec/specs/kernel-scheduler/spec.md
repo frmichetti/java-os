@@ -30,3 +30,10 @@ Quando nenhuma thread está pronta para executar, o kernel SHALL entrar em um es
 #### Scenario: Nenhuma thread pronta não trava nem ocupa a CPU em busy-wait
 - **WHEN** o escalonador não encontra nenhuma thread pronta para executar
 - **THEN** o kernel SHALL aguardar em um estado ocioso que responde normalmente à próxima interrupção (ex.: o próximo tick do timer), em vez de girar em busy-wait ou parar de responder
+
+### Requirement: Stack de Kernel Confiável Sempre Atualizada para a Thread Corrente
+A cada troca de contexto, o escalonador SHALL garantir que a stack de kernel usada pela CPU em qualquer transição de privilégio (interrupção ou chamada de sistema) seja a stack de kernel da thread que passou a ser a corrente.
+
+#### Scenario: Interrupção durante execução em modo usuário usa a stack de kernel correta
+- **WHEN** uma thread em modo usuário é interrompida (ex.: pelo timer) ou faz uma chamada de sistema
+- **THEN** a CPU SHALL passar a executar sobre a stack de kernel dessa mesma thread, nunca sobre a stack de kernel de outra thread

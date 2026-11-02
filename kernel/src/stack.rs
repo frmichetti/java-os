@@ -119,6 +119,42 @@ fn next_slot_index() -> u64 {
     NEXT_THREAD_STACK_SLOT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Garante que a cadeia de tabelas intermediárias (PDPT/PD/PT) do pool de
+/// stacks de thread já exista na paginação ativa — chamada uma única vez,
+/// **antes** de qualquer `AddressSpace::new()` (criação de processo) pela
+/// primeira vez.
+///
+/// **Achado durante a implementação da change `kernel-syscalls`:**
+/// `AddressSpace::new()` copia as entradas de PML4 256-511 *por valor*, no
+/// momento em que é chamada. Se o índice de PML4 do pool (`THREAD_STACK_POOL_BASE`)
+/// ainda não tiver uma PDPT criada nesse momento (porque nenhuma stack de
+/// thread foi alocada ainda), a cópia registra esse índice como "ausente" —
+/// e uma stack alocada *depois* disso (o caso comum: a primeira thread de um
+/// processo recém-criado) nunca fica visível para esse processo quando ele
+/// for escalonado, mesmo a tabela existindo na PML4 ativa a partir daí (só a
+/// entrada de PML4 em si é compartilhada por referência; criar essa entrada
+/// *depois* de uma cópia não propaga retroativamente). Ver design.md.
+///
+/// Mapeia e desmapeia imediatamente uma página de disfarce (a primeira
+/// página real do slot 0, não a guard page): a tabela intermediária criada
+/// como efeito colateral do mapeamento persiste mesmo depois do
+/// desmapeamento (que só remove a entrada-folha).
+///
+/// **Limitação conhecida, aceitável no escopo atual:** isso garante a PDPT
+/// (e, na prática, também a PD/PT da própria página de disfarce) do índice
+/// de PML4 do pool, mas uma `PT` cobre ~30 slots (2 MiB / `SLOT_STRIDE`) —
+/// o pool crescer além disso exigiria uma nova PT, sujeita ao mesmo
+/// problema se criada depois de outra `AddressSpace::new()`. Aceitável
+/// porque este kernel ainda cria poucas threads; revisitar se/quando isso
+/// deixar de ser verdade.
+pub fn prime_thread_stack_pool<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>) -> Result<(), StackInitError> {
+    let probe_virt = THREAD_STACK_POOL_BASE + PAGE_SIZE;
+    let mut mapper = Mapper::new(frame_allocator);
+    mapper.map_new(probe_virt, PageFlags::KERNEL_RW, false).map_err(|_| StackInitError::MapFailed)?;
+    mapper.unmap(probe_virt).map_err(|_| StackInitError::MapFailed)?;
+    Ok(())
+}
+
 /// Aloca o próximo slot livre do pool e mapeia sua stack (64 KiB),
 /// deixando a guard page do slot deliberadamente sem mapear. Retorna o topo
 /// da stack alocada, pronta para `process::init_stack`.

@@ -355,15 +355,36 @@ impl AddressSpace {
     /// Troca o espaço de endereçamento ativo da CPU para este.
     ///
     /// # Safety
-    /// O chamador deve garantir que nenhum código em execução depende de um
-    /// mapeamento da metade inferior que só existia no espaço de
-    /// endereçamento anterior — a metade superior (kernel) é sempre
-    /// preservada por construção (ver `new`), mas a inferior é própria de
-    /// cada address space.
+    /// Mesmos requisitos de [`switch_address_space`].
     pub unsafe fn switch(&self) {
-        unsafe {
-            core::arch::asm!("mov cr3, {0}", in(reg) self.pml4_phys, options(nostack, preserves_flags));
-        }
+        unsafe { switch_address_space(self.pml4_phys) };
+    }
+}
+
+/// Endereço físico da PML4 atualmente ativa (`CR3`). Usado pelo escalonador
+/// para capturar a address space da thread de boot (que nunca passa por
+/// `AddressSpace::new` — continua na PML4 original montada pelo
+/// Limine/`kernel-memory-management`), já que ela também precisa de um
+/// `root` rastreado para a troca de contexto restaurar corretamente — ver
+/// `design.md` da change `kernel-syscalls`.
+pub fn current_root() -> u64 {
+    read_cr3()
+}
+
+/// Troca `CR3` diretamente para `root` (endereço físico de uma PML4), sem
+/// precisar de uma `AddressSpace` em mãos — usada pelo escalonador, que só
+/// guarda o `root` de cada thread (não a `AddressSpace` inteira, cuja posse
+/// é do `Process`) em seu `Context`.
+///
+/// # Safety
+/// O chamador deve garantir que nenhum código em execução depende de um
+/// mapeamento da metade inferior que só existia no espaço de endereçamento
+/// anterior — a metade superior (kernel) é sempre preservada por construção
+/// (ver `AddressSpace::new`), mas a inferior é própria de cada address
+/// space. `root` deve ser o endereço físico de uma PML4 válida.
+pub unsafe fn switch_address_space(root: u64) {
+    unsafe {
+        core::arch::asm!("mov cr3, {0}", in(reg) root, options(nostack, preserves_flags));
     }
 }
 

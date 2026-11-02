@@ -194,6 +194,24 @@ extern "C" fn continue_boot() -> ! {
     kernel::scheduler::register_boot_thread();
     kernel::serial_println!("escalonador: iniciado (thread de boot registrada)");
 
+    // Depois da thread de boot já registrada (TSS.rsp0/CURRENT_KERNEL_STACK_TOP
+    // corretos — ver design.md da change `kernel-syscalls`).
+    unsafe { kernel::syscall::init() };
+    kernel::serial_println!("syscall/sysret: configurado (STAR/LSTAR/SFMASK, EFER.SCE)");
+
+    // Processo de demonstração em modo usuário: prova o mecanismo completo
+    // de `syscall`/`sysret` ponta a ponta — ver `design.md` da change
+    // `kernel-syscalls`, "Primeiro programa de usuário".
+    {
+        let mut frame_allocator = kernel::phys::FRAME_ALLOCATOR.lock();
+        // Antes de QUALQUER `AddressSpace::new()` (criação de processo) —
+        // ver `kernel::stack::prime_thread_stack_pool`.
+        kernel::stack::prime_thread_stack_pool(&mut frame_allocator)
+            .expect("preparar o pool de stacks de thread falhou");
+        kernel::scheduler::spawn_user_demo(&mut frame_allocator)
+            .expect("spawn do processo de demonstracao em modo usuario falhou");
+    }
+
     idle_loop();
 }
 
