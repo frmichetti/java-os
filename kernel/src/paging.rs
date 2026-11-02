@@ -139,20 +139,51 @@ fn flush_tlb(virt: u64) {
     }
 }
 
-/// Mapeia/desmapeia páginas virtuais de 4 KiB sobre a paginação de 4 níveis
-/// ativa, criando tabelas intermediárias sob demanda via o alocador de
-/// frames físicos. Ver spec `kernel-paging`.
+fn phys_to_table_ptr(phys: u64) -> *mut PageTable {
+    hhdm::phys_to_virt(hhdm::offset(), phys) as *mut PageTable
+}
+
+/// A raiz (PML4) sobre a qual um `Mapper` opera: ou a atualmente ativa
+/// (lida de `CR3` sob demanda, nunca na construção — ler `CR3` é uma
+/// instrução privilegiada, e `Mapper::new` precisa continuar seguro de
+/// construir em host, onde só roda em anel 3, para os testes unitários de
+/// `translate`/`decompose` existentes), ou uma PML4 explícita.
+enum Root {
+    Active,
+    Explicit(u64),
+}
+
+/// Mapeia/desmapeia páginas virtuais de 4 KiB sobre uma paginação de 4
+/// níveis explícita (`root`), criando tabelas intermediárias sob demanda via
+/// o alocador de frames físicos. Ver spec `kernel-paging`.
 pub struct Mapper<'a, S: FrameStore> {
     frame_allocator: &'a mut FrameAllocator<S>,
+    root: Root,
 }
 
 impl<'a, S: FrameStore> Mapper<'a, S> {
+    /// Opera sobre a paginação atualmente ativa (`CR3`) — mesmo
+    /// comportamento de sempre, usado por `kernel::heap`/`kernel::stack`.
     pub fn new(frame_allocator: &'a mut FrameAllocator<S>) -> Self {
-        Self { frame_allocator }
+        Self { frame_allocator, root: Root::Active }
+    }
+
+    /// Opera sobre uma PML4 explícita (`root`), não necessariamente a
+    /// atualmente ativa — usada para montar o espaço de endereçamento de um
+    /// processo antes de trocar para ele (ver `AddressSpace`).
+    pub fn for_root(frame_allocator: &'a mut FrameAllocator<S>, root: u64) -> Self {
+        Self { frame_allocator, root: Root::Explicit(root) }
+    }
+
+    fn root_phys(&self) -> u64 {
+        match self.root {
+            Root::Active => read_cr3(),
+            Root::Explicit(root) => root,
+        }
     }
 
     fn table_ptr(&self, phys: u64) -> *mut PageTable {
-        hhdm::phys_to_virt(hhdm::offset(), phys) as *mut PageTable
+        phys_to_table_ptr(phys)
     }
 
     /// # Safety
@@ -189,7 +220,7 @@ impl<'a, S: FrameStore> Mapper<'a, S> {
             return Err(MapError::Misaligned);
         }
         let idx = decompose(virt);
-        let pml4_phys = read_cr3();
+        let pml4_phys = self.root_phys();
         let pdpt_phys = self.next_table_or_create(unsafe { self.table_mut(pml4_phys) }, idx.pml4)?;
         let pd_phys = self.next_table_or_create(unsafe { self.table_mut(pdpt_phys) }, idx.pdpt)?;
         let pt_phys = self.next_table_or_create(unsafe { self.table_mut(pd_phys) }, idx.pd)?;
@@ -225,7 +256,7 @@ impl<'a, S: FrameStore> Mapper<'a, S> {
         }
         let idx = decompose(virt);
 
-        let pml4 = unsafe { self.table_mut(read_cr3()) };
+        let pml4 = unsafe { self.table_mut(self.root_phys()) };
         let pml4e = pml4.entries[idx.pml4];
         if !pml4e.is_present() {
             return None;
@@ -256,7 +287,7 @@ impl<'a, S: FrameStore> Mapper<'a, S> {
         }
         let idx = decompose(virt);
 
-        let pml4 = unsafe { self.table_mut(read_cr3()) };
+        let pml4 = unsafe { self.table_mut(self.root_phys()) };
         if !pml4.entries[idx.pml4].is_present() {
             return Err(MapError::NotMapped);
         }
@@ -277,6 +308,62 @@ impl<'a, S: FrameStore> Mapper<'a, S> {
         pt.entries[idx.pt] = PageTableEntry::empty();
         flush_tlb(virt);
         Ok(entry.addr())
+    }
+}
+
+/// Primeiro índice de PML4 compartilhado entre todas as address spaces: a
+/// partir daqui (HHDM, heap, pool de stacks de thread, código do kernel —
+/// tudo "do kernel", nunca específico de um processo), as entradas são
+/// copiadas por referência de uma `AddressSpace` para outra na criação, de
+/// forma que o kernel continue acessível depois de uma troca de `CR3`. Ver
+/// `design.md` da change `kernel-process-scheduler`.
+const KERNEL_PML4_START: usize = 256;
+
+/// Um espaço de endereçamento virtual independente: sua própria PML4, com a
+/// metade superior (ver `KERNEL_PML4_START`) compartilhada com todas as
+/// outras address spaces e a metade inferior inicialmente vazia, disponível
+/// para mapeamentos específicos de um processo. Ver spec `kernel-paging`
+/// ("Criação de Novo Espaço de Endereçamento").
+pub struct AddressSpace {
+    pml4_phys: u64,
+}
+
+impl AddressSpace {
+    /// Cria uma nova address space: aloca e zera uma PML4, depois copia
+    /// nela as entradas `KERNEL_PML4_START..512` da PML4 atualmente ativa,
+    /// preservando o acesso ao kernel assim que a CPU trocar para ela.
+    pub fn new<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>) -> Result<Self, MapError> {
+        let frame = frame_allocator.alloc().map_err(|_| MapError::OutOfFrames)?;
+        let new_ptr = phys_to_table_ptr(frame);
+        unsafe { core::ptr::write_bytes(new_ptr as *mut u8, 0, PAGE_SIZE as usize) };
+
+        let active_ptr = phys_to_table_ptr(read_cr3());
+        let new_table = unsafe { &mut *new_ptr };
+        let active_table = unsafe { &*active_ptr };
+        new_table.entries[KERNEL_PML4_START..].copy_from_slice(&active_table.entries[KERNEL_PML4_START..]);
+
+        Ok(Self { pml4_phys: frame })
+    }
+
+    /// Endereço físico da PML4 desta address space — usado por
+    /// `Mapper::for_root` para montar mapeamentos nela antes de trocar para
+    /// ela, e por `switch` para carregar `CR3`.
+    pub fn root(&self) -> u64 {
+        self.pml4_phys
+    }
+
+    /// Troca o espaço de endereçamento ativo da CPU para este.
+    ///
+    /// # Safety
+    /// O chamador deve garantir que nenhum código em execução depende de um
+    /// mapeamento da metade inferior que só existia no espaço de
+    /// endereçamento anterior — a metade superior (kernel) é sempre
+    /// preservada por construção (ver `new`), mas a inferior é própria de
+    /// cada address space.
+    pub unsafe fn switch(&self) {
+        unsafe {
+            core::arch::asm!("mov cr3, {0}", in(reg) self.pml4_phys, options(nostack, preserves_flags));
+        }
     }
 }
 

@@ -4,11 +4,12 @@
 > técnica de referência definida originalmente em
 > `openspec/changes/kernel-boot-foundation/design.md` (seção "Arquitetura do Sistema
 > (Referência)"). Ele cobre as 15 áreas de arquitetura do Java OS. Apenas as áreas
-> 1 (Kernel, incluindo interrupções/timer), 2 (Memória, exceto isolamento por
-> processo e huge pages), e 12-14 (repositório/build/testes) estão implementadas até
-> o momento (changes `kernel-boot-foundation`, `kernel-memory-management` e
-> `kernel-interrupts-timer`); as demais ficam registradas aqui para orientar changes
-> futuras.
+> 1 (Kernel, incluindo interrupções/timer e stack própria com guard page), 2 (Memória,
+> exceto huge pages), 3 (Processos e Threads, exceto modo usuário/anel 3 — ver a seção),
+> e 12-14 (repositório/build/testes) estão implementadas até o momento (changes
+> `kernel-boot-foundation`, `kernel-memory-management`, `kernel-interrupts-timer`,
+> `kernel-stack-guard-page` e `kernel-process-scheduler`); as demais ficam registradas
+> aqui para orientar changes futuras.
 
 ## 1. Arquitetura do Kernel
 
@@ -24,15 +25,21 @@
 - **Interrupções e exceções**: IDT e GDT/TSS próprios (`kernel::idt`/`kernel::gdt`,
   change `kernel-interrupts-timer`), substituindo os que o Limine deixa montados no
   boot. Handlers para as exceções de CPU essenciais (page fault, general protection
-  fault, double fault — este último com stack dedicada via uma entrada de IST no TSS,
-  para continuar funcionando mesmo diante de um estouro da stack corrente). Um handler
-  padrão (reconhece via EOI do Local APIC e retorna) cobre qualquer vetor de IRQ sem
-  handler específico. Interrupções via Local APIC em modo **x2APIC** (MSR-based,
-  obrigatório — sem fallback para xAPIC/MMIO); o PIC 8259 legado é desabilitado. O
-  timer do Local APIC é calibrado contra o PIT 8254 e configurado para disparo
-  periódico, mantendo um contador de ticks (`kernel::timer`) ainda não consumido por
-  nenhum escalonador. Limitação conhecida: a stack do kernel (fornecida pelo Limine)
-  não tem guard page — ver `KNOW_ISSUES.md`.
+  fault, double fault — double fault e page fault com stacks dedicadas via entradas
+  de IST no TSS, para continuar sendo entregues mesmo diante de um estouro da stack
+  corrente; ver `kernel-stack-guard-page`). Um handler padrão (reconhece via EOI do
+  Local APIC e retorna) cobre qualquer vetor de IRQ sem handler específico.
+  Interrupções via Local APIC em modo **x2APIC** (MSR-based, obrigatório — sem
+  fallback para xAPIC/MMIO); o PIC 8259 legado é desabilitado. O timer do Local APIC
+  é calibrado contra o PIT 8254 e configurado para disparo periódico, mantendo um
+  contador de ticks (`kernel::timer`) ainda não consumido por nenhum escalonador.
+- **Stack do kernel**: desde a change `kernel-stack-guard-page`, o kernel troca da
+  stack fornecida pelo Limine para uma stack própria (`kernel::stack`, 64 KiB, faixa
+  virtual isolada) assim que o alocador de frames/paginação ficam prontos, com a
+  página imediatamente abaixo do seu limite inferior deliberadamente não mapeada
+  (guard page). Um estouro de stack resulta em page fault imediato e diagnosticável
+  (endereço dentro da guard page), em vez de corromper memória adjacente
+  silenciosamente.
 - **Concorrência no kernel**: inicialmente single-core; SMP é adiado para uma change
   futura, mas as estruturas de dados já nascem pensando em `Sync`/`Send`.
 
@@ -49,7 +56,9 @@
   processos de usuário. O binário do kernel em si é linkado no topo dos 2 GiB
   superiores (`0xffffffff80000000`), exigido pelo `code-model=kernel`. A HHDM
   (higher-half direct map) fornecida pelo Limine ocupa o índice 256 da PML4; o heap
-  do kernel está reservado a partir de `0xffff_9000_0000_0000` (índice 288).
+  do kernel está reservado a partir de `0xffff_9000_0000_0000` (índice 288); a stack
+  dedicada do kernel está reservada a partir de `0xffff_a000_0000_0000` (índice 320),
+  com a guard page logo abaixo (ver `kernel-stack-guard-page`).
 - **Alocador físico**: `kernel::phys::FrameAllocator` — uma lista livre intrusiva (cada
   frame livre guarda, nos seus próprios bytes via HHDM, o endereço do próximo frame
   livre) inicializada a partir das regiões `usable` do memory map do Limine. Detecta
@@ -66,13 +75,32 @@
   usuário/aplicação Java terá seu próprio espaço de endereçamento (CR3 próprio),
   construído sobre a mesma API de `kernel::paging` já implementada.
 
-## 3. Gerenciamento de Processos e Threads (futuro)
+## 3. Gerenciamento de Processos e Threads
 
-- Processos do kernel representam unidades de isolamento; threads são as unidades de
-  escalonamento dentro de um processo.
-- Escalonador planejado: preemptivo, baseado em timer (APIC timer).
-- "Processo" no Java OS pode significar tanto um processo nativo do kernel quanto uma
-  aplicação Java rodando dentro de uma JVM isolada.
+- **Processos** (`kernel::process::Process`, change `kernel-process-scheduler`): cada
+  processo possui seu próprio espaço de endereçamento (`kernel::paging::AddressSpace`,
+  uma PML4 própria), com a metade superior (HHDM, heap, pool de stacks de thread,
+  código do kernel — índices 256-511) compartilhada por referência com todos os outros
+  processos, e a metade inferior inicialmente vazia (reservada para mapeamentos
+  específicos de processo, ainda sem uso real até a change de modo usuário/syscalls).
+  Um processo tem pelo menos uma thread.
+- **Threads** (`kernel::process::Thread`): a unidade de escalonamento dentro de um
+  processo. Cada thread tem sua própria stack de kernel (64 KiB, protegida por guard
+  page — generalização de `kernel-stack-guard-page` para um pool de stacks, uma por
+  thread) e seu próprio contexto de registradores da CPU.
+- **Escalonador** (`kernel::scheduler`): preemptivo, round-robin, disparado pelo timer
+  periódico do Local APIC já existente (`kernel-timer`) — a cada tick, o contexto da
+  thread corrente é salvo e a próxima thread pronta é retomada, sem exigir cooperação.
+  A troca de contexto é feita por uma rotina em assembly puro no vetor do timer (não
+  pelo mecanismo `extern "x86-interrupt"` do Rust, que não expõe os registradores de
+  uso geral necessários para uma troca de contexto completa).
+- **Limitação atual**: tudo roda em modo kernel (anel 0) — não há modo usuário, não há
+  `syscall`/`sysret`, e threads/processos só podem ser criados a partir de funções Rust
+  do próprio kernel (sem carregamento de executáveis). Isso fica para a change futura de
+  System Calls (ver seção 4).
+- "Processo" no Java OS pode, no futuro, significar tanto um processo nativo do kernel
+  quanto uma aplicação Java rodando dentro de uma JVM isolada — ainda não implementado
+  (depende do porte da JVM, roadmap itens 7-9).
 
 ## 4. System Calls (futuro)
 
@@ -195,8 +223,10 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
 3. **`kernel-interrupts-timer`** (concluída): IDT/GDT/TSS próprios, handlers de
    exceção de CPU com double fault via IST, Local APIC (x2APIC) substituindo o PIC
    8259, timer periódico com contador de ticks.
-4. **Processos e threads + escalonador**: espaços de endereçamento por processo,
-   troca de contexto, escalonador preemptivo.
+4. **`kernel-process-scheduler`** (concluída): processos com espaço de endereçamento
+   próprio, threads com stack protegida por guard page e contexto de registradores,
+   escalonador preemptivo round-robin disparado pelo timer — tudo ainda em modo kernel
+   (anel 0), sem modo usuário/syscalls.
 5. **System calls**: ABI `syscall`/`sysret`, primeiras chamadas.
 6. **HAL e drivers essenciais**: console/framebuffer, teclado, armazenamento, timer,
    (depois) rede.

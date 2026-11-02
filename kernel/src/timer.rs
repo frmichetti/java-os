@@ -5,7 +5,6 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::apic::{self, MSR_X2APIC_CURRENT_COUNT, MSR_X2APIC_DIVIDE_CONFIG, MSR_X2APIC_INITIAL_COUNT, MSR_X2APIC_LVT_TIMER};
-use crate::idt::InterruptStackFrame;
 use crate::port::outb;
 
 /// Vetor da IDT dedicado ao timer.
@@ -88,20 +87,26 @@ fn calibrate_apic_timer_frequency_hz() -> u64 {
     measured_frequency_hz(apic_ticks_elapsed, CALIBRATION_MILLIS)
 }
 
-extern "x86-interrupt" fn timer_interrupt_handler(_frame: InterruptStackFrame) {
+/// Incrementa o contador de ticks e reconhece a interrupção via EOI do
+/// Local APIC. Chamada por `kernel::scheduler::on_timer_tick` a cada tick —
+/// ver `design.md` da change `kernel-process-scheduler` ("Troca de
+/// contexto") para o porquê do vetor do timer não usar mais um handler
+/// `extern "x86-interrupt"` comum.
+pub fn on_tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     apic::send_eoi();
 }
 
 /// Calibra e configura o timer do Local APIC para disparo periódico em
-/// `TARGET_FREQUENCY_HZ`, instala seu handler, e habilita a entrega da
+/// `TARGET_FREQUENCY_HZ`, instala o vetor de entrada do escalonador
+/// (`scheduler::TIMER_ENTRY`) como handler, e habilita a entrega da
 /// interrupção (o handler só é efetivamente chamado depois que o chamador
 /// executar `sti`).
 ///
 /// # Safety
 /// Deve ser chamada depois de `apic::init()` e com a IDT já carregada.
 pub unsafe fn init() {
-    crate::idt::set_handler(TIMER_VECTOR, timer_interrupt_handler as *const () as u64, 0);
+    crate::idt::set_handler(TIMER_VECTOR, crate::scheduler::timer_entry_addr(), 0);
 
     let frequency_hz = calibrate_apic_timer_frequency_hz();
     let initial_count = initial_count_for_target(frequency_hz, TARGET_FREQUENCY_HZ);

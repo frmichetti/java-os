@@ -186,6 +186,14 @@ extern "C" fn continue_boot() -> ! {
     unsafe { kernel::timer::init() };
     kernel::serial_println!("timer do APIC: configurado (periodico)");
 
+    // Registra esta própria execução (já sobre a stack dedicada com guard
+    // page) como a primeira thread do escalonador, antes de `idle_loop()`
+    // habilitar interrupções — ver design.md da change
+    // `kernel-process-scheduler`, "A thread 'boot' é o próprio
+    // `continue_boot`".
+    kernel::scheduler::register_boot_thread();
+    kernel::serial_println!("escalonador: iniciado (thread de boot registrada)");
+
     idle_loop();
 }
 

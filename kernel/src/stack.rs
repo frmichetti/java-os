@@ -1,5 +1,9 @@
 //! Stack dedicada do kernel, protegida por uma guard page — ver `design.md`
-//! da change `kernel-stack-guard-page`.
+//! da change `kernel-stack-guard-page`. Também o pool de stacks de thread
+//! (uma por thread, mesma proteção de guard page) — ver `design.md` da
+//! change `kernel-process-scheduler`.
+
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::paging::{Mapper, PageFlags, PAGE_SIZE};
 use crate::phys::{FrameAllocator, FrameError, FrameStore};
@@ -83,5 +87,89 @@ pub unsafe fn switch_to(stack_top: u64, continuation: extern "C" fn() -> !) -> !
             continuation = in(reg) continuation,
             options(noreturn),
         );
+    }
+}
+
+/// Base da faixa virtual reservada ao pool de stacks de thread — faixa
+/// isolada, distante da HHDM (índice 256), do heap (índice 288) e da stack
+/// principal do kernel (índice 320). Ver `design.md` da change
+/// `kernel-process-scheduler` — "Stack de cada thread".
+pub const THREAD_STACK_POOL_BASE: u64 = 0xffff_b000_0000_0000;
+
+/// Distância, em bytes, entre o início de um slot do pool e o do próximo:
+/// guard page (4 KiB) + stack (mesmo tamanho da stack principal do kernel).
+pub const SLOT_STRIDE: u64 = PAGE_SIZE + KERNEL_STACK_SIZE;
+
+/// Endereço da guard page, do limite inferior e do topo da stack do slot
+/// `index` do pool. Função pura, testável sem hardware.
+fn slot_addresses(index: u64) -> (u64, u64, u64) {
+    let slot_base = THREAD_STACK_POOL_BASE + index * SLOT_STRIDE;
+    let guard_page = slot_base;
+    let stack_base = slot_base + PAGE_SIZE;
+    let stack_top = stack_base + KERNEL_STACK_SIZE;
+    (guard_page, stack_base, stack_top)
+}
+
+/// Próximo índice de slot livre do pool de stacks de thread. Sem
+/// reciclagem (ver `design.md` — Non-Goals): cada chamada devolve um índice
+/// novo, nunca reaproveitado.
+static NEXT_THREAD_STACK_SLOT: AtomicU64 = AtomicU64::new(0);
+
+fn next_slot_index() -> u64 {
+    NEXT_THREAD_STACK_SLOT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Aloca o próximo slot livre do pool e mapeia sua stack (64 KiB),
+/// deixando a guard page do slot deliberadamente sem mapear. Retorna o topo
+/// da stack alocada, pronta para `process::init_stack`.
+///
+/// Sempre mapeada via `Mapper::new` (a paginação atualmente ativa), nunca
+/// via `Mapper::for_root` de um processo específico: a stack de uma thread
+/// é memória de kernel (ring 0) e, como tal, deve estar igualmente visível
+/// em toda e qualquer address space — exatamente a razão de o pool viver na
+/// faixa compartilhada do PML4 (índices 256-511, ver design.md). Mapear via
+/// `for_root` sobre a PML4 recém-criada e nunca ativada de um processo faria
+/// a nova tabela intermediária (PDPT/PD/PT) existir só *naquela* PML4
+/// específica — não "voltar" a ser compartilhada com a PML4 realmente
+/// ativa (a do kernel), causando um page fault na primeira escrita real na
+/// stack (achado ao testar a tarefa 5.2 em boot real: a CPU nunca troca de
+/// `CR3` para threads kernel-mode nesta change, então a stack precisa estar
+/// mapeada onde quer que a PML4 ativa esteja, desde o início).
+pub fn alloc_thread_stack<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>) -> Result<u64, StackInitError> {
+    let index = next_slot_index();
+    let (_guard_page, stack_base, stack_top) = slot_addresses(index);
+
+    let mut mapper = Mapper::new(frame_allocator);
+    let pages = KERNEL_STACK_SIZE / PAGE_SIZE;
+    for i in 0..pages {
+        let virt = stack_base + i * PAGE_SIZE;
+        mapper.map_new(virt, PageFlags::KERNEL_RW, false).map_err(|_| StackInitError::MapFailed)?;
+    }
+    Ok(stack_top)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slot_guard_page_sits_immediately_below_its_stack() {
+        let (guard_page, stack_base, stack_top) = slot_addresses(0);
+        assert_eq!(guard_page + PAGE_SIZE, stack_base);
+        assert_eq!(stack_base + KERNEL_STACK_SIZE, stack_top);
+    }
+
+    #[test]
+    fn consecutive_slots_do_not_overlap() {
+        let (_, _, top0) = slot_addresses(0);
+        let (guard1, _, _) = slot_addresses(1);
+        assert_eq!(top0, guard1, "o fim do slot 0 deve coincidir com a guard page do slot 1, sem lacuna nem sobreposição");
+    }
+
+    #[test]
+    fn successive_slot_allocations_are_distinct() {
+        let a = next_slot_index();
+        let b = next_slot_index();
+        assert_ne!(a, b);
     }
 }
