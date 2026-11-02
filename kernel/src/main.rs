@@ -8,7 +8,7 @@ use core::panic::PanicInfo;
 use kernel::fmtbuf::StackBuf;
 use kernel::{memmap_report, serial};
 
-use limine::request::{BootloaderInfoRequest, HhdmRequest, MemmapRequest};
+use limine::request::{BootloaderInfoRequest, FramebufferRequest, HhdmRequest, MemmapRequest};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
 const KERNEL_NAME: &str = "Java OS kernel";
@@ -29,6 +29,10 @@ static MEMORY_MAP_REQUEST: MemmapRequest = MemmapRequest::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -53,6 +57,31 @@ pub extern "C" fn kernel_main() -> ! {
     unsafe { kernel::idt::load() };
 
     serial::init();
+
+    // Console de framebuffer: inicializado o quanto antes (antes até de
+    // HHDM_REQUEST), com base na hipótese de que `Framebuffer::address()`
+    // já devolve um ponteiro diretamente utilizável — ver design.md da
+    // change `kernel-framebuffer-console`, "Inicialização cedo". A ausência
+    // de resposta, de framebuffer, ou um framebuffer rejeitado pela
+    // validação são tratados explicitamente: o boot prossegue normalmente,
+    // só com o console serial.
+    match FRAMEBUFFER_REQUEST.response().and_then(|r| r.framebuffers().first().copied()) {
+        Some(fb) => match kernel::framebuffer::init(fb) {
+            Ok(()) => kernel::serial_println!(
+                "console de framebuffer: inicializado ({}x{}, {} bpp)",
+                fb.width,
+                fb.height,
+                fb.bpp,
+            ),
+            Err(e) => kernel::serial_println!(
+                "console de framebuffer: indisponivel ({:?}); prosseguindo so com o console serial",
+                e,
+            ),
+        },
+        None => kernel::serial_println!(
+            "console de framebuffer: nenhum framebuffer reportado pelo bootloader; prosseguindo so com o console serial"
+        ),
+    }
 
     if !BASE_REVISION.is_supported() {
         kernel::serial_println_emergency!(
@@ -95,7 +124,7 @@ pub extern "C" fn kernel_main() -> ! {
     kernel::serial_println!("{}", banner.as_str());
 
     let memmap_entries = MEMORY_MAP_REQUEST.response().map(|r| r.entries());
-    let _ = memmap_report::write_memory_map(&mut *serial::SERIAL1.lock(), memmap_entries);
+    let _ = memmap_report::write_memory_map(&mut serial::MirroredWriter, memmap_entries);
 
     let phys_init_result = kernel::phys::FRAME_ALLOCATOR.lock().init(memmap_entries);
     match phys_init_result {

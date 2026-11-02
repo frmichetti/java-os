@@ -56,9 +56,20 @@ pub const SYSCALL_ERROR: u64 = u64::MAX;
 /// uma change futura).
 unsafe fn sys_write(ptr: u64, len: u64) -> u64 {
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
-    let mut serial = crate::serial::SERIAL1.lock();
-    for &byte in bytes {
-        serial.write_byte(byte);
+    {
+        let mut serial = crate::serial::SERIAL1.lock();
+        for &byte in bytes {
+            serial.write_byte(byte);
+        }
+    }
+    // Espelhamento no console de framebuffer (ver design.md da change
+    // `kernel-framebuffer-console`, "Espelhamento"): só para o caso comum de
+    // texto UTF-8 válido — bytes arbitrários não decodificáveis não têm uma
+    // representação textual sensata para desenhar, mas isso não afeta o
+    // contrato da própria syscall (que já escreveu os bytes crus na serial
+    // acima, sem essa restrição).
+    if let Ok(s) = core::str::from_utf8(bytes) {
+        crate::framebuffer::mirror_str(s);
     }
     len
 }

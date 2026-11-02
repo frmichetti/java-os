@@ -3,7 +3,9 @@
 
 pub mod apic;
 pub mod fmtbuf;
+pub mod framebuffer;
 pub mod gdt;
+pub mod hal;
 pub mod heap;
 pub mod hhdm;
 pub mod idt;

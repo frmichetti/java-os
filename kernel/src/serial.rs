@@ -63,6 +63,23 @@ impl Write for SerialPort {
 
 pub static SERIAL1: Spinlock<SerialPort> = Spinlock::new(SerialPort::new(COM1_BASE));
 
+/// Adaptador de `core::fmt::Write` para código que precisa de um writer
+/// concreto em vez de usar as macros `serial_println!`/`serial_print!`
+/// diretamente (ex.: `memmap_report::write_memory_map`, que recebe o writer
+/// como parâmetro genérico para continuar puro/testável em host). Escreve
+/// na porta serial e espelha no console de framebuffer, assim como
+/// [`_print`] — ver design.md da change `kernel-framebuffer-console`,
+/// "Espelhamento".
+pub struct MirroredWriter;
+
+impl Write for MirroredWriter {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        SERIAL1.lock().write_str(s)?;
+        crate::framebuffer::mirror_str(s);
+        Ok(())
+    }
+}
+
 /// Deve ser chamada uma única vez, no início de `kernel_main`, antes de
 /// qualquer uso de `serial_println!`.
 pub fn init() {
@@ -72,6 +89,7 @@ pub fn init() {
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     SERIAL1.lock().write_fmt(args).expect("falha ao escrever na porta serial");
+    crate::framebuffer::mirror(args);
 }
 
 /// Variante de emergência: ignora o lock de `SERIAL1` em vez de esperar por

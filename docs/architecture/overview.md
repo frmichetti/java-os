@@ -130,11 +130,38 @@
 - Separação esperada entre syscalls "de sistema" e a superfície exposta à JVM
   fica para quando a JVM existir (roadmap itens 7-9).
 
-## 5. HAL e Drivers (futuro)
+## 5. HAL e Drivers
 
-- HAL prevista como traits Rust (`trait BlockDevice`, `trait Console`, etc.).
-- Primeiros drivers esperados, em ordem: console serial (já implementado), console de
-  framebuffer, timer/APIC, teclado, armazenamento (AHCI/NVMe), rede.
+- **Primeira abstração de HAL** (`kernel-framebuffer-console`): `trait Console:
+  core::fmt::Write` (`kernel::hal`), sem métodos próprios além de
+  `core::fmt::Write` — suficiente para os dois consoles existentes. Novos
+  drivers (teclado, armazenamento) definirão seus próprios traits
+  (`KeyboardDevice`, `BlockDevice`) no mesmo módulo quando chegar a vez.
+- **Console de framebuffer** (`kernel-framebuffer-console`, `kernel::framebuffer`):
+  segundo canal de saída de texto, sobre o framebuffer linear fornecido pelo
+  Limine (`FramebufferRequest`). Conversão de pixel genérica a partir das
+  máscaras RGB reportadas (`red/green/blue_mask_size`/`_shift`), fonte bitmap
+  8×8 própria (ASCII 32-126, com glifo de reserva fora desse intervalo),
+  rolagem por cópia de linhas de pixels. Inicializado bem cedo em
+  `kernel_main` (antes até de `HHDM_REQUEST` — `Framebuffer::address()` já
+  vem diretamente utilizável, confirmado em boot real), com tratamento
+  explícito de indisponibilidade (nenhuma resposta, nenhum framebuffer, ou
+  `memory_model`/`bpp` não suportados — só `FRAMEBUFFER_RGB` com 16/24/32
+  bits por pixel).
+- **Espelhamento automático**: `kernel::serial::_print` (usada por
+  `serial_println!`/`serial_print!`) passa a também escrever no console de
+  framebuffer, se inicializado — reflete automaticamente todo o código de
+  diagnóstico que já usava essas macros. Código que escreve direto num
+  `core::fmt::Write` concreto em vez de usar essas macros (ex.:
+  `memmap_report::write_memory_map`) precisa do adaptador
+  `kernel::serial::MirroredWriter`; código que escreve bytes crus (ex.:
+  `syscall::sys_write`) chama `kernel::framebuffer::mirror_str` diretamente
+  quando os bytes são UTF-8 válido. Sem console serial ou de framebuffer
+  "soltos" sem espelhamento — qualquer novo call site de diagnóstico direto
+  na serial deve usar um desses dois mecanismos.
+- Sem teclado, armazenamento ou rede ainda — essa change entregou só a
+  primeira metade do item 6 do roadmap (HAL + framebuffer); os demais
+  drivers continuam pendentes como changes futuras.
 
 ## 6. Estratégia de Portabilidade do OpenJDK (futuro — maior risco técnico do projeto)
 
@@ -253,8 +280,10 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    4 argumentos + retorno), duas primeiras chamadas (escrita no console,
    consulta de ticks) — ainda sem carregador de executáveis nem isolamento de
    falhas por processo.
-6. **HAL e drivers essenciais**: console/framebuffer, teclado, armazenamento, timer,
-   (depois) rede.
+6. **HAL e drivers essenciais** (em andamento): `kernel-framebuffer-console`
+   (concluída) entregou a primeira abstração de HAL (`trait Console`) e o
+   console de framebuffer, com espelhamento automático do console serial
+   existente. Ainda pendentes: teclado, armazenamento, rede.
 7. **Pesquisa e decisão de estratégia de porte do OpenJDK/HotSpot** (change dedicada).
 8. **Porte inicial da JVM**: primeira JVM minimamente funcional rodando um "hello
    world" Java sobre o Java OS.
