@@ -4,8 +4,9 @@
 > técnica de referência definida originalmente em
 > `openspec/changes/kernel-boot-foundation/design.md` (seção "Arquitetura do Sistema
 > (Referência)"). Ele cobre as 15 áreas de arquitetura do Java OS. Apenas as áreas
-> 1 (Kernel), parcialmente a 2 (Memória), e 12-14 (repositório/build/testes) estão
-> implementadas até o momento (change `kernel-boot-foundation`); as demais ficam
+> 1 (Kernel), 2 (Memória, exceto isolamento por processo e huge pages), e 12-14
+> (repositório/build/testes) estão implementadas até o momento (changes
+> `kernel-boot-foundation` e `kernel-memory-management`); as demais ficam
 > registradas aqui para orientar changes futuras.
 
 ## 1. Arquitetura do Kernel
@@ -27,17 +28,32 @@
 ## 2. Arquitetura de Memória
 
 - **Paginação**: 4-level paging (x86_64 padrão, 48-bit virtual address space), páginas
-  de 4 KiB, com possibilidade futura de huge pages (2 MiB).
+  de 4 KiB. O kernel implementa seu próprio gerenciamento de tabelas de página
+  (`kernel::paging`, change `kernel-memory-management`) — caminhada via `CR3` +
+  HHDM, criação de tabelas intermediárias sob demanda, e `map`/`unmap` de páginas
+  arbitrárias com controle de permissões — escrito à mão (sem a crate `x86_64`) para
+  manter consistência com o driver serial. Huge pages (2 MiB/1 GiB) permanecem futuras.
 - **Layout de endereço virtual**: higher-half kernel — o kernel reside na metade
   superior do espaço de endereçamento, deixando a metade inferior livre para
   processos de usuário. O binário do kernel em si é linkado no topo dos 2 GiB
-  superiores (`0xffffffff80000000`), exigido pelo `code-model=kernel`.
-- **Alocador físico**: um frame allocator inicial simples sobre as regiões `usable`
-  do memory map do Limine.
-- **Alocador de heap do kernel**: ainda não implementado nesta fase — toda formatação
-  de saída de boot usa buffers fixos de stack (`core::fmt::Write` sobre `[u8; N]`).
+  superiores (`0xffffffff80000000`), exigido pelo `code-model=kernel`. A HHDM
+  (higher-half direct map) fornecida pelo Limine ocupa o índice 256 da PML4; o heap
+  do kernel está reservado a partir de `0xffff_9000_0000_0000` (índice 288).
+- **Alocador físico**: `kernel::phys::FrameAllocator` — uma lista livre intrusiva (cada
+  frame livre guarda, nos seus próprios bytes via HHDM, o endereço do próximo frame
+  livre) inicializada a partir das regiões `usable` do memory map do Limine. Detecta
+  explicitamente esgotamento de memória, endereços fora do intervalo gerenciado e
+  double-free, sem precisar de um bitmap de bookkeeping separado.
+- **Alocador de heap do kernel**: `kernel::heap`, usando a crate `linked_list_allocator`
+  como `#[global_allocator]`, mapeado sobre uma faixa virtual fixa reservada (máximo de
+  256 MiB) via `kernel::paging`. Cresce sob demanda (mapeando mais frames e chamando
+  `extend()`) quando uma alocação não cabe no espaço já mapeado; falhas definitivas de
+  alocação (memória física ou faixa reservada esgotadas) são tratadas por um
+  `#[alloc_error_handler]` que reporta via serial e halta, em vez de corromper memória.
+  Libera o uso de `alloc::{Vec, String, Box}` em qualquer parte do kernel.
 - **Isolamento de memória entre processos** (futuro): cada processo de
-  usuário/aplicação Java terá seu próprio espaço de endereçamento (CR3 próprio).
+  usuário/aplicação Java terá seu próprio espaço de endereçamento (CR3 próprio),
+  construído sobre a mesma API de `kernel::paging` já implementada.
 
 ## 3. Gerenciamento de Processos e Threads (futuro)
 
@@ -115,7 +131,8 @@ java-os/
 │   ├── build.rs                # aplica o linker.ld apenas ao binário
 │   ├── linker.ld
 │   └── src/
-│       ├── lib.rs              # módulos testáveis no host (serial, fmtbuf, memmap_report)
+│       ├── lib.rs              # módulos testáveis no host (serial, fmtbuf, memmap_report,
+│       │                       #   hhdm, phys, paging, heap, sync)
 │       └── main.rs             # binário bare-metal (#![no_std]#![no_main])
 ├── xtask/                      # automação de build/run/test (cargo-xtask)
 ├── boot/
@@ -161,8 +178,8 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
 1. **`kernel-boot-foundation`** (concluída): arquitetura completa documentada; boot
    UEFI/Limine funcional no QEMU; relato de boot e mapa de memória; smoke test
    automatizado + CI.
-2. **Gerenciamento de memória**: alocador físico robusto, alocador de heap do kernel
-   definitivo, paginação dinâmica, mapeamento/desmapeamento sob demanda.
+2. **`kernel-memory-management`** (concluída): alocador de frames físicos, paginação
+   própria (mapear/desmapear sob demanda), heap do kernel crescendo sob demanda.
 3. **Interrupções e timer**: IDT completa, APIC/APIC timer, tratamento de exceções.
 4. **Processos e threads + escalonador**: espaços de endereçamento por processo,
    troca de contexto, escalonador preemptivo.

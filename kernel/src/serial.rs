@@ -1,6 +1,6 @@
-use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::sync::Spinlock;
 
 const COM1_BASE: u16 = 0x3F8;
 
@@ -69,60 +69,6 @@ impl Write for SerialPort {
             self.write_byte(byte);
         }
         Ok(())
-    }
-}
-
-/// Spinlock mínimo: o kernel é single-core nesta change, mas as estruturas
-/// de dados compartilhadas já nascem `Sync`/`Send`-safe (ver design.md,
-/// seção "1. Arquitetura do Kernel" — Concorrência no kernel) para não
-/// exigir reescrita quando SMP for adicionado.
-pub struct Spinlock<T> {
-    locked: AtomicBool,
-    data: UnsafeCell<T>,
-}
-
-unsafe impl<T: Send> Sync for Spinlock<T> {}
-
-pub struct SpinlockGuard<'a, T> {
-    lock: &'a Spinlock<T>,
-}
-
-impl<T> Spinlock<T> {
-    pub const fn new(data: T) -> Self {
-        Self {
-            locked: AtomicBool::new(false),
-            data: UnsafeCell::new(data),
-        }
-    }
-
-    pub fn lock(&self) -> SpinlockGuard<'_, T> {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        SpinlockGuard { lock: self }
-    }
-}
-
-impl<T> core::ops::Deref for SpinlockGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        unsafe { &*self.lock.data.get() }
-    }
-}
-
-impl<T> core::ops::DerefMut for SpinlockGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.lock.data.get() }
-    }
-}
-
-impl<T> Drop for SpinlockGuard<'_, T> {
-    fn drop(&mut self) {
-        self.lock.locked.store(false, Ordering::Release);
     }
 }
 
