@@ -12,3 +12,10 @@ O kernel SHALL fornecer uma interface comum para escrita de texto em um console,
 #### Scenario: Mesmo texto escrito através de dispositivos diferentes produz a mesma saída lógica
 - **WHEN** a mesma sequência de texto é escrita através da interface comum em dois dispositivos diferentes que a implementam
 - **THEN** ambos SHALL produzir a mesma saída lógica (o mesmo conteúdo textual), cada um em seu próprio formato de exibição
+
+### Requirement: Abstração de Dispositivo de Teclado Independente de Hardware
+O kernel SHALL fornecer uma interface comum para obter eventos de tecla, de forma que código consumidor de entrada funcione sobre qualquer dispositivo que implemente essa interface, sem conhecer os detalhes do dispositivo físico.
+
+#### Scenario: Consultar eventos de tecla não exige conhecer o dispositivo físico
+- **WHEN** código do kernel consulta eventos de tecla através da interface comum
+- **THEN** essa consulta SHALL funcionar independentemente de qual dispositivo de teclado físico a implementa

@@ -202,7 +202,7 @@ pub struct Process {
 /// Aloca a stack de kernel de uma nova thread e sintetiza seu frame de
 /// entrada em modo kernel. Lógica comum entre `Process::new` e
 /// `Process::spawn_thread`.
-fn create_kernel_thread<S: FrameStore>(
+pub(crate) fn create_kernel_thread<S: FrameStore>(
     frame_allocator: &mut FrameAllocator<S>,
     process: ProcessId,
     root: u64,

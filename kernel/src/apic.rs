@@ -66,6 +66,18 @@ pub(crate) const MSR_X2APIC_INITIAL_COUNT: u32 = 0x838;
 pub(crate) const MSR_X2APIC_CURRENT_COUNT: u32 = 0x839;
 pub(crate) const MSR_X2APIC_DIVIDE_CONFIG: u32 = 0x83E;
 
+const MSR_X2APIC_ID: u32 = 0x802;
+
+/// ID do Local APIC da CPU corrente — usado como campo de destino ao rotear
+/// uma IRQ externa para esta CPU via `kernel::ioapic::route_irq` (ver
+/// design.md da change `kernel-keyboard`). Em modo x2APIC o ID pode ter até
+/// 32 bits, mas como o kernel ainda é single-core o único Local APIC
+/// existente (o do BSP) tem tipicamente ID 0 em qualquer uma das VMs alvo
+/// atuais.
+pub fn local_apic_id() -> u32 {
+    unsafe { rdmsr(MSR_X2APIC_ID) as u32 }
+}
+
 /// Vetor usado para a "spurious interrupt" do Local APIC — um vetor alto,
 /// fora da faixa usada por exceções de CPU ou pelo timer.
 pub const SPURIOUS_VECTOR: u8 = 0xFF;

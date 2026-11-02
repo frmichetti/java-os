@@ -85,7 +85,7 @@ fn interrupts_enabled() -> bool {
 /// thread comum preemptada no meio dessas estruturas (lock já adquirido)
 /// causaria um deadlock real de single-core — ver `design.md`, "Fila de
 /// prontos do escalonador".
-fn with_interrupts_disabled<R>(f: impl FnOnce() -> R) -> R {
+pub(crate) fn with_interrupts_disabled<R>(f: impl FnOnce() -> R) -> R {
     let was_enabled = interrupts_enabled();
     unsafe { core::arch::asm!("cli", options(preserves_flags)) };
     let result = f();
@@ -147,6 +147,27 @@ pub fn spawn<S: FrameStore>(
     let thread_id = register_thread(thread);
     with_interrupts_disabled(|| PROCESSES.lock().push(process));
     Ok(thread_id)
+}
+
+/// Cria uma thread de kernel adicional que compartilha o espaço de
+/// endereçamento atualmente ativo (`paging::current_root()`), em vez de um
+/// processo com `AddressSpace` própria — ver design.md da change
+/// `kernel-keyboard`, "Troca de CR3 a cada tick": como o escalonador troca
+/// `CR3` incondicionalmente a cada tick (`on_timer_tick`), cada
+/// `AddressSpace` distinta em rotação é mais uma troca de `CR3`/flush de
+/// TLB por tick — achado real em boot via QEMU, onde isso se mostrou
+/// suficiente para impedir a entrega confiável de uma IRQ externa de baixa
+/// frequência (o teclado) competindo com o timer a 100 Hz. Threads só de
+/// diagnóstico/demonstração que não precisam de isolamento de endereço
+/// (ex.: `keyboard_demo`) usam esta função em vez de [`spawn`].
+pub fn spawn_sharing_current_address_space<S: FrameStore>(
+    frame_allocator: &mut FrameAllocator<S>,
+    entry: extern "C" fn() -> !,
+) -> Result<ThreadId, ProcessError> {
+    let process = process::next_process_id_for_scheduler();
+    let root = crate::paging::current_root();
+    let thread = process::create_kernel_thread(frame_allocator, process, root, entry)?;
+    Ok(register_thread(thread))
 }
 
 /// Endereço virtual, na metade inferior, onde o código do programa de teste

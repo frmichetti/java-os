@@ -223,6 +223,19 @@ extern "C" fn continue_boot() -> ! {
     kernel::scheduler::register_boot_thread();
     kernel::serial_println!("escalonador: iniciado (thread de boot registrada)");
 
+    // Teclado PS/2: depois do escalonador e do Local APIC já estarem
+    // prontos — ver `design.md` da change `kernel-keyboard`. Só a
+    // inicialização de hardware aqui (controlador 8042, IDT, I/O APIC) —
+    // nenhum `AddressSpace::new()` é criado ainda, então pode acontecer
+    // antes de `prime_thread_stack_pool` (abaixo). O spawn da thread de
+    // demonstração (que cria um processo) é adiado para depois do priming,
+    // pela mesma razão do `spawn_user_demo` logo abaixo.
+    {
+        let mut frame_allocator = kernel::phys::FRAME_ALLOCATOR.lock();
+        unsafe { kernel::keyboard::init(&mut frame_allocator) };
+    }
+    kernel::serial_println!("teclado PS/2: configurado (I/O APIC rotea IRQ1 para o Local APIC)");
+
     // Depois da thread de boot já registrada (TSS.rsp0/CURRENT_KERNEL_STACK_TOP
     // corretos — ver design.md da change `kernel-syscalls`).
     unsafe { kernel::syscall::init() };
@@ -239,6 +252,12 @@ extern "C" fn continue_boot() -> ! {
             .expect("preparar o pool de stacks de thread falhou");
         kernel::scheduler::spawn_user_demo(&mut frame_allocator)
             .expect("spawn do processo de demonstracao em modo usuario falhou");
+        // Thread de demonstração do teclado (ver `design.md` da change
+        // `kernel-keyboard`): compartilha o espaço de endereçamento da
+        // thread de boot (não precisa de isolamento próprio), evitando uma
+        // troca de CR3 extra a cada tick do escalonador.
+        kernel::scheduler::spawn_sharing_current_address_space(&mut frame_allocator, kernel::keyboard_demo::run)
+            .expect("spawn da demonstracao de teclado falhou");
     }
 
     idle_loop();

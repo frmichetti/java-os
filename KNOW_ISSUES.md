@@ -1,5 +1,15 @@
 # Known Issues
 
+## ~~IRQ1 (teclado) entregue só uma vez por sessão de boot a 100 Hz sob QEMU/TCG~~ (NÃO É UM BUG DO KERNEL)
+
+**Status:** investigado a fundo na change `kernel-keyboard` (ver `openspec/changes/archive/.../design.md`, seção "Achados durante a implementação") — confirmado como limitação de timing da emulação por software do QEMU (TCG), não um defeito do kernel. Nenhuma correção de código necessária.
+
+**Sintoma observado:** com o escalonador na frequência padrão de 100 Hz, uma tecla simulada via `sendkey`/QMP no QEMU era recebida e traduzida corretamente, mas nenhuma tecla seguinte (mesmo minutos depois, em conexões separadas) disparava uma nova interrupção. `info lapic` do monitor do QEMU mostrava o vetor do teclado permanentemente pendente em IRR, nunca promovido a ISR.
+
+**Diagnóstico:** descartados como causa (todos testados e refutados com evidência real via GDB/`info lapic`): entrada do I/O APIC mascarada/presa, prioridade do vetor da IDT, IMCR, polaridade/modo de disparo, número de espaços de endereçamento em rotação a cada tick. O fator decisivo foi a frequência do timer: a 2 Hz e 20 Hz a entrega era perfeitamente confiável; só falhava a 100 Hz. **Confirmação definitiva**: rodando com aceleração de hardware real (`-accel kvm -cpu host`) em vez de TCG, a 100 Hz, toda a sequência de teclas foi entregue perfeitamente — prova que o driver está correto e a falha é específica da emulação por software do QEMU sob alta frequência de interrupção concorrente.
+
+**Implicação prática:** verificação manual de drivers de IRQ externa via `cargo xtask run`/`sendkey` sob QEMU padrão (sem KVM) pode mostrar só a primeira interrupção simulada — isso é esperado, não indica regressão. Para verificar de verdade um driver de IRQ externa em boot manual, usar `-accel kvm` (requer `/dev/kvm` acessível) quando disponível.
+
 ## ~~Ausência de guard page na stack principal do kernel~~ (RESOLVIDO)
 
 **Status:** resolvido pela change `kernel-stack-guard-page` (ver `openspec/changes/kernel-stack-guard-page/` — `design.md` para o racional completo).

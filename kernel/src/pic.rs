@@ -20,7 +20,28 @@ const PIC2_VECTOR_OFFSET: u8 = 0x28;
 
 const MASK_ALL_IRQS: u8 = 0xFF;
 
-/// Remapeia o PIC 8259 (master + slave) e então mascara todas as suas IRQs.
+/// Porta de seleção e porta de dados do IMCR (Interrupt Mode Control
+/// Register) — presente no chipset (não no próprio 8259), controla se as
+/// IRQs ISA são eletricamente roteadas para o PIC ou para o I/O APIC.
+const IMCR_SELECT_PORT: u16 = 0x22;
+const IMCR_DATA_PORT: u16 = 0x23;
+const IMCR_SELECT_REGISTER: u8 = 0x70;
+/// Modo APIC: desconecta a saída INTR do PIC da CPU, entregando as IRQs
+/// exclusivamente ao I/O APIC.
+const IMCR_APIC_MODE: u8 = 0x01;
+
+/// Remapeia o PIC 8259 (master + slave), mascara todas as suas IRQs, e
+/// comuta o IMCR para modo APIC.
+///
+/// Achado durante a implementação da change `kernel-keyboard`: mascarar o
+/// PIC (`MASK_ALL_IRQS` abaixo) não basta para que uma IRQ externa roteada
+/// pelo I/O APIC (`kernel::ioapic`) seja entregue de forma confiável — sem
+/// comutar o IMCR para modo APIC, a IRQ1 (teclado) era entregue corretamente
+/// só na primeira vez, e nunca mais depois disso. O timer nunca expôs esse
+/// problema porque é gerado internamente pelo próprio Local APIC (LVT),
+/// sem depender do IMCR nem do I/O APIC — só agora, com o primeiro
+/// dispositivo externo do kernel, o IMCR precisou ser tocado pela primeira
+/// vez.
 pub fn disable() {
     unsafe {
         outb(PIC1_COMMAND, ICW1_INIT_ICW4);
@@ -34,5 +55,8 @@ pub fn disable() {
 
         outb(PIC1_DATA, MASK_ALL_IRQS);
         outb(PIC2_DATA, MASK_ALL_IRQS);
+
+        outb(IMCR_SELECT_PORT, IMCR_SELECT_REGISTER);
+        outb(IMCR_DATA_PORT, IMCR_APIC_MODE);
     }
 }

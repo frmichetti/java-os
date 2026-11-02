@@ -1,0 +1,34 @@
+# Tasks
+
+## 1. `kernel::ioapic`: roteamento mínimo de IRQ externa
+
+- [x] 1.1 Adicionar `kernel::apic::local_apic_id() -> u32` (leitura do registrador de ID do x2APIC, MSR `0x802`). Verificar que `cargo kernel-build` compila; valor real confirmado em boot/GDB na tarefa 5.3 (junto da verificação de ponta a ponta).
+- [x] 1.2 Implementar como funções puras a montagem dos dois dwords (baixo/alto) de uma entrada da tabela de redireção do I/O APIC (ver design.md — modo Fixed, destino físico, borda, polaridade ativa-alta, vetor e máscara parametrizados, destino = ID do Local APIC). Verificar com testes unitários em host: o vetor configurado aparece nos bits corretos do dword baixo, o bit de máscara reflete o parâmetro passado, o modo de entrega/destino/borda/polaridade correspondem aos valores fixos decididos em design.md, e o ID de destino aparece nos bits corretos do dword alto.
+- [x] 1.3 Implementar `kernel::ioapic::route_irq(irq: u8, vector: u8, destination_apic_id: u32)`: escreve os dois dwords da tarefa 1.2 nos registradores da entrada de redireção correspondente a `irq`, via acesso MMIO a `IOREGSEL`/`IOWIN` no endereço fixo `0xFEC00000` (ver design.md). Como depende de MMIO real (não disponível em host), verificar que `cargo kernel-build` compila; o roteamento de verdade é confirmado em boot real na tarefa 5.3.
+
+## 2. `kernel::keyboard`: tradução de scancode (lógica pura)
+
+- [x] 2.1 Implementar as funções puras de reconhecimento de scancode set 1: distinguir make code de break code (bit 7), extrair o make code de um break code, e reconhecer o byte de prefixo de tecla estendida (`0xE0`). Verificar com testes unitários em host cobrindo os três casos (incluindo um make code e um break code do mesmo valor base).
+- [x] 2.2 Definir as tabelas de tradução (sem Shift e com Shift) para as teclas alfanuméricas e de símbolo do layout US QWERTY (ver design.md) e uma função pura `translate(code: u8, shift_held: bool, pending_extended: bool) -> TranslateResult` (ou equivalente) que: devolve o evento de tecla (pressionada/solta + caractere ASCII, quando mapeado) para um scancode reconhecido; não gera evento para o segundo byte de uma sequência estendida (`0xE0` + byte seguinte); e não gera evento para um scancode fora de qualquer tabela conhecida. Verificar com testes unitários em host cobrindo: uma letra sem Shift produz o caractere minúsculo, a mesma letra com Shift ativo produz o caractere maiúsculo/símbolo correspondente, pressionar e soltar Shift (via seus próprios make/break codes) produz eventos sem caractere ASCII mas atualiza corretamente o estado de Shift para a tradução seguinte, um scancode desconhecido não produz evento, e um byte precedido de `0xE0` não produz evento.
+
+## 3. `kernel::keyboard`: fila de eventos (lógica pura)
+
+- [x] 3.1 Implementar um buffer circular de capacidade fixa (32 entradas, ver design.md) para `KeyEvent`, com `push`/`pop`. Verificar com testes unitários em host: eventos são obtidos em `pop` na mesma ordem em que foram inseridos (FIFO), e inserir além da capacidade descarta o evento mais novo mantendo os já presentes intactos e obteníveis na ordem original (nenhum acesso fora dos limites do buffer).
+
+## 4. `kernel::keyboard`/`kernel::hal`: driver real (controlador 8042, IRQ1, `KeyboardDevice`)
+
+- [x] 4.1 Adicionar `kernel::hal::KeyboardDevice` (trait com `fn poll_event(&mut self) -> Option<KeyEvent>`, ver design.md) e o tipo `kernel::keyboard::Ps2Keyboard` (zero-size) implementando-o, delegando para a fila global da tarefa 3.1 por trás de um `Spinlock`, mesmo padrão de `kernel::serial::SERIAL1`/`kernel::framebuffer::CONSOLE`. Verificar que `cargo kernel-build` compila.
+- [x] 4.2 Implementar a inicialização do controlador 8042 (desabilitar os dois canais, esvaziar o buffer de saída, ajustar o byte de configuração para habilitar a IRQ1 do primeiro canal mantendo a IRQ12 desabilitada, reabilitar só o primeiro canal — ver design.md) em `kernel::keyboard::init()`. Como depende de portas de I/O reais (não disponível em host), verificar que `cargo kernel-build` compila; o comportamento real é confirmado em boot na tarefa 5.3.
+- [x] 4.3 Registrar o handler de IRQ1 (lê o scancode de `0x60`, atualiza o estado de Shift e a flag de prefixo estendido, traduz via a tarefa 2.2, empilha na fila da tarefa 3.1 quando há evento, reconhece via EOI do Local APIC) em um vetor livre da IDT (`kernel::idt::set_handler`, mesmo padrão do timer) e chamar `kernel::ioapic::route_irq(1, <vetor>, apic::local_apic_id())` a partir de `kernel::keyboard::init()`. Verificar que `cargo kernel-build` compila; a entrega real da IRQ é confirmada em boot na tarefa 5.3.
+
+## 5. Integração: demonstração, inicialização em `kernel_main` e verificação de ponta a ponta
+
+- [x] 5.1 Implementar `kernel::keyboard_demo::run() -> !` (thread de kernel que consulta `keyboard::poll_event()` em loop e imprime via `serial_println!` cada evento com caractere ASCII presente — ver design.md). Verificar que `cargo kernel-build` compila.
+- [x] 5.2 Em `continue_boot` (`kernel/src/main.rs`), depois do escalonador e do Local APIC já estarem prontos: chamar `kernel::keyboard::init()` e então `kernel::scheduler::spawn(&mut frame_allocator, kernel::keyboard_demo::run)`, mesmo padrão de wiring já usado para o `user_demo` de `kernel-syscalls`. Verificar com `cargo xtask test` que o boot continua passando sem regressão no console serial (o smoke test não envia teclas, então não deve haver nenhuma saída nova do teclado nesse cenário).
+- [x] 5.3 Validar em boot real (QEMU) que uma tecla simulada via o comando `sendkey` do monitor do QEMU (mesma técnica de automação via monitor usada em `kernel-framebuffer-console` para o `screendump`) é recebida e aparece corretamente ecoada nos consoles serial e framebuffer — incluindo pelo menos um caractere com Shift (letra maiúscula). Confirmar também, via GDB ou pela ausência de qualquer exceção/halt reportado, que `local_apic_id()` (tarefa 1.1) e o roteamento de `route_irq` (tarefa 1.3) produziram os valores esperados. **Se a IRQ1 não chegar ao vetor configurado**, investigar antes de prosseguir (candidatos mais prováveis: endereço do I/O APIC incorreto para o QEMU em uso, campo de destino mal calculado, ou o PIC legado capturando a IRQ antes do I/O APIC — ver design.md) e documentar o achado real em design.md, como já é costume neste projeto.
+- [x] 5.4 Confirmar `cargo test -p kernel --lib` (suíte completa de host) sem regressão, incluindo os novos testes das tarefas 1.2, 2.1, 2.2 e 3.1.
+- [x] 5.5 Atualizar `docs/architecture/overview.md`: seção "5. HAL e Drivers" (teclado PS/2 e I/O APIC implementados) e o item 6 do roadmap (teclado concluído; armazenamento/rede continuam pendentes). Verificar lendo o arquivo atualizado.
+
+## Workflow follow-up
+
+- Arquivar esta change após a aprovação do usuário para as modificações propostas.

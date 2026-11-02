@@ -132,11 +132,13 @@
 
 ## 5. HAL e Drivers
 
-- **Primeira abstração de HAL** (`kernel-framebuffer-console`): `trait Console:
-  core::fmt::Write` (`kernel::hal`), sem métodos próprios além de
-  `core::fmt::Write` — suficiente para os dois consoles existentes. Novos
-  drivers (teclado, armazenamento) definirão seus próprios traits
-  (`KeyboardDevice`, `BlockDevice`) no mesmo módulo quando chegar a vez.
+- **HAL em `kernel::hal`**: `trait Console: core::fmt::Write`
+  (`kernel-framebuffer-console`), sem métodos próprios além de
+  `core::fmt::Write` — suficiente para os dois consoles existentes; e
+  `trait KeyboardDevice` (`kernel-keyboard`), com um único método
+  não-bloqueante (`poll_event`), implementado por `kernel::keyboard::Ps2Keyboard`.
+  Futuros drivers (armazenamento) definirão seus próprios traits
+  (`BlockDevice`) no mesmo módulo.
 - **Console de framebuffer** (`kernel-framebuffer-console`, `kernel::framebuffer`):
   segundo canal de saída de texto, sobre o framebuffer linear fornecido pelo
   Limine (`FramebufferRequest`). Conversão de pixel genérica a partir das
@@ -159,9 +161,29 @@
   quando os bytes são UTF-8 válido. Sem console serial ou de framebuffer
   "soltos" sem espelhamento — qualquer novo call site de diagnóstico direto
   na serial deve usar um desses dois mecanismos.
-- Sem teclado, armazenamento ou rede ainda — essa change entregou só a
-  primeira metade do item 6 do roadmap (HAL + framebuffer); os demais
-  drivers continuam pendentes como changes futuras.
+- **I/O APIC mínimo** (`kernel-keyboard`, `kernel::ioapic`): primeiro
+  roteamento de uma IRQ de hardware externa — endereço MMIO fixo
+  (`0xFEC00000`, padrão de plataforma PC-compatível, sem parsing de
+  ACPI/MADT), mapeado via `kernel::paging::Mapper` (a HHDM do Limine não
+  cobre esse endereço). Pré-requisito descoberto durante a implementação:
+  o PIC 8259 legado estava completamente mascarado e não havia nenhum
+  caminho para uma IRQ externa chegar à CPU antes desta change; agora o
+  IMCR (portas 0x22/0x23) também é comutado para modo APIC em
+  `kernel::pic::disable()`.
+- **Teclado PS/2** (`kernel-keyboard`, `kernel::keyboard`): driver do
+  controlador 8042 (primeiro canal) e tradução de scancodes set 1 (com
+  estado de Shift) para eventos de tecla, expostos via a nova abstração de
+  HAL `kernel::hal::KeyboardDevice`. Fila de eventos circular de capacidade
+  fixa, consumida por uma thread de demonstração
+  (`kernel::keyboard_demo`) que ecoa teclas recebidas nos consoles
+  existentes. Verificado via `sendkey`/QMP do QEMU com aceleração de
+  hardware (`-accel kvm`) — sob emulação por software pura (TCG) a 100 Hz
+  (frequência padrão do escalonador), a entrega de IRQ externa de baixa
+  frequência compete mal com o timer e só a primeira tecla simulada chega
+  de forma confiável (limitação de timing do ambiente de teste, não do
+  kernel — ver `KNOW_ISSUES.md`).
+- Sem armazenamento ou rede ainda — os demais drivers do item 6 do roadmap
+  continuam pendentes como changes futuras.
 
 ## 6. Estratégia de Portabilidade do OpenJDK (futuro — maior risco técnico do projeto)
 
@@ -283,7 +305,10 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
 6. **HAL e drivers essenciais** (em andamento): `kernel-framebuffer-console`
    (concluída) entregou a primeira abstração de HAL (`trait Console`) e o
    console de framebuffer, com espelhamento automático do console serial
-   existente. Ainda pendentes: teclado, armazenamento, rede.
+   existente. `kernel-keyboard` (concluída) entregou o primeiro I/O APIC
+   (roteamento de IRQ externa, pré-requisito para qualquer dispositivo
+   externo futuro), o driver de teclado PS/2 e `trait KeyboardDevice`.
+   Ainda pendentes: armazenamento, rede.
 7. **Pesquisa e decisão de estratégia de porte do OpenJDK/HotSpot** (change dedicada).
 8. **Porte inicial da JVM**: primeira JVM minimamente funcional rodando um "hello
    world" Java sobre o Java OS.
