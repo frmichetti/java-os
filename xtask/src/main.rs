@@ -123,6 +123,7 @@ fn run_qemu(root: &Path, extra_args: &[String], headless: bool) -> std::process:
 
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.arg("-M").arg("q35")
+        .arg("-cpu").arg("max") // exigido a partir de kernel-interrupts-timer: precisa expor x2APIC
         .arg("-m").arg("256M")
         .arg("-bios").arg(&ovmf)
         .arg("-drive").arg(format!("file={},format=raw,if=ide", image_path.display()))
@@ -163,6 +164,8 @@ fn run_test(root: &Path) {
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.arg("-M")
         .arg("q35")
+        .arg("-cpu")
+        .arg("max")
         .arg("-m")
         .arg("256M")
         .arg("-bios")

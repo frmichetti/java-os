@@ -34,6 +34,18 @@ impl<T> Spinlock<T> {
         }
         SpinlockGuard { lock: self }
     }
+
+    /// Acessa o valor protegido ignorando completamente o lock.
+    ///
+    /// # Safety
+    /// Só deve ser usada em um contexto de falha irrecuperável (ex.: um
+    /// handler de exceção de CPU prestes a haltar o kernel), onde travar
+    /// esperando um lock que pode já estar (ou ter ficado, por corrupção)
+    /// tomado é pior do que arriscar uma leitura/escrita concorrente —
+    /// nesse ponto o kernel não vai continuar executando de qualquer forma.
+    pub unsafe fn force_get_mut(&self) -> &mut T {
+        unsafe { &mut *self.data.get() }
+    }
 }
 
 impl<T> core::ops::Deref for SpinlockGuard<'_, T> {

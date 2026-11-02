@@ -38,29 +38,24 @@ static _REQUESTS_START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
 #[unsafe(link_section = ".requests_end_marker")]
 static _REQUESTS_END_MARKER: RequestsEndMarker = RequestsEndMarker::new();
 
-/// Halt definitivo: interrupções desabilitadas, `hlt` em loop. Usado tanto ao
-/// final de um boot bem-sucedido quanto a partir do `panic_handler` e de
-/// qualquer caminho de erro irrecuperável durante o boot (ver spec,
-/// "Comportamento Definido de Halt").
-fn hlt_loop() -> ! {
-    unsafe { core::arch::asm!("cli") };
-    loop {
-        unsafe { core::arch::asm!("hlt") }
-    }
-}
+use kernel::{hlt_loop, idle_loop};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main() -> ! {
-    // Sem IDT própria ainda (roadmap item 3): qualquer interrupção de
-    // hardware que chegasse aqui desviaria a execução para a IDT obsoleta
-    // deixada pelo firmware/Limine. Desabilitar interrupções imediatamente
-    // evita isso até que uma IDT própria exista.
+    // Defensivo: interrupções ficam desabilitadas até a IDT/APIC estarem
+    // prontos (não há handler próprio antes disso). Reabilitadas no final
+    // da sequência de boot, em idle_loop().
     unsafe { core::arch::asm!("cli") };
+
+    unsafe { kernel::gdt::init() };
+    kernel::idt::install_default_handlers();
+    kernel::idt::install_exception_handlers();
+    unsafe { kernel::idt::load() };
 
     serial::init();
 
     if !BASE_REVISION.is_supported() {
-        kernel::serial_println!(
+        kernel::serial_println_emergency!(
             "ERRO FATAL: revisao base do protocolo Limine nao suportada (revisao atual do bootloader: {:?}; maxima suportada por este kernel: {}). Abortando o boot.",
             BASE_REVISION.actual_revision(),
             BaseRevision::MAX_SUPPORTED,
@@ -69,7 +64,7 @@ pub extern "C" fn kernel_main() -> ! {
     }
 
     let Some(hhdm_info) = HHDM_REQUEST.response() else {
-        kernel::serial_println!(
+        kernel::serial_println_emergency!(
             "ERRO FATAL: bootloader nao respondeu a HhdmRequest (higher-half direct map indisponivel). Abortando o boot."
         );
         hlt_loop();
@@ -113,7 +108,7 @@ pub extern "C" fn kernel_main() -> ! {
             );
         }
         Err(e) => {
-            kernel::serial_println!(
+            kernel::serial_println_emergency!(
                 "ERRO FATAL: falha ao inicializar o alocador de frames fisicos: {:?}. Abortando o boot.",
                 e
             );
@@ -127,7 +122,7 @@ pub extern "C" fn kernel_main() -> ! {
             kernel::serial_println!("heap do kernel: {} bytes mapeados", kernel::heap::mapped_size());
         }
         Err(e) => {
-            kernel::serial_println!(
+            kernel::serial_println_emergency!(
                 "ERRO FATAL: falha ao inicializar o heap do kernel: {:?}. Abortando o boot.",
                 e
             );
@@ -135,12 +130,24 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
 
-    hlt_loop();
+    if !kernel::apic::supports_x2apic() {
+        kernel::serial_println_emergency!(
+            "ERRO FATAL: CPU nao suporta x2APIC (exigido por este kernel). Abortando o boot."
+        );
+        hlt_loop();
+    }
+    unsafe { kernel::apic::init() };
+    kernel::serial_println!("Local APIC (x2APIC) inicializado; PIC 8259 desabilitado");
+
+    unsafe { kernel::timer::init() };
+    kernel::serial_println!("timer do APIC: configurado (periodico)");
+
+    idle_loop();
 }
 
 #[alloc_error_handler]
 fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
-    kernel::serial_println!(
+    kernel::serial_println_emergency!(
         "ERRO FATAL: falha de alocacao de heap (tamanho={}, alinhamento={}). Abortando o boot.",
         layout.size(),
         layout.align(),
@@ -152,6 +159,6 @@ fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
 fn panic(info: &PanicInfo) -> ! {
     let mut buf = StackBuf::<256>::new();
     let _ = write!(buf, "PANIC: {info}");
-    kernel::serial_println!("{}", buf.as_str());
+    kernel::serial_println_emergency!("{}", buf.as_str());
     hlt_loop();
 }

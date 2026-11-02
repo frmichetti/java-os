@@ -1,24 +1,9 @@
 use core::fmt::{self, Write};
 
+use crate::port::{inb, outb};
 use crate::sync::Spinlock;
 
 const COM1_BASE: u16 = 0x3F8;
-
-#[inline(always)]
-unsafe fn outb(port: u16, val: u8) {
-    unsafe {
-        core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
-    }
-}
-
-#[inline(always)]
-unsafe fn inb(port: u16) -> u8 {
-    let val: u8;
-    unsafe {
-        core::arch::asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack, preserves_flags));
-    }
-    val
-}
 
 /// Driver mínimo para a UART 16550 (porta serial COM1), usado como canal
 /// primário de saída de boot — é trivialmente capturável pelo QEMU sem
@@ -85,6 +70,21 @@ pub fn _print(args: fmt::Arguments) {
     SERIAL1.lock().write_fmt(args).expect("falha ao escrever na porta serial");
 }
 
+/// Variante de emergência: ignora o lock de `SERIAL1` em vez de esperar por
+/// ele. Usada por handlers de exceção de CPU e outros caminhos de falha
+/// irrecuperável, onde o kernel está prestes a haltar e travar esperando um
+/// lock (possivelmente já corrompido pela própria falha) seria pior do que
+/// uma escrita não sincronizada.
+///
+/// # Safety
+/// Só deve ser chamada de um contexto que não vai retornar à execução
+/// normal (o kernel entra em halt logo em seguida).
+#[doc(hidden)]
+pub unsafe fn _print_emergency(args: fmt::Arguments) {
+    let port = unsafe { SERIAL1.force_get_mut() };
+    let _ = port.write_fmt(args);
+}
+
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => ($crate::serial::_print(format_args!($($arg)*)));
@@ -94,4 +94,16 @@ macro_rules! serial_print {
 macro_rules! serial_println {
     () => ($crate::serial_print!("\n"));
     ($($arg:tt)*) => ($crate::serial_print!("{}\n", format_args!($($arg)*)));
+}
+
+/// Ver [`_print_emergency`] — para usar em handlers de falha irrecuperável.
+#[macro_export]
+macro_rules! serial_print_emergency {
+    ($($arg:tt)*) => (unsafe { $crate::serial::_print_emergency(format_args!($($arg)*)) });
+}
+
+#[macro_export]
+macro_rules! serial_println_emergency {
+    () => ($crate::serial_print_emergency!("\n"));
+    ($($arg:tt)*) => ($crate::serial_print_emergency!("{}\n", format_args!($($arg)*)));
 }

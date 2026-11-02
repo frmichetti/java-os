@@ -4,10 +4,11 @@
 > técnica de referência definida originalmente em
 > `openspec/changes/kernel-boot-foundation/design.md` (seção "Arquitetura do Sistema
 > (Referência)"). Ele cobre as 15 áreas de arquitetura do Java OS. Apenas as áreas
-> 1 (Kernel), 2 (Memória, exceto isolamento por processo e huge pages), e 12-14
-> (repositório/build/testes) estão implementadas até o momento (changes
-> `kernel-boot-foundation` e `kernel-memory-management`); as demais ficam
-> registradas aqui para orientar changes futuras.
+> 1 (Kernel, incluindo interrupções/timer), 2 (Memória, exceto isolamento por
+> processo e huge pages), e 12-14 (repositório/build/testes) estão implementadas até
+> o momento (changes `kernel-boot-foundation`, `kernel-memory-management` e
+> `kernel-interrupts-timer`); as demais ficam registradas aqui para orientar changes
+> futuras.
 
 ## 1. Arquitetura do Kernel
 
@@ -20,8 +21,18 @@
 - **Modelo de execução do kernel**: monolítico modular — um único espaço de
   endereçamento privilegiado (anel 0) contendo gerenciamento de memória, escalonador,
   drivers e IPC, organizado em crates Rust internas por subsistema (não microkernel).
-- **Interrupções e exceções**: IDT própria, handlers para exceções de CPU (page fault,
-  GPF, double fault com stack própria via IST) e para IRQs via APIC (não PIC 8259).
+- **Interrupções e exceções**: IDT e GDT/TSS próprios (`kernel::idt`/`kernel::gdt`,
+  change `kernel-interrupts-timer`), substituindo os que o Limine deixa montados no
+  boot. Handlers para as exceções de CPU essenciais (page fault, general protection
+  fault, double fault — este último com stack dedicada via uma entrada de IST no TSS,
+  para continuar funcionando mesmo diante de um estouro da stack corrente). Um handler
+  padrão (reconhece via EOI do Local APIC e retorna) cobre qualquer vetor de IRQ sem
+  handler específico. Interrupções via Local APIC em modo **x2APIC** (MSR-based,
+  obrigatório — sem fallback para xAPIC/MMIO); o PIC 8259 legado é desabilitado. O
+  timer do Local APIC é calibrado contra o PIT 8254 e configurado para disparo
+  periódico, mantendo um contador de ticks (`kernel::timer`) ainda não consumido por
+  nenhum escalonador. Limitação conhecida: a stack do kernel (fornecida pelo Limine)
+  não tem guard page — ver `KNOW_ISSUES.md`.
 - **Concorrência no kernel**: inicialmente single-core; SMP é adiado para uma change
   futura, mas as estruturas de dados já nascem pensando em `Sync`/`Send`.
 
@@ -132,7 +143,8 @@ java-os/
 │   ├── linker.ld
 │   └── src/
 │       ├── lib.rs              # módulos testáveis no host (serial, fmtbuf, memmap_report,
-│       │                       #   hhdm, phys, paging, heap, sync)
+│       │                       #   hhdm, phys, paging, heap, sync, gdt, idt,
+│       │                       #   apic, pic, port, timer)
 │       └── main.rs             # binário bare-metal (#![no_std]#![no_main])
 ├── xtask/                      # automação de build/run/test (cargo-xtask)
 ├── boot/
@@ -180,7 +192,9 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    automatizado + CI.
 2. **`kernel-memory-management`** (concluída): alocador de frames físicos, paginação
    própria (mapear/desmapear sob demanda), heap do kernel crescendo sob demanda.
-3. **Interrupções e timer**: IDT completa, APIC/APIC timer, tratamento de exceções.
+3. **`kernel-interrupts-timer`** (concluída): IDT/GDT/TSS próprios, handlers de
+   exceção de CPU com double fault via IST, Local APIC (x2APIC) substituindo o PIC
+   8259, timer periódico com contador de ticks.
 4. **Processos e threads + escalonador**: espaços de endereçamento por processo,
    troca de contexto, escalonador preemptivo.
 5. **System calls**: ABI `syscall`/`sysret`, primeiras chamadas.
