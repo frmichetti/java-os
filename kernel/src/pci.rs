@@ -29,6 +29,16 @@ pub fn read_config_dword(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     }
 }
 
+/// Escreve `value` no dword de configuração em `offset` da função PCI
+/// (`bus`, `device`, `function`) — ver `design.md` da change
+/// `kernel-network`, "PCI: habilitar Bus Mastering explicitamente".
+pub fn write_config_dword(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+    unsafe {
+        outl(CONFIG_ADDRESS_PORT, config_address(bus, device, function, offset));
+        outl(CONFIG_DATA_PORT, value);
+    }
+}
+
 /// Vendor ID reportado quando não há função PCI presente nessa posição do
 /// barramento.
 const NO_DEVICE_VENDOR_ID: u16 = 0xffff;

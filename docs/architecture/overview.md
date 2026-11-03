@@ -137,9 +137,12 @@
   `core::fmt::Write` — suficiente para os dois consoles existentes;
   `trait KeyboardDevice` (`kernel-keyboard`), com um único método
   não-bloqueante (`poll_event`), implementado por `kernel::keyboard::Ps2Keyboard`;
-  e `trait BlockDevice` (`kernel-storage`), com `block_size`/`read_block`/
-  `write_block` por LBA, implementado por `kernel::storage::AhciDisk`.
-  Futuros drivers (rede) definirão seus próprios traits no mesmo módulo.
+  `trait BlockDevice` (`kernel-storage`), com `block_size`/`read_block`/
+  `write_block` por LBA, implementado por `kernel::storage::AhciDisk`; e
+  `trait NetworkDevice` (`kernel-network`), com `mac_address`/`send_frame`/
+  `poll_frame`, implementado por `kernel::network::E1000Nic`. Com isso, os
+  quatro traits previstos desde `kernel-framebuffer-console` (saída,
+  teclado, armazenamento, rede) estão todos implementados.
 - **Console de framebuffer** (`kernel-framebuffer-console`, `kernel::framebuffer`):
   segundo canal de saída de texto, sobre o framebuffer linear fornecido pelo
   Limine (`FramebufferRequest`). Conversão de pixel genérica a partir das
@@ -198,7 +201,25 @@
   tentativa — ao contrário do teclado, este driver não depende de nenhuma
   IRQ, então não sofre da limitação de timing do QEMU/TCG documentada em
   `KNOW_ISSUES.md`.
-- Sem rede ainda — fica como o último driver pendente do item 6 do roadmap.
+- **Rede** (`kernel-network`, `kernel::network`): driver de placa Ethernet
+  Intel 82540EM (`e1000`) — localizado via `kernel::pci`, com Bus Mastering
+  habilitado explicitamente no registrador de comando PCI (`kernel::pci`
+  ganhou escrita de configuração nesta change — até então só lia) e `BAR0`
+  mapeado explicitamente (mesmo tratamento do I/O APIC/`ABAR`). Anéis de
+  descritores de recepção/transmissão (8 cada), envio/recepção de quadros
+  Ethernet brutos por *polling* (sem IRQ, mesma decisão de `kernel-storage`
+  — nenhum dos dois sofre da limitação de timing do QEMU/TCG documentada em
+  `KNOW_ISSUES.md`, exclusiva do teclado). O modelo da placa é fixado
+  explicitamente via uma nova flag em `xtask` (`-device e1000`), em vez de
+  depender do modelo que o QEMU expõe por padrão (uma Intel 82574L/e1000e,
+  descoberta durante a pesquisa desta change). Verificado em boot real:
+  endereço MAC lido corretamente, quadro de teste aceito pela placa, e
+  confirmado via captura de pacotes (`-object filter-dump` do QEMU) que os
+  bytes exatos do quadro saíram pela rede emulada.
+
+Com `kernel-network`, o item 6 do roadmap (HAL e drivers essenciais) está
+**completo**: console serial, framebuffer, timer/APIC, I/O APIC, teclado,
+armazenamento e rede — todos implementados.
 
 ## 6. Estratégia de Portabilidade do OpenJDK (futuro — maior risco técnico do projeto)
 
@@ -317,15 +338,16 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    4 argumentos + retorno), duas primeiras chamadas (escrita no console,
    consulta de ticks) — ainda sem carregador de executáveis nem isolamento de
    falhas por processo.
-6. **HAL e drivers essenciais** (em andamento): `kernel-framebuffer-console`
-   (concluída) entregou a primeira abstração de HAL (`trait Console`) e o
-   console de framebuffer, com espelhamento automático do console serial
-   existente. `kernel-keyboard` (concluída) entregou o primeiro I/O APIC
-   (roteamento de IRQ externa, pré-requisito para qualquer dispositivo
-   externo futuro), o driver de teclado PS/2 e `trait KeyboardDevice`.
-   `kernel-storage` (concluída) entregou acesso a configuração PCI
-   (`kernel::pci`), o driver de bloco bruto AHCI e `trait BlockDevice`.
-   Ainda pendente: rede.
+6. **HAL e drivers essenciais** (concluído): `kernel-framebuffer-console`
+   entregou a primeira abstração de HAL (`trait Console`) e o console de
+   framebuffer, com espelhamento automático do console serial existente.
+   `kernel-keyboard` entregou o primeiro I/O APIC (roteamento de IRQ
+   externa, pré-requisito para qualquer dispositivo externo futuro), o
+   driver de teclado PS/2 e `trait KeyboardDevice`. `kernel-storage`
+   entregou acesso a configuração PCI (`kernel::pci`), o driver de bloco
+   bruto AHCI e `trait BlockDevice`. `kernel-network` entregou escrita de
+   configuração PCI, o driver de placa Ethernet e1000 e `trait
+   NetworkDevice`, fechando este item do roadmap.
 7. **Pesquisa e decisão de estratégia de porte do OpenJDK/HotSpot** (change dedicada).
 8. **Porte inicial da JVM**: primeira JVM minimamente funcional rodando um "hello
    world" Java sobre o Java OS.

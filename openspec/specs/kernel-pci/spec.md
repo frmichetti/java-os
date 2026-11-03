@@ -19,3 +19,10 @@ Para um dispositivo PCI já localizado pela enumeração, o kernel SHALL ser cap
 #### Scenario: Endereço base de um dispositivo é obtido corretamente
 - **WHEN** o kernel consulta o endereço base registrado na configuração PCI de um dispositivo já localizado
 - **THEN** o kernel SHALL devolver o endereço correspondente ao que o próprio dispositivo reportou na sua configuração, sem valores inventados ou de outro dispositivo
+
+### Requirement: Escrita de Configuração de um Dispositivo PCI Já Localizado
+Para um dispositivo PCI já localizado pela enumeração, o kernel SHALL ser capaz de escrever um registrador de sua configuração, de forma que um driver consiga habilitar capacidades do dispositivo que dependem disso (ex.: Bus Mastering, necessário para DMA).
+
+#### Scenario: Registrador escrito reflete o valor escrito numa leitura seguinte
+- **WHEN** o kernel escreve um valor num registrador de configuração de um dispositivo PCI já localizado e, em seguida, lê esse mesmo registrador
+- **THEN** o valor lido SHALL refletir a escrita realizada, não o valor anterior

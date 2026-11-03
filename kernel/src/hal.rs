@@ -38,3 +38,14 @@ pub trait BlockDevice {
     fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError>;
     fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError>;
 }
+
+/// Qualquer placa de rede que envia/recebe quadros Ethernet brutos —
+/// independe de qual controlador físico específico o implementa (hoje só
+/// a placa e1000, `kernel::network::E1000Nic`). `poll_frame` é
+/// não-bloqueante, mesmo espírito de `KeyboardDevice::poll_event` — ver
+/// `design.md` da change `kernel-network`.
+pub trait NetworkDevice {
+    fn mac_address(&self) -> [u8; 6];
+    fn send_frame(&mut self, frame: &[u8]) -> Result<(), crate::network::NetworkError>;
+    fn poll_frame(&mut self, buf: &mut [u8]) -> Option<usize>;
+}

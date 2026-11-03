@@ -257,6 +257,24 @@ extern "C" fn continue_boot() -> ! {
         }
     }
 
+    // Rede (placa e1000): depois do escalonador e do I/O APIC já prontos —
+    // ver `design.md` da change `kernel-network`. Indisponibilidade (sem
+    // placa de rede encontrada) é tratada explicitamente: reporta e
+    // prossegue o boot normalmente, sem travar.
+    {
+        let mut frame_allocator = kernel::phys::FRAME_ALLOCATOR.lock();
+        match kernel::network::init(&mut frame_allocator) {
+            Ok(()) => {
+                kernel::serial_println!("rede: placa e1000 inicializada");
+                drop(frame_allocator);
+                kernel::network_demo::run();
+            }
+            Err(e) => {
+                kernel::serial_println!("rede: indisponivel ({:?}); prosseguindo sem rede", e);
+            }
+        }
+    }
+
     // Depois da thread de boot já registrada (TSS.rsp0/CURRENT_KERNEL_STACK_TOP
     // corretos — ver design.md da change `kernel-syscalls`).
     unsafe { kernel::syscall::init() };

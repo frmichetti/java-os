@@ -127,6 +127,11 @@ fn run_qemu(root: &Path, extra_args: &[String], headless: bool) -> std::process:
         .arg("-m").arg("256M")
         .arg("-bios").arg(&ovmf)
         .arg("-drive").arg(format!("file={},format=raw,if=ide", image_path.display()))
+        // Fixa explicitamente o modelo da placa de rede (Intel 82540EM, bem
+        // documentado) em vez de depender do padrão do QEMU — ver design.md
+        // da change `kernel-network`.
+        .arg("-netdev").arg("user,id=n0")
+        .arg("-device").arg("e1000,netdev=n0")
         .arg("-no-reboot")
         .arg("-no-shutdown");
 
@@ -172,6 +177,12 @@ fn run_test(root: &Path) {
         .arg(&ovmf)
         .arg("-drive")
         .arg(format!("file={},format=raw,if=ide", image_path.display()))
+        // Mesma flag de rede fixa de `run_qemu` — ver design.md da change
+        // `kernel-network`.
+        .arg("-netdev")
+        .arg("user,id=n0")
+        .arg("-device")
+        .arg("e1000,netdev=n0")
         .arg("-no-reboot")
         .arg("-no-shutdown")
         .arg("-display")

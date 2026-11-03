@@ -13,6 +13,8 @@ pub mod ioapic;
 pub mod keyboard;
 pub mod keyboard_demo;
 pub mod memmap_report;
+pub mod network;
+pub mod network_demo;
 pub mod paging;
 pub mod pci;
 pub mod phys;
