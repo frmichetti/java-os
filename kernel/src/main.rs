@@ -320,6 +320,17 @@ extern "C" fn continue_boot() -> ! {
             .expect("spawn da produtora de wait_demo falhou");
         kernel::scheduler::spawn_sharing_current_address_space(&mut frame_allocator, kernel::wait_demo::consumer)
             .expect("spawn da consumidora de wait_demo falhou");
+
+        // Demonstração de `kernel::pthread` (Mutex/CondVar) — ver design.md
+        // da change `kernel-pthread-sync`.
+        for _ in 0..kernel::pthread_demo::COUNTER_THREAD_COUNT {
+            kernel::scheduler::spawn_sharing_current_address_space(&mut frame_allocator, kernel::pthread_demo::counter_worker)
+                .expect("spawn de uma thread do cenario de contador de pthread_demo falhou");
+        }
+        kernel::scheduler::spawn_sharing_current_address_space(&mut frame_allocator, kernel::pthread_demo::box_producer)
+            .expect("spawn da produtora da caixa de pthread_demo falhou");
+        kernel::scheduler::spawn_sharing_current_address_space(&mut frame_allocator, kernel::pthread_demo::box_consumer)
+            .expect("spawn da consumidora da caixa de pthread_demo falhou");
     }
 
     idle_loop();

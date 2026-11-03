@@ -62,7 +62,65 @@ impl WaitQueue {
     pub fn block_current(&'static self) {
         let current = scheduler::current_thread_id();
         scheduler::with_interrupts_disabled(|| set_block_intent(current, self));
+        self.commit_block();
+    }
 
+    /// Bloqueia a thread corrente nesta fila **somente se** `predicate`
+    /// ainda for verdadeiro no instante em que a intenção de bloqueio seria
+    /// registrada — a reavaliação de `predicate` e o registro da intenção
+    /// acontecem como uma única operação atômica em relação a interrupções
+    /// (`with_interrupts_disabled`), para que nenhum `wake_one`/`wake_all`
+    /// concorrente (que torne `predicate` falso) possa acontecer entre a
+    /// checagem original do chamador e este bloqueio — ver design.md da
+    /// change `kernel-pthread-sync`, "`Mutex::lock()` evita despertar
+    /// perdido". Usada por `kernel::pthread::Mutex::lock`.
+    pub(crate) fn block_current_if(&'static self, predicate: impl FnOnce() -> bool) {
+        let current = scheduler::current_thread_id();
+        let should_block = scheduler::with_interrupts_disabled(|| self.try_register_block_intent(current, predicate));
+        if should_block {
+            self.commit_block();
+        }
+    }
+
+    /// Lógica pura de `block_current_if`: reavalia `predicate` e, se
+    /// verdadeiro, registra a intenção de bloqueio para `current` nesta
+    /// fila, devolvendo se registrou. Separada do método público só para
+    /// ser testável em host sem depender de `scheduler::current_thread_id`
+    /// (hardware real). O chamador garante que isto roda com interrupções
+    /// já desabilitadas.
+    fn try_register_block_intent(&'static self, current: ThreadId, predicate: impl FnOnce() -> bool) -> bool {
+        if predicate() {
+            set_block_intent(current, self);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Registra a intenção de bloqueio da thread corrente nesta fila, **sem
+    /// ainda bloquear** — usado por `kernel::pthread::CondVar::wait`, que
+    /// precisa registrar a intenção atomicamente **junto com** a liberação
+    /// do mutex associado (chamador deve envolver esta chamada e a
+    /// liberação do mutex no mesmo `scheduler::with_interrupts_disabled`),
+    /// para que nenhum tick real de hardware possa interceptar a intenção e
+    /// bloquear a thread *antes* dela liberar o mutex (o que a deixaria
+    /// presa para sempre, com o mutex nunca liberado) — ver design.md da
+    /// change `kernel-pthread-sync`. Chamador deve, em seguida, chamar
+    /// [`Self::commit_block`] para efetivar o bloqueio de fato.
+    pub(crate) fn register_intent_for(&'static self, current: ThreadId) {
+        set_block_intent(current, self);
+    }
+
+    /// Dispara a interrupção de software dedicada a pedidos de bloqueio
+    /// (`scheduler::BLOCK_VECTOR`), reentrando no mecanismo de
+    /// salvar/restaurar contexto já usado pelo timer, mas num vetor
+    /// distinto — ver design.md da change `kernel-wait-queue`, "Achados
+    /// durante a implementação". Só retorna quando esta thread for de fato
+    /// despertada e escolhida de novo pelo escalonador, retomando
+    /// exatamente de onde bloqueou. Assume que uma intenção de bloqueio já
+    /// foi registrada para a thread corrente (por `block_current`,
+    /// `block_current_if` ou `register_intent_for`).
+    pub(crate) fn commit_block(&self) {
         unsafe {
             core::arch::asm!(
                 "int {vector}",
@@ -140,6 +198,17 @@ pub(crate) fn take_block_intent(was_running: ThreadId) -> bool {
 mod tests {
     use super::*;
 
+    /// Serializa os testes que tocam o estado global `BLOCK_INTENT`: o
+    /// executor de testes do Rust roda testes em paralelo (threads
+    /// distintas) por padrão, e `BLOCK_INTENT` é um único `static`
+    /// compartilhado por todo o processo de teste — sem isso, dois desses
+    /// testes rodando ao mesmo tempo podem interferir um no outro (cada um
+    /// limpando/checando o estado que o outro acabou de escrever). Achado
+    /// ao adicionar mais testes que tocam o mesmo estado nesta change
+    /// (`kernel-pthread-sync`); os testes puros de `BlockedQueue`, que não
+    /// tocam estado global nenhum, não precisam deste lock.
+    static BLOCK_INTENT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn blocked_queue_wakes_threads_in_fifo_order() {
         let mut queue = BlockedQueue::new();
@@ -158,8 +227,7 @@ mod tests {
 
     #[test]
     fn take_block_intent_matches_only_the_registered_thread() {
-        // Limpa qualquer intenção deixada por outro teste rodando em
-        // paralelo no mesmo processo de host (estado global compartilhado).
+        let _guard = BLOCK_INTENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         *BLOCK_INTENT.lock() = None;
 
         static QUEUE: WaitQueue = WaitQueue::new();
@@ -174,7 +242,35 @@ mod tests {
     }
 
     #[test]
+    fn try_register_block_intent_does_nothing_when_predicate_is_false() {
+        let _guard = BLOCK_INTENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *BLOCK_INTENT.lock() = None;
+        static QUEUE: WaitQueue = WaitQueue::new();
+
+        let registered = QUEUE.try_register_block_intent(ThreadId(5), || false);
+
+        assert!(!registered);
+        assert!(BLOCK_INTENT.lock().is_none());
+    }
+
+    #[test]
+    fn try_register_block_intent_registers_when_predicate_is_true() {
+        let _guard = BLOCK_INTENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *BLOCK_INTENT.lock() = None;
+        static QUEUE: WaitQueue = WaitQueue::new();
+
+        let registered = QUEUE.try_register_block_intent(ThreadId(6), || true);
+
+        assert!(registered);
+        // `take_block_intent` consome a intenção registrada: confirma que
+        // ela realmente foi gravada para a thread certa, na fila certa.
+        assert!(take_block_intent(ThreadId(6)));
+        assert_eq!(QUEUE.blocked.lock().pop(), Some(ThreadId(6)));
+    }
+
+    #[test]
     fn taking_the_intent_parks_the_thread_in_the_target_queue() {
+        let _guard = BLOCK_INTENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         *BLOCK_INTENT.lock() = None;
 
         static QUEUE: WaitQueue = WaitQueue::new();

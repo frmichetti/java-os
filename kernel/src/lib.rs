@@ -21,6 +21,8 @@ pub mod phys;
 pub mod pic;
 pub mod port;
 pub mod process;
+pub mod pthread;
+pub mod pthread_demo;
 pub mod scheduler;
 pub mod serial;
 pub mod stack;

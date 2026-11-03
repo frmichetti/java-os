@@ -9,8 +9,9 @@
 > executáveis e isolamento de falhas — ver a seção), e 12-14 (repositório/build/testes)
 > estão implementadas até o momento (changes `kernel-boot-foundation`,
 > `kernel-memory-management`, `kernel-interrupts-timer`, `kernel-stack-guard-page`,
-> `kernel-process-scheduler`, `kernel-syscalls`, `kernel-posix-virtual-memory` e
-> `kernel-wait-queue`); as demais ficam registradas aqui para orientar changes futuras.
+> `kernel-process-scheduler`, `kernel-syscalls`, `kernel-posix-virtual-memory`,
+> `kernel-wait-queue` e `kernel-pthread-sync`); as demais ficam registradas aqui
+> para orientar changes futuras.
 
 ## 1. Arquitetura do Kernel
 
@@ -139,6 +140,22 @@
   `KNOW_ISSUES.md`, "Duas threads de kernel imprimindo concorrentemente travam o
   timer de hardware para sempre" (RESOLVIDO): `_print`/`MirroredWriter` agora são
   atômicos em relação a interrupções.
+- **`pthread_mutex`/`pthread_cond` nomeados** (`kernel-pthread-sync`, `kernel::pthread`):
+  segunda sub-change do item 8 do roadmap, construída sobre `kernel::wait_queue`.
+  `Mutex` (exclusão mútua não-reentrante, bloqueio real sem busy-wait — `lock`/`unlock`)
+  e `CondVar` (variável de condição estilo POSIX/Java — `wait(&Mutex)`/`notify_one`/
+  `notify_all`, libera e reaquire o mutex associado atomicamente ao redor da espera).
+  `WaitQueue` ganhou uma primitiva de bloqueio condicional (`block_current_if`, reavalia
+  um predicado e registra a intenção de bloqueio como uma única operação atômica em
+  relação a interrupções) para que `Mutex::lock` nunca perca um `unlock` concorrente —
+  a garantia de `CondVar` contra notificação perdida depende da convenção de notificar
+  com o mutex associado detido, mesmo contrato de `pthread_cond_signal`/`Object.notify`.
+  Ainda sem *syscall* expondo isso a modo usuário, sem suporte a *timeout* e sem mutex
+  reentrante — ficam para sub-changes futuras do item 8. Verificado em boot real via
+  `kernel::pthread_demo`: um contador disputado por 4 threads sob o mesmo `Mutex`
+  fecha exatamente com a soma esperada (nenhum incremento perdido) e um par
+  produtor/consumidor com `Mutex`+`CondVar` entrega o item corretamente, em múltiplas
+  execuções independentes.
 - "Processo" no Java OS pode, no futuro, significar tanto um processo nativo do kernel
   quanto uma aplicação Java rodando dentro de uma JVM isolada — ainda não implementado
   (depende do porte da JVM, roadmap itens 7-9).
@@ -443,12 +460,14 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    camada de memória virtual anônima POSIX (`kernel::vmm` —
    `reserve`/`commit`/`decommit`/`protect`/`release`, base de `mmap`/`munmap`/
    `mprotect`) e a primitiva `Mapper::protect` em `kernel-paging` (ver seção 2).
-   Ainda faltam: `pthread_mutex`/`pthread_cond` como API nomeada, sinal de
-   safepoint (SIGSEGV de página de polling), relógio de parede
-   (`clock_gettime`), sistema de arquivos (para `open`/`read` de classes),
-   carregamento dinâmico de bibliotecas (build estático do JDK, ou um linker ELF
-   dinâmico mínimo), e o próprio porte do HotSpot — ver seção 6 para o inventário
-   completo.
+   `kernel-pthread-sync` (concluída) entregou a terceira sub-change: `pthread_mutex`/
+   `pthread_cond` nomeados (`kernel::pthread::{Mutex, CondVar}`, ver seção 3),
+   construídos sobre `kernel::wait_queue`. Ainda faltam: *syscalls* expondo essas
+   primitivas a modo usuário, sinal de safepoint (SIGSEGV de página de polling),
+   relógio de parede (`clock_gettime`), sistema de arquivos (para `open`/`read` de
+   classes), carregamento dinâmico de bibliotecas (build estático do JDK, ou um
+   linker ELF dinâmico mínimo), e o próprio porte do HotSpot — ver seção 6 para o
+   inventário completo.
 9. **Modelo híbrido de execução de JVM**: runtime compartilhado vs. JVM isolada por
    aplicação.
 10. **Java OS Platform (Java)**: gerenciamento de arquivos, serviços de sistema, rede,
