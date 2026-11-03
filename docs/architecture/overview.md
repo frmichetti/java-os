@@ -221,15 +221,56 @@ Com `kernel-network`, o item 6 do roadmap (HAL e drivers essenciais) está
 **completo**: console serial, framebuffer, timer/APIC, I/O APIC, teclado,
 armazenamento e rede — todos implementados.
 
-## 6. Estratégia de Portabilidade do OpenJDK (futuro — maior risco técnico do projeto)
+## 6. Estratégia de Portabilidade do OpenJDK (decidida — maior risco técnico do projeto)
 
 - Portar o HotSpot completo para um kernel próprio e não-POSIX é a tarefa de maior
   risco do projeto, pois o HotSpot assume um ambiente hospedeiro rico (libc, pthreads,
   mmap/mprotect POSIX, sinais Unix, `/proc`, etc.).
-- Caminhos a avaliar em uma change dedicada: (1) camada de compatibilidade POSIX
-  mínima no kernel; (2) porte direto das camadas de abstração de SO do próprio
-  HotSpot; (3) JVM alternativa minimalista para bootstrap inicial em paralelo ao
-  porte completo.
+- **Decisão (`jvm-posix-compat-strategy`)**: camada de compatibilidade POSIX mínima
+  implementada no kernel, para que o HotSpot (ou uma JVM derivada) rode sobre ela com
+  o mínimo de modificação possível no seu próprio código-fonte — idealmente tratando o
+  Java OS como "mais um `os_<plataforma>`" dentro da estrutura já existente de
+  `src/hotspot/os/<plataforma>` do HotSpot, análogo a `os_linux`/`os_bsd`.
+  Alternativas descartadas: porte direto das camadas de abstração de SO do próprio
+  HotSpot para as primitivas nativas do kernel sem POSIX intermediário (acoplamento
+  profundo demais com código interno do HotSpot, que muda entre versões); e JVM
+  alternativa minimalista para bootstrap (adiaria, não eliminaria, o problema).
+- **Inventário de primitivas POSIX mínimas exigidas pelo HotSpot** (pesquisado em
+  `jvm-posix-compat-strategy/design.md`, com fontes), cruzado com o que o kernel já
+  tem:
+  - *Memória virtual* (`mmap`/`munmap`/`mprotect`, para heap Java, *code cache* do JIT
+    e páginas de guarda): o kernel só tem `kernel::paging::Mapper::map`/`map_new`
+    (página já resolvida, sem conceito de "reservado mas não committado", nem de
+    alterar permissões de uma página já mapeada).
+  - *Threads nativas e sincronização* (`pthread_create`, `pthread_mutex`/`pthread_cond`
+    — base de `park`/`unpark`, `Object.wait`/`notify`, `java.util.concurrent`): o
+    escalonador cria threads kernel, mas não há API pensada para uma VM hóspede, e
+    **não existe nenhuma primitiva de bloqueio/sono de thread no kernel hoje** (só
+    *busy-wait* via `kernel::sync::Spinlock`) — o maior gap estrutural identificado.
+  - *Sinal de safepoint* (`SIGSEGV` numa página de polling protegida, para parar todas
+    as threads Java simultaneamente sem polling explícito em cada ponto de segurança):
+    o `page_fault_handler` da IDT (vetor 14) existe, mas hoje trata qualquer falta de
+    página como evento fatal — falta um mecanismo de "esta página gera um desvio para
+    um handler escolhido pelo processo", análogo a `sigaction(SIGSEGV, ...)`.
+  - *Relógio* (`clock_gettime`, para `System.nanoTime()`/`currentTimeMillis()`):
+    `kernel::timer` já conta ticks desde o boot; falta relógio de parede real e,
+    possivelmente, resolução mais fina.
+  - *E/S de arquivo* (`open`/`read`, para carregar classes do *class path*):
+    `kernel::storage`/`hal::BlockDevice` só dão blocos brutos — falta um sistema de
+    arquivos inteiro antes mesmo de expor `open`/`read` de verdade.
+- **Risco não previsto originalmente, registrado sem decisão fechada**: o HotSpot "de
+  fábrica" também depende de **carregamento dinâmico de bibliotecas compartilhadas**
+  (`libjvm.so` carregando `libjava.so` via `dlopen`/linker dinâmico, e JNI carregando
+  bibliotecas nativas de aplicações) — um requisito de peso comparável aos acima, sem
+  solução óbvia num kernel sem linker dinâmico de ELF. Candidato mais promissor para
+  avaliação na change do item 8 do roadmap: build totalmente estático do JDK (linha de
+  trabalho já experimental, e ainda incompleta, no próprio projeto OpenJDK/Leyden);
+  alternativa, caso se prove inviável: implementar um linker dinâmico de ELF mínimo no
+  kernel. Nenhuma das duas é decidida nesta etapa.
+- Esta change não implementa nenhuma primitiva nova — isso fica inteiramente para a
+  change do item 8 do roadmap ("Porte inicial da JVM"), que decide a forma concreta de
+  cada primitiva do inventário acima (ex.: syscalls novas vs. extensão das existentes)
+  antes de integrar um HotSpot de fato.
 
 ## 7. Arquitetura da JVM (futuro)
 
@@ -348,7 +389,10 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    bruto AHCI e `trait BlockDevice`. `kernel-network` entregou escrita de
    configuração PCI, o driver de placa Ethernet e1000 e `trait
    NetworkDevice`, fechando este item do roadmap.
-7. **Pesquisa e decisão de estratégia de porte do OpenJDK/HotSpot** (change dedicada).
+7. **`jvm-posix-compat-strategy`** (concluída): decisão formal da estratégia de porte
+   do OpenJDK/HotSpot — camada de compatibilidade POSIX mínima no kernel (ver
+   seção 6) — e inventário das primitivas que faltam, sem nenhuma implementação
+   ainda.
 8. **Porte inicial da JVM**: primeira JVM minimamente funcional rodando um "hello
    world" Java sobre o Java OS.
 9. **Modelo híbrido de execução de JVM**: runtime compartilhado vs. JVM isolada por
