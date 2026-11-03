@@ -1,5 +1,29 @@
 # Known Issues
 
+## Duas threads de kernel imprimindo concorrentemente travam o timer de hardware para sempre
+
+**Status:** descoberto durante a implementação da change `kernel-wait-queue` (ver `openspec/changes/kernel-wait-queue/design.md`, seção "Achados durante a implementação" — nº 2), ao tentar ligar `kernel::wait_demo` (produtora/consumidora) em boot real. **Não corrigido ainda** — causa raiz exata não identificada; bloqueia qualquer change futura que precise de duas ou mais threads de kernel imprimindo (`serial_println!`/a *syscall* de escrita) repetidamente de forma concorrente.
+
+**Sintoma observado:** assim que uma segunda thread de kernel (além de `kernel::user_demo`, que já imprime em laço apertado via *syscall*) chama `serial_println!` repetidamente, o kernel trava por completo após 1-4 impressões dessa segunda thread — nenhuma mensagem nova aparece no console serial depois disso, nem mesmo as de `user_demo` (que até então imprimia continuamente). O travamento é permanente (observado por até 30s sem nenhum progresso).
+
+**Isolado por eliminação, em boot real (QEMU), três testes consecutivos:**
+1. Uma 5ª thread que só faz `loop { sti; hlt; }` (sem imprimir nada) — **funciona perfeitamente**, indefinidamente.
+2. Uma **segunda instância** de `kernel::keyboard_demo::run` (código já existente, comprovado em changes anteriores) como 5ª thread — **funciona perfeitamente** (nunca imprime, já que não há evento de teclado real sob QEMU headless, mas confirma que "5 threads" por si só não é a causa).
+3. Uma thread que só chama `serial_println!("PING {n}")` em laço, **sem nenhum código de `kernel::wait_queue`/`block_current`/`kernel::vmm` envolvido** — trava exatamente da mesma forma, já na 1ª-2ª impressão.
+
+**Conclusão do isolamento:** o travamento não tem nenhuma relação com o mecanismo de bloqueio/despertar de `kernel-wait-queue`, nem com `kernel::vmm` — é um bug pré-existente em `kernel::serial`/`kernel::framebuffer`, disparado por qualquer segunda thread de kernel chamando o caminho de impressão (`serial_println!`/`_print`/`mirror` ou a *syscall* de escrita/`sys_write`/`mirror_str`) **concorrentemente** com outra que já faz o mesmo. Nenhuma change anterior jamais teve duas threads imprimindo continuamente ao mesmo tempo (as demos anteriores imprimem uma vez só — `storage_demo`/`network_demo`/`vmm_demo` — ou nunca de fato, no caso de `keyboard_demo` sem teclado real), então esta é a primeira vez que esse caminho é exercitado de verdade.
+
+**Evidência coletada via GDB** (anexado ao QEMU travado, `qemu-system-x86_64 ... -s` + `gdb -q -batch -x cmds.txt target/x86_64-java_os/debug/kernel`, `target remote localhost:1234`):
+- `kernel::timer::TICKS` para de incrementar **permanentemente** — mesmo valor em amostras sucessivas, confirmando que o timer periódico do Local APIC simplesmente para de disparar a partir desse ponto (não é um impasse de lógica de escalonamento: nada mais acontece porque nenhuma interrupção futura jamais chega).
+- `kernel::scheduler::READY_QUEUE` continua com **todas** as threads registradas (nenhuma "sumiu" da rotação) — descarta a hipótese de uma thread ter sido removida da fila e nunca devolvida.
+- A thread presa no momento de cada amostragem está sempre girando em `kernel::sync::Spinlock::lock()` (via `core::hint::spin_loop`/`_mm_pause`) esperando o lock de `kernel::framebuffer::CONSOLE`, que fica permanentemente marcado como tomado (`locked: true`) — nunca dentro de um handler de exceção de CPU (`EXCECAO #PF/#GP/#DF` não aparece no console serial), nunca dentro de `hlt_loop`.
+
+**Hipóteses descartadas** (todas testadas e refutadas com os três testes acima): colisão de endereço virtual entre `kernel::vmm::VMM_WINDOW_START` e `kernel::stack::THREAD_STACK_POOL_BASE` (ambos coincidentemente `0xffff_b000_0000_0000` — **observação separada, válida, mas não é a causa ativa deste travamento**: `kernel::vmm_demo` sempre libera tudo antes de qualquer stack de thread ser alocada no mesmo endereço, sem sobreposição real de uso); limite fixo de threads/stacks (refutado pelo teste 2); o mecanismo de `int`/vetor de software desta change (refutado pelo teste 3, que não usa nada de `kernel::wait_queue`).
+
+**Hipóteses não descartadas, candidatas para investigação futura:** uma condição de corrida real em `kernel::framebuffer::mirror`/`mirror_str` (que mantém o lock de `CONSOLE` durante toda a formatação/desenho dos glifos, com interrupções habilitadas) quando uma thread é preemptada no meio dessa seção crítica e, por alguma razão ainda não identificada, nunca mais retoma para liberar o lock — mas por que isso faria o **timer de hardware real** parar de disparar (não apenas um impasse lógico de escalonamento) não foi explicado; merece investigação com um breakpoint no handler de `#GP`/verificação do registrador `LVT_TIMER`/`IA32_APIC_BASE` no momento exato do travamento, e possivelmente logging adicional em `kernel::framebuffer::put_pixel`/`draw_glyph` para checar uma escrita fora dos limites do framebuffer (com `width`/`pitch` corretos, mas talvez alguma conversão de índice incorreta sob concorrência).
+
+**Impacto prático:** nenhuma demo de verificação que precise de duas threads de kernel imprimindo continuamente pode ser ligada em boot real até este bug ser corrigido. `kernel::wait_demo` (produtora/consumidora) desta change teve que ser adaptado para evitar esse padrão (ver proposal.md/tasks.md para a abordagem final adotada).
+
 ## ~~IRQ1 (teclado) entregue só uma vez por sessão de boot a 100 Hz sob QEMU/TCG~~ (NÃO É UM BUG DO KERNEL)
 
 **Status:** investigado a fundo na change `kernel-keyboard` (ver `openspec/changes/archive/.../design.md`, seção "Achados durante a implementação") — confirmado como limitação de timing da emulação por software do QEMU (TCG), não um defeito do kernel. Nenhuma correção de código necessária.

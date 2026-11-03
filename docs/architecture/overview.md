@@ -9,8 +9,8 @@
 > executáveis e isolamento de falhas — ver a seção), e 12-14 (repositório/build/testes)
 > estão implementadas até o momento (changes `kernel-boot-foundation`,
 > `kernel-memory-management`, `kernel-interrupts-timer`, `kernel-stack-guard-page`,
-> `kernel-process-scheduler`, `kernel-syscalls` e `kernel-posix-virtual-memory`); as
-> demais ficam registradas aqui para orientar changes futuras.
+> `kernel-process-scheduler`, `kernel-syscalls`, `kernel-posix-virtual-memory` e
+> `kernel-wait-queue`); as demais ficam registradas aqui para orientar changes futuras.
 
 ## 1. Arquitetura do Kernel
 
@@ -119,6 +119,24 @@
   `syscall`/`sysret`, e threads/processos só podem ser criados a partir de funções Rust
   do próprio kernel (sem carregamento de executáveis). Isso fica para a change futura de
   System Calls (ver seção 4).
+- **Bloqueio/despertar voluntário de thread** (`kernel-wait-queue`, `kernel::wait_queue`):
+  primeira sub-change do item 8 do roadmap (porte da JVM) — base de `pthread_mutex`/
+  `pthread_cond` (`PlatformEvent`/`Parker` do HotSpot). `WaitQueue::block_current()`
+  permite que a thread corrente saia voluntariamente da rotação do escalonador (sem
+  busy-wait) até ser explicitamente devolvida a ela por `wake_one`/`wake_all` — de
+  outra thread ou de uma ISR, com segurança (`with_interrupts_disabled` em toda seção
+  crítica, mesmo precedente de `kernel::keyboard::poll_event`). Implementado como um
+  vetor de interrupção de software **dedicado** (distinto do vetor do timer), que
+  reentra na mesma lógica de decisão de escalonamento (`ReadyQueue`
+  pop/decide-destino/next, extraída para `kernel::scheduler::schedule_next` e
+  compartilhada com o tick real do timer) sem tocar na contagem de ticks/EOI do Local
+  APIC, que só fazem sentido para uma interrupção real de hardware. Ainda sem API
+  nomeada de `pthread_mutex`/`pthread_cond`, sem *syscall* exposta a modo usuário e
+  sem suporte a *timeout* — ficam para sub-changes futuras do item 8. Verificado em
+  boot real via `kernel::wait_demo` (produtora/consumidora) e inspeção de memória
+  (GDB) em vez de mensagens no console serial — ver `KNOW_ISSUES.md`, "Duas threads
+  de kernel imprimindo concorrentemente travam o timer de hardware para sempre" (bug
+  pré-existente, não relacionado, encontrado durante esta change).
 - "Processo" no Java OS pode, no futuro, significar tanto um processo nativo do kernel
   quanto uma aplicação Java rodando dentro de uma JVM isolada — ainda não implementado
   (depende do porte da JVM, roadmap itens 7-9).
@@ -415,13 +433,15 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    ainda.
 8. **Porte inicial da JVM** (em andamento): primeira JVM minimamente funcional
    rodando um "hello world" Java sobre o Java OS, dividido em sub-changes
-   sequenciais (mesmo padrão já usado para o item 6). `kernel-posix-virtual-memory`
-   (concluída) entregou a segunda sub-change: a camada de memória virtual anônima
-   POSIX (`kernel::vmm` — `reserve`/`commit`/`decommit`/`protect`/`release`, base de
-   `mmap`/`munmap`/`mprotect`) e a primitiva `Mapper::protect` em `kernel-paging` (ver
-   seção 2). A primeira sub-change (`kernel-wait-queue` — primitiva de
-   bloqueio/despertar de thread, base de `pthread_mutex`/`pthread_cond`) está em
-   andamento. Ainda faltam: `pthread_mutex`/`pthread_cond` como API nomeada, sinal de
+   sequenciais (mesmo padrão já usado para o item 6). `kernel-wait-queue`
+   (concluída) entregou a primeira sub-change: a primitiva de bloqueio/despertar
+   voluntário de thread (`kernel::wait_queue` — `block_current`/`wake_one`/
+   `wake_all`, base de `pthread_mutex`/`pthread_cond`, ver seção 3).
+   `kernel-posix-virtual-memory` (concluída) entregou a segunda sub-change: a
+   camada de memória virtual anônima POSIX (`kernel::vmm` —
+   `reserve`/`commit`/`decommit`/`protect`/`release`, base de `mmap`/`munmap`/
+   `mprotect`) e a primitiva `Mapper::protect` em `kernel-paging` (ver seção 2).
+   Ainda faltam: `pthread_mutex`/`pthread_cond` como API nomeada, sinal de
    safepoint (SIGSEGV de página de polling), relógio de parede
    (`clock_gettime`), sistema de arquivos (para `open`/`read` de classes),
    carregamento dinâmico de bibliotecas (build estático do JDK, ou um linker ELF

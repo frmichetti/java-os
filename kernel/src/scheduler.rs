@@ -13,6 +13,14 @@ use crate::sync::Spinlock;
 /// Fila circular de todas as threads escalonáveis, em ordem round-robin — a
 /// "frente" é a que está rodando (ou a próxima a rodar). Lógica pura (sem
 /// hardware), testável diretamente em host.
+///
+/// Dividida em passos menores (`pop_front`/`push_back`/`front`) — em vez do
+/// `advance()` monolítico original, que sempre recolocava a thread
+/// interrompida no fim — para que `on_timer_tick` tenha um ponto de decisão
+/// explícito sobre o destino dela (recolocar no fim, comportamento padrão de
+/// qualquer tick normal; ou desviá-la para uma `WaitQueue`, quando há uma
+/// intenção de bloqueio pendente — ver `kernel::wait_queue` e design.md da
+/// change `kernel-wait-queue`).
 struct ReadyQueue {
     order: VecDeque<ThreadId>,
 }
@@ -22,18 +30,21 @@ impl ReadyQueue {
         Self { order: VecDeque::new() }
     }
 
-    fn push(&mut self, id: ThreadId) {
+    fn push_back(&mut self, id: ThreadId) {
         self.order.push_back(id);
     }
 
-    /// Move a thread da frente para o fim e devolve `(quem estava rodando,
-    /// quem roda a seguir)` — round-robin puro. `None` se não houver
-    /// nenhuma thread registrada (fila vazia).
-    fn advance(&mut self) -> Option<(ThreadId, ThreadId)> {
-        let was_running = self.order.pop_front()?;
-        self.order.push_back(was_running);
-        let next = *self.order.front().expect("acabou de inserir um elemento; a fila não pode estar vazia");
-        Some((was_running, next))
+    /// Remove e devolve a thread atualmente na frente (a que estava
+    /// rodando) — `None` se não houver nenhuma thread registrada (fila
+    /// vazia).
+    fn pop_front(&mut self) -> Option<ThreadId> {
+        self.order.pop_front()
+    }
+
+    /// A próxima thread a rodar (a nova frente da fila), sem removê-la —
+    /// `None` se a fila estiver vazia (nenhuma thread pronta).
+    fn front(&self) -> Option<ThreadId> {
+        self.order.front().copied()
     }
 }
 
@@ -106,9 +117,30 @@ fn register_thread(thread: Thread) -> ThreadId {
             }
             contexts[index] = thread.context;
         }
-        READY_QUEUE.lock().push(id);
+        READY_QUEUE.lock().push_back(id);
         id
     })
+}
+
+/// A thread atualmente em execução: por construção, sempre a que está na
+/// frente da `ReadyQueue` entre dois ticks (ver `on_timer_tick` — a thread
+/// `next` escolhida num tick permanece na frente até o próximo). Usada por
+/// `kernel::wait_queue::WaitQueue::block_current` para saber qual thread
+/// registrar a intenção de bloqueio.
+///
+/// Entra em pânico se chamada antes de qualquer thread ter sido registrada
+/// (nenhum consumidor legítimo chama isso antes de `register_boot_thread`).
+pub(crate) fn current_thread_id() -> ThreadId {
+    with_interrupts_disabled(|| READY_QUEUE.lock().front().expect("escalonador sem nenhuma thread corrente"))
+}
+
+/// Devolve `id` à rotação normal do escalonador (fim da `ReadyQueue`) —
+/// seguro para chamar a partir de uma ISR, já que usa
+/// `with_interrupts_disabled` internamente (nunca mantém o lock além da
+/// seção crítica mínima). Usada por `kernel::wait_queue::WaitQueue::wake_one`/
+/// `wake_all` para devolver uma thread despertada à rotação.
+pub(crate) fn make_ready(id: ThreadId) {
+    with_interrupts_disabled(|| READY_QUEUE.lock().push_back(id));
 }
 
 /// Registra a thread que já está em execução (`continue_boot`, rodando
@@ -220,20 +252,44 @@ pub fn spawn_user_demo<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>) -
 
 /// Chamada pela rotina de entrada do timer ([`timer_entry`]) com o `rsp` da
 /// thread que acabou de ser interrompida. Mantém o incremento do contador
-/// de ticks e o EOI já existentes em `kernel::timer`, salva `current_rsp`
-/// como o contexto dessa thread, escolhe a próxima via round-robin, atualiza
-/// `TSS.rsp0` para a stack de kernel da nova thread corrente (ver
-/// `design.md` da change `kernel-syscalls`), e devolve o `rsp` salvo dela,
-/// para a rotina de entrada restaurar.
-#[unsafe(no_mangle)]
-extern "C" fn on_timer_tick(current_rsp: u64) -> u64 {
-    crate::timer::on_tick();
-
+/// Lógica de decisão de escalonamento em si — compartilhada entre
+/// `on_timer_tick` (tick real de hardware do timer) e `on_block_request`
+/// (bloqueio voluntário via `WaitQueue::block_current`, ver
+/// `kernel::wait_queue`): salva `current_rsp` como o contexto da thread
+/// interrompida, decide seu destino (recolocar no fim da `ReadyQueue`,
+/// comportamento padrão; ou desviá-la para uma `WaitQueue`, se ela pediu
+/// bloqueio antes desta chamada), escolhe a próxima via round-robin, atualiza
+/// `TSS.rsp0`/`CR3` para a nova thread corrente (ver `design.md` da change
+/// `kernel-syscalls`), e devolve o `rsp` salvo dela, para a rotina de entrada
+/// restaurar.
+///
+/// Deliberadamente **não** toca nada específico de hardware do timer
+/// (contagem de ticks, EOI do Local APIC) — isso é responsabilidade exclusiva
+/// de `on_timer_tick`. Ver design.md da change `kernel-wait-queue`, "Achados
+/// durante a implementação": um `int` de software não corresponde a nenhuma
+/// interrupção real "em serviço" no Local APIC, e enviar um EOI nessa
+/// condição (via `on_block_request`, antes desta correção) deixava a entrega
+/// do timer real travada para sempre.
+fn schedule_next(current_rsp: u64) -> u64 {
     with_interrupts_disabled(|| {
-        let (was_running, next) =
-            READY_QUEUE.lock().advance().expect("escalonador sem nenhuma thread registrada");
-        let mut contexts = CONTEXTS.lock();
-        contexts[was_running.0 as usize].rsp = current_rsp;
+        let was_running = READY_QUEUE.lock().pop_front().expect("escalonador sem nenhuma thread registrada");
+        {
+            CONTEXTS.lock()[was_running.0 as usize].rsp = current_rsp;
+        }
+
+        // Ponto de decisão (ver design.md, "`ReadyQueue` ganha um ponto de
+        // decisão explícito"): se há uma intenção de bloqueio pendente para
+        // `was_running`, ela é desviada para a `WaitQueue` indicada; caso
+        // contrário (qualquer chamada normal), comportamento padrão inalterado.
+        if !crate::wait_queue::take_block_intent(was_running) {
+            READY_QUEUE.lock().push_back(was_running);
+        }
+
+        let next = READY_QUEUE
+            .lock()
+            .front()
+            .expect("escalonador sem nenhuma thread pronta (todas bloqueadas) - fora do escopo desta change, ver design.md");
+        let contexts = CONTEXTS.lock();
         set_current_kernel_stack(contexts[next.0 as usize].kernel_stack_top);
         // Achado durante a implementação (ver design.md): threads de
         // processos diferentes podem ter mapeamentos próprios na metade
@@ -242,6 +298,35 @@ extern "C" fn on_timer_tick(current_rsp: u64) -> u64 {
         unsafe { crate::paging::switch_address_space(contexts[next.0 as usize].address_space_root) };
         contexts[next.0 as usize].rsp
     })
+}
+
+/// Chamada pela rotina de entrada do timer ([`timer_entry`]) com o `rsp` da
+/// thread que acabou de ser interrompida. Mantém o incremento do contador de
+/// ticks e o EOI já existentes em `kernel::timer` (só fazem sentido para uma
+/// interrupção real de hardware), delegando a decisão de escalonamento em si
+/// a [`schedule_next`].
+#[unsafe(no_mangle)]
+extern "C" fn on_timer_tick(current_rsp: u64) -> u64 {
+    crate::timer::on_tick();
+    schedule_next(current_rsp)
+}
+
+/// Vetor de interrupção de software dedicado a pedidos voluntários de
+/// bloqueio (`WaitQueue::block_current`) — deliberadamente **distinto** do
+/// vetor do timer (ver design.md, "Achados durante a implementação", e a
+/// correção da decisão original "Reaproveitar `int <vetor do timer>`") e do
+/// vetor do teclado (`kernel::keyboard::KEYBOARD_VECTOR`, 33 — achado real
+/// durante a implementação: 33 colidia diretamente com ele, ver design.md).
+pub const BLOCK_VECTOR: usize = 34;
+
+/// Chamada pela rotina de entrada de bloqueio ([`block_entry`]), disparada
+/// por `WaitQueue::block_current` via `int {BLOCK_VECTOR}`. Mesma decisão de
+/// escalonamento de `on_timer_tick` (via [`schedule_next`]), mas sem nenhuma
+/// contagem de ticks nem EOI — um `int` de software não é uma interrupção
+/// real de hardware "em serviço" no Local APIC.
+#[unsafe(no_mangle)]
+extern "C" fn on_block_request(current_rsp: u64) -> u64 {
+    schedule_next(current_rsp)
 }
 
 core::arch::global_asm!(
@@ -292,8 +377,54 @@ core::arch::global_asm!(
     "iretq",
 );
 
+// Cópia de `timer_entry` acima, só trocando a função chamada
+// (`on_block_request` em vez de `on_timer_tick`) — mesmo formato de frame e
+// mesma disciplina de push/pop de registradores, já comprovados. Ver
+// design.md, "Achados durante a implementação", sobre por que este vetor
+// precisa ser distinto do timer.
+core::arch::global_asm!(
+    ".global block_entry",
+    "block_entry:",
+    "push rax",
+    "push rbx",
+    "push rcx",
+    "push rdx",
+    "push rsi",
+    "push rdi",
+    "push rbp",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov rdi, rsp",
+    "and rsp, -16",
+    "call on_block_request",
+    "mov rsp, rax",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rbp",
+    "pop rdi",
+    "pop rsi",
+    "pop rdx",
+    "pop rcx",
+    "pop rbx",
+    "pop rax",
+    "iretq",
+);
+
 unsafe extern "C" {
     fn timer_entry();
+    fn block_entry();
 }
 
 /// Endereço da rotina de entrada do timer (ver `global_asm!` acima), para
@@ -302,36 +433,87 @@ pub fn timer_entry_addr() -> u64 {
     timer_entry as *const () as u64
 }
 
+/// Endereço da rotina de entrada de bloqueio (ver `global_asm!` acima), para
+/// registrar em [`BLOCK_VECTOR`] via `idt::set_handler`.
+pub fn block_entry_addr() -> u64 {
+    block_entry as *const () as u64
+}
+
+/// Instala o handler de [`BLOCK_VECTOR`] na IDT — deve ser chamada uma única
+/// vez durante o boot, antes de qualquer `WaitQueue::block_current()` (mesmo
+/// requisito de `kernel::timer::init` para o vetor do timer).
+///
+/// # Safety
+/// Mesmos requisitos de `kernel::timer::init`: deve ser chamada depois de
+/// `gdt::init()` e com a IDT já carregável (antes de `idt::load()` ou antes
+/// de qualquer `int {BLOCK_VECTOR}` ser executado).
+pub fn install_block_vector() {
+    crate::idt::set_handler(BLOCK_VECTOR, block_entry_addr(), 0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Reproduz o comportamento padrão do antigo `advance()` monolítico
+    /// (sempre recolocar `was_running` no fim) compondo os passos menores —
+    /// usado pelos testes abaixo para confirmar que a refatoração não altera
+    /// o caminho padrão (nenhuma intenção de bloqueio pendente).
+    fn advance_without_blocking(queue: &mut ReadyQueue) -> Option<(ThreadId, ThreadId)> {
+        let was_running = queue.pop_front()?;
+        queue.push_back(was_running);
+        let next = queue.front().expect("acabou de inserir um elemento; a fila não pode estar vazia");
+        Some((was_running, next))
+    }
+
     #[test]
     fn single_thread_queue_always_advances_to_itself() {
         let mut queue = ReadyQueue::new();
-        queue.push(ThreadId(7));
+        queue.push_back(ThreadId(7));
 
-        assert_eq!(queue.advance(), Some((ThreadId(7), ThreadId(7))));
-        assert_eq!(queue.advance(), Some((ThreadId(7), ThreadId(7))));
+        assert_eq!(advance_without_blocking(&mut queue), Some((ThreadId(7), ThreadId(7))));
+        assert_eq!(advance_without_blocking(&mut queue), Some((ThreadId(7), ThreadId(7))));
     }
 
     #[test]
     fn round_robin_visits_every_thread_before_repeating() {
         let mut queue = ReadyQueue::new();
-        queue.push(ThreadId(0));
-        queue.push(ThreadId(1));
-        queue.push(ThreadId(2));
+        queue.push_back(ThreadId(0));
+        queue.push_back(ThreadId(1));
+        queue.push_back(ThreadId(2));
 
-        assert_eq!(queue.advance(), Some((ThreadId(0), ThreadId(1))));
-        assert_eq!(queue.advance(), Some((ThreadId(1), ThreadId(2))));
-        assert_eq!(queue.advance(), Some((ThreadId(2), ThreadId(0))));
+        assert_eq!(advance_without_blocking(&mut queue), Some((ThreadId(0), ThreadId(1))));
+        assert_eq!(advance_without_blocking(&mut queue), Some((ThreadId(1), ThreadId(2))));
+        assert_eq!(advance_without_blocking(&mut queue), Some((ThreadId(2), ThreadId(0))));
         // Completou um ciclo completo: de volta ao estado do primeiro advance.
-        assert_eq!(queue.advance(), Some((ThreadId(0), ThreadId(1))));
+        assert_eq!(advance_without_blocking(&mut queue), Some((ThreadId(0), ThreadId(1))));
     }
 
     #[test]
     fn empty_queue_has_nothing_to_advance_to() {
         let mut queue = ReadyQueue::new();
-        assert_eq!(queue.advance(), None);
+        assert_eq!(advance_without_blocking(&mut queue), None);
+    }
+
+    #[test]
+    fn popping_without_pushing_back_removes_the_thread_from_rotation() {
+        // Cobre o novo ponto de decisão: quando o chamador opta por NÃO
+        // recolocar a thread (ex.: ela pediu bloqueio), ela deixa de
+        // aparecer em `front()` — ver design.md, "ReadyQueue ganha um ponto
+        // de decisão explícito".
+        let mut queue = ReadyQueue::new();
+        queue.push_back(ThreadId(0));
+        queue.push_back(ThreadId(1));
+
+        let was_running = queue.pop_front().unwrap();
+        assert_eq!(was_running, ThreadId(0));
+        // Deliberadamente não recolocada.
+        assert_eq!(queue.front(), Some(ThreadId(1)));
+
+        // Uma `wake_one`/`make_ready` equivalente a devolve à rotação.
+        queue.push_back(was_running);
+        assert_eq!(queue.front(), Some(ThreadId(1)));
+        let _ = queue.pop_front();
+        assert_eq!(queue.front(), Some(ThreadId(0)));
     }
 }

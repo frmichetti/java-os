@@ -234,6 +234,12 @@ extern "C" fn continue_boot() -> ! {
     kernel::scheduler::register_boot_thread();
     kernel::serial_println!("escalonador: iniciado (thread de boot registrada)");
 
+    // Vetor de software dedicado a `WaitQueue::block_current` — deve ser
+    // instalado antes de qualquer bloqueio voluntário de thread (ver
+    // design.md da change `kernel-wait-queue`).
+    kernel::scheduler::install_block_vector();
+    kernel::serial_println!("escalonador: vetor de bloqueio voluntario instalado");
+
     // Teclado PS/2: depois do escalonador e do Local APIC já estarem
     // prontos — ver `design.md` da change `kernel-keyboard`. Só a
     // inicialização de hardware aqui (controlador 8042, IDT, I/O APIC) —
@@ -308,6 +314,15 @@ extern "C" fn continue_boot() -> ! {
         // troca de CR3 extra a cada tick do escalonador.
         kernel::scheduler::spawn_sharing_current_address_space(&mut frame_allocator, kernel::keyboard_demo::run)
             .expect("spawn da demonstracao de teclado falhou");
+        // DIAGNOSTICO TEMPORARIO: so a consumidora (nunca acordada), sem a
+        // produtora, para isolar se o travamento vem de block_current() por
+        // si so ou da interacao com wake_one().
+        // Demonstração de `kernel::wait_queue` (produtora/consumidora) — ver
+        // design.md da change `kernel-wait-queue`.
+        kernel::scheduler::spawn_sharing_current_address_space(&mut frame_allocator, kernel::wait_demo::producer)
+            .expect("spawn da produtora de wait_demo falhou");
+        kernel::scheduler::spawn_sharing_current_address_space(&mut frame_allocator, kernel::wait_demo::consumer)
+            .expect("spawn da consumidora de wait_demo falhou");
     }
 
     idle_loop();
