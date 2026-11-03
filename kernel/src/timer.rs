@@ -21,14 +21,14 @@ const TARGET_FREQUENCY_HZ: u64 = 100;
 
 /// Duração da janela de calibração contra o PIT 8254 (canal 0).
 const CALIBRATION_MILLIS: u64 = 10;
-const PIT_FREQUENCY_HZ: u64 = 1_193_182;
+pub(crate) const PIT_FREQUENCY_HZ: u64 = 1_193_182;
 
-const PIT_CHANNEL0_DATA: u16 = 0x40;
-const PIT_COMMAND: u16 = 0x43;
+pub(crate) const PIT_CHANNEL0_DATA: u16 = 0x40;
+pub(crate) const PIT_COMMAND: u16 = 0x43;
 /// Canal 0, acesso lobyte/hibyte, modo 0 (interrupt on terminal count), binário.
-const PIT_CMD_CHANNEL0_MODE0: u8 = 0b0011_0000;
+pub(crate) const PIT_CMD_CHANNEL0_MODE0: u8 = 0b0011_0000;
 /// Comando de "latch" do canal 0, para ler a contagem atual sem reprogramar.
-const PIT_CMD_LATCH_CHANNEL0: u8 = 0b0000_0000;
+pub(crate) const PIT_CMD_LATCH_CHANNEL0: u8 = 0b0000_0000;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
@@ -47,12 +47,18 @@ pub fn measured_frequency_hz(apic_ticks_elapsed: u64, calibration_millis: u64) -
     (apic_ticks_elapsed * 1000) / calibration_millis
 }
 
-fn pit_calibration_count(millis: u64) -> u16 {
+/// Quantas contagens do PIT (frequência fixa e conhecida) cabem em
+/// `millis` milissegundos — usada para programar uma janela de calibração
+/// de duração conhecida. `pub(crate)`: reaproveitada por `kernel::clock`
+/// para calibrar o TSC com a mesma técnica (ver design.md da change
+/// `kernel-wall-clock`), em vez de duplicar esta conta.
+pub(crate) fn pit_calibration_count(millis: u64) -> u16 {
     ((PIT_FREQUENCY_HZ * millis) / 1000) as u16
 }
 
-/// Lê a contagem atual (latched) do canal 0 do PIT.
-fn read_pit_count() -> u16 {
+/// Lê a contagem atual (latched) do canal 0 do PIT. `pub(crate)` pelo mesmo
+/// motivo de [`pit_calibration_count`].
+pub(crate) fn read_pit_count() -> u16 {
     unsafe {
         outb(PIT_COMMAND, PIT_CMD_LATCH_CHANNEL0);
         let low = crate::port::inb(PIT_CHANNEL0_DATA) as u16;

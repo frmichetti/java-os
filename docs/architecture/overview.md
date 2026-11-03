@@ -10,8 +10,8 @@
 > estão implementadas até o momento (changes `kernel-boot-foundation`,
 > `kernel-memory-management`, `kernel-interrupts-timer`, `kernel-stack-guard-page`,
 > `kernel-process-scheduler`, `kernel-syscalls`, `kernel-posix-virtual-memory`,
-> `kernel-wait-queue` e `kernel-pthread-sync`); as demais ficam registradas aqui
-> para orientar changes futuras.
+> `kernel-wait-queue`, `kernel-pthread-sync` e `kernel-wall-clock`); as demais
+> ficam registradas aqui para orientar changes futuras.
 
 ## 1. Arquitetura do Kernel
 
@@ -44,6 +44,22 @@
   silenciosamente.
 - **Concorrência no kernel**: inicialmente single-core; SMP é adiado para uma change
   futura, mas as estruturas de dados já nascem pensando em `Sync`/`Send`.
+- **Relógio de parede e monotônico** (`kernel-wall-clock`, `kernel::clock`): quarta
+  sub-change do item 8 do roadmap — base de `clock_gettime` POSIX
+  (`System.currentTimeMillis()`/`System.nanoTime()` do HotSpot). `wall_clock_nanos()`
+  (`CLOCK_REALTIME`) lê o relógio CMOS/RTC uma única vez no boot (esperando o período
+  "quieto" entre atualizações, convertendo BCD/12h-24h conforme os bits do
+  registrador de status B indicarem, assumindo a década 2000-2099 para o ano de 2
+  dígitos — sem parsear o registrador de século, mesmo espírito de simplificação já
+  usado por `kernel-ioapic`/`kernel-pci`) e soma o tempo decorrido desde então.
+  `monotonic_nanos()` (`CLOCK_MONOTONIC`) usa o *Time Stamp Counter* da CPU,
+  calibrado contra o PIT 8254 com a mesma técnica já usada para o timer do Local
+  APIC — resolução de nanossegundos, não os 10ms do contador de ticks existente
+  (`kernel::timer::ticks()`, inalterado). Ainda sem *syscall* expondo isso a modo
+  usuário, sem ajuste de relógio em tempo de execução e sem fuso horário (sempre
+  UTC) — ficam para sub-changes futuras do item 8. Verificado em boot real via
+  `kernel::clock_demo`: a data/hora reportada bate com a hora real do host, e o
+  relógio monotônico sempre avança entre duas leituras, em múltiplas execuções.
 
 ## 2. Arquitetura de Memória
 
@@ -462,12 +478,14 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    `mprotect`) e a primitiva `Mapper::protect` em `kernel-paging` (ver seção 2).
    `kernel-pthread-sync` (concluída) entregou a terceira sub-change: `pthread_mutex`/
    `pthread_cond` nomeados (`kernel::pthread::{Mutex, CondVar}`, ver seção 3),
-   construídos sobre `kernel::wait_queue`. Ainda faltam: *syscalls* expondo essas
-   primitivas a modo usuário, sinal de safepoint (SIGSEGV de página de polling),
-   relógio de parede (`clock_gettime`), sistema de arquivos (para `open`/`read` de
-   classes), carregamento dinâmico de bibliotecas (build estático do JDK, ou um
-   linker ELF dinâmico mínimo), e o próprio porte do HotSpot — ver seção 6 para o
-   inventário completo.
+   construídos sobre `kernel::wait_queue`. `kernel-wall-clock` (concluída) entregou
+   a quarta sub-change: relógio de parede e monotônico (`kernel::clock` —
+   `wall_clock_nanos`/`monotonic_nanos`, base de `clock_gettime`, ver seção 1).
+   Ainda faltam: *syscalls* expondo essas primitivas a modo usuário, sinal de
+   safepoint (SIGSEGV de página de polling), sistema de arquivos (para `open`/
+   `read` de classes), carregamento dinâmico de bibliotecas (build estático do
+   JDK, ou um linker ELF dinâmico mínimo), e o próprio porte do HotSpot — ver
+   seção 6 para o inventário completo.
 9. **Modelo híbrido de execução de JVM**: runtime compartilhado vs. JVM isolada por
    aplicação.
 10. **Java OS Platform (Java)**: gerenciamento de arquivos, serviços de sistema, rede,

@@ -2,6 +2,8 @@
 #![feature(abi_x86_interrupt)]
 
 pub mod apic;
+pub mod clock;
+pub mod clock_demo;
 pub mod fmtbuf;
 pub mod framebuffer;
 pub mod gdt;

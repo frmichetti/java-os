@@ -226,6 +226,13 @@ extern "C" fn continue_boot() -> ! {
     unsafe { kernel::timer::init() };
     kernel::serial_println!("timer do APIC: configurado (periodico)");
 
+    // Relógio de parede/monotônico (RTC + TSC calibrado contra o PIT) — ver
+    // design.md da change `kernel-wall-clock`. Depois do timer já
+    // configurado (o PIT já foi usado para calibração), mas antes de
+    // `idle_loop()`/`sti`, mesma janela defendida para o resto do boot.
+    kernel::clock::init();
+    kernel::clock_demo::run();
+
     // Registra esta própria execução (já sobre a stack dedicada com guard
     // page) como a primeira thread do escalonador, antes de `idle_loop()`
     // habilitar interrupções — ver design.md da change
