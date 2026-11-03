@@ -133,10 +133,12 @@
   APIC, que só fazem sentido para uma interrupção real de hardware. Ainda sem API
   nomeada de `pthread_mutex`/`pthread_cond`, sem *syscall* exposta a modo usuário e
   sem suporte a *timeout* — ficam para sub-changes futuras do item 8. Verificado em
-  boot real via `kernel::wait_demo` (produtora/consumidora) e inspeção de memória
-  (GDB) em vez de mensagens no console serial — ver `KNOW_ISSUES.md`, "Duas threads
-  de kernel imprimindo concorrentemente travam o timer de hardware para sempre" (bug
-  pré-existente, não relacionado, encontrado durante esta change).
+  boot real via `kernel::wait_demo` (produtora/consumidora, reportando cada despertar
+  pelo console serial). Encontrou (e, em manutenção posterior, corrigiu) um bug
+  pré-existente não relacionado em `kernel::serial`/`kernel::framebuffer` — ver
+  `KNOW_ISSUES.md`, "Duas threads de kernel imprimindo concorrentemente travam o
+  timer de hardware para sempre" (RESOLVIDO): `_print`/`MirroredWriter` agora são
+  atômicos em relação a interrupções.
 - "Processo" no Java OS pode, no futuro, significar tanto um processo nativo do kernel
   quanto uma aplicação Java rodando dentro de uma JVM isolada — ainda não implementado
   (depende do porte da JVM, roadmap itens 7-9).

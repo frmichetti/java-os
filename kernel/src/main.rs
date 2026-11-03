@@ -314,9 +314,6 @@ extern "C" fn continue_boot() -> ! {
         // troca de CR3 extra a cada tick do escalonador.
         kernel::scheduler::spawn_sharing_current_address_space(&mut frame_allocator, kernel::keyboard_demo::run)
             .expect("spawn da demonstracao de teclado falhou");
-        // DIAGNOSTICO TEMPORARIO: so a consumidora (nunca acordada), sem a
-        // produtora, para isolar se o travamento vem de block_current() por
-        // si so ou da interacao com wake_one().
         // Demonstração de `kernel::wait_queue` (produtora/consumidora) — ver
         // design.md da change `kernel-wait-queue`.
         kernel::scheduler::spawn_sharing_current_address_space(&mut frame_allocator, kernel::wait_demo::producer)

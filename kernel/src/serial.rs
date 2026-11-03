@@ -74,9 +74,11 @@ pub struct MirroredWriter;
 
 impl Write for MirroredWriter {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        SERIAL1.lock().write_str(s)?;
-        crate::framebuffer::mirror_str(s);
-        Ok(())
+        crate::scheduler::with_interrupts_disabled(|| {
+            SERIAL1.lock().write_str(s)?;
+            crate::framebuffer::mirror_str(s);
+            Ok(())
+        })
     }
 }
 
@@ -86,10 +88,25 @@ pub fn init() {
     SERIAL1.lock().init();
 }
 
+/// Escreve na porta serial e espelha no console de framebuffer como uma
+/// única operação atômica em relação a interrupções — ver `KNOW_ISSUES.md`,
+/// "Duas threads de kernel imprimindo concorrentemente travam o timer de
+/// hardware para sempre" (achado durante a change `kernel-wait-queue`, só
+/// corrigido depois): sem isso, uma thread comum (interrupções habilitadas)
+/// podia ser interrompida com o lock de `CONSOLE` retido, e qualquer código
+/// que precisasse do mesmo lock rodando com interrupções já desabilitadas
+/// (ex.: a syscall de escrita, via `SFMASK`) ficava preso esperando um lock
+/// que nunca seria liberado — a própria espera (`Spinlock::lock`, com `IF`
+/// já em zero) impedia o timer de entregar a interrupção que devolveria a
+/// CPU à thread que detinha o lock. `with_interrupts_disabled` elimina a
+/// janela de preempção inteira: nenhuma chamada a esta função pode ser
+/// interrompida, então o lock nunca fica retido além da própria chamada.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    SERIAL1.lock().write_fmt(args).expect("falha ao escrever na porta serial");
-    crate::framebuffer::mirror(args);
+    crate::scheduler::with_interrupts_disabled(|| {
+        SERIAL1.lock().write_fmt(args).expect("falha ao escrever na porta serial");
+        crate::framebuffer::mirror(args);
+    });
 }
 
 /// Variante de emergência: ignora o lock de `SERIAL1` em vez de esperar por
