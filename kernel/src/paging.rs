@@ -309,6 +309,42 @@ impl<'a, S: FrameStore> Mapper<'a, S> {
         flush_tlb(virt);
         Ok(entry.addr())
     }
+
+    /// Altera as permissões de acesso da página virtual em `virt`, já
+    /// mapeada, preservando o frame físico atualmente mapeado para ela, sem
+    /// exigir um desmapeamento (e remapeamento) intermediário —
+    /// primitiva de nível de página por trás de `mprotect` (ver spec
+    /// `kernel-paging`, "Alteração de Permissões de Página Já Mapeada", e
+    /// `kernel::vmm::protect`, que usa este método por página).
+    /// `Err(MapError::NotMapped)` se `virt` não estiver mapeado.
+    pub fn protect(&mut self, virt: u64, flags: PageFlags) -> Result<(), MapError> {
+        if virt % PAGE_SIZE != 0 {
+            return Err(MapError::Misaligned);
+        }
+        let idx = decompose(virt);
+
+        let pml4 = unsafe { self.table_mut(self.root_phys()) };
+        if !pml4.entries[idx.pml4].is_present() {
+            return Err(MapError::NotMapped);
+        }
+        let pdpt = unsafe { self.table_mut(pml4.entries[idx.pml4].addr()) };
+        if !pdpt.entries[idx.pdpt].is_present() {
+            return Err(MapError::NotMapped);
+        }
+        let pd = unsafe { self.table_mut(pdpt.entries[idx.pdpt].addr()) };
+        if !pd.entries[idx.pd].is_present() {
+            return Err(MapError::NotMapped);
+        }
+        let pt = unsafe { self.table_mut(pd.entries[idx.pd].addr()) };
+        let entry = pt.entries[idx.pt];
+        if !entry.is_present() {
+            return Err(MapError::NotMapped);
+        }
+
+        pt.entries[idx.pt] = PageTableEntry::new(entry.addr(), flags.to_pte_bits());
+        flush_tlb(virt);
+        Ok(())
+    }
 }
 
 /// Primeiro índice de PML4 compartilhado entre todas as address spaces: a
@@ -440,6 +476,17 @@ mod tests {
         let mut allocator = FrameAllocator::new(HhdmFrameStore);
         let mapper = Mapper::new(&mut allocator);
         assert_eq!(mapper.translate(0x1001), None);
+    }
+
+    #[test]
+    fn protect_rejects_misaligned_address_without_touching_cr3() {
+        // Mesmo racional de `translate_rejects_misaligned_address_without_touching_cr3`:
+        // o guard de desalinhamento retorna antes de qualquer acesso a
+        // CR3/HHDM, então é seguro chamar `protect` em host.
+        use crate::phys::{FrameAllocator, HhdmFrameStore};
+        let mut allocator = FrameAllocator::new(HhdmFrameStore);
+        let mut mapper = Mapper::new(&mut allocator);
+        assert_eq!(mapper.protect(0x1001, PageFlags::KERNEL_RW), Err(MapError::Misaligned));
     }
 
     #[test]

@@ -203,6 +203,17 @@ extern "C" fn continue_boot() -> ! {
         }
     }
 
+    // `kernel::vmm`: depois do heap do kernel pronto, já que sua
+    // contabilidade (faixas livres, reservas vivas) usa `alloc::{Vec,
+    // BTreeMap}` — ver design.md da change `kernel-posix-virtual-memory`.
+    kernel::vmm::VMM.lock().init();
+    kernel::serial_println!(
+        "vmm: janela de memoria virtual anonima registrada (0x{:x}, {} bytes)",
+        kernel::vmm::VMM_WINDOW_START,
+        kernel::vmm::VMM_WINDOW_SIZE
+    );
+    kernel::vmm_demo::run();
+
     if !kernel::apic::supports_x2apic() {
         kernel::serial_println_emergency!(
             "ERRO FATAL: CPU nao suporta x2APIC (exigido por este kernel). Abortando o boot."

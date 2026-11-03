@@ -9,8 +9,8 @@
 > executáveis e isolamento de falhas — ver a seção), e 12-14 (repositório/build/testes)
 > estão implementadas até o momento (changes `kernel-boot-foundation`,
 > `kernel-memory-management`, `kernel-interrupts-timer`, `kernel-stack-guard-page`,
-> `kernel-process-scheduler` e `kernel-syscalls`); as demais ficam registradas aqui
-> para orientar changes futuras.
+> `kernel-process-scheduler`, `kernel-syscalls` e `kernel-posix-virtual-memory`); as
+> demais ficam registradas aqui para orientar changes futuras.
 
 ## 1. Arquitetura do Kernel
 
@@ -75,6 +75,26 @@
 - **Isolamento de memória entre processos** (futuro): cada processo de
   usuário/aplicação Java terá seu próprio espaço de endereçamento (CR3 próprio),
   construído sobre a mesma API de `kernel::paging` já implementada.
+- **Memória virtual anônima POSIX** (`kernel-posix-virtual-memory`, `kernel::vmm`):
+  segunda sub-change do item 8 do roadmap (porte da JVM), entrega a base de
+  `mmap`/`munmap`/`mprotect` identificada como gap em `jvm-posix-compat-strategy` —
+  reservar uma faixa de endereço virtual sem comprometer memória física (`reserve`),
+  comprometer sob demanda com frames físicos zerados (`commit`), descomprometer
+  devolvendo os frames ao alocador físico (`decommit`), alterar permissões de uma
+  sub-região já comprometida sem desmapear (`protect`, sobre a nova primitiva
+  `Mapper::protect` de `kernel-paging`) e liberar uma reserva inteira com
+  reaproveitamento do espaço virtual por reservas futuras (`release`). Opera sobre
+  uma janela fixa de 64 GiB a partir de `0xffff_b000_0000_0000` (índice 352 da PML4,
+  o primeiro livre após a stack dedicada do kernel), só em modo kernel por enquanto —
+  sem nenhuma *syscall* exposta a modo usuário e sem integração com
+  `kernel::process::Process` (uma faixa de reserva por processo fica para uma
+  sub-change futura). Verificado em boot real: o caminho feliz completo de
+  `kernel::vmm_demo` (reservar, comprometer, escrever/ler um padrão conhecido,
+  proteger, descomprometer, liberar, reservar de novo) roda sem gerar nenhuma falta
+  de página; os quatro cenários de acesso inválido da spec (acesso não comprometido,
+  escrita após proteção, acesso após descomprometimento, reaproveitamento do espaço
+  liberado) foram confirmados individualmente com um gatilho temporário — ver
+  `design.md` da change, "Achados durante a implementação".
 
 ## 3. Gerenciamento de Processos e Threads
 
@@ -393,8 +413,20 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    do OpenJDK/HotSpot — camada de compatibilidade POSIX mínima no kernel (ver
    seção 6) — e inventário das primitivas que faltam, sem nenhuma implementação
    ainda.
-8. **Porte inicial da JVM**: primeira JVM minimamente funcional rodando um "hello
-   world" Java sobre o Java OS.
+8. **Porte inicial da JVM** (em andamento): primeira JVM minimamente funcional
+   rodando um "hello world" Java sobre o Java OS, dividido em sub-changes
+   sequenciais (mesmo padrão já usado para o item 6). `kernel-posix-virtual-memory`
+   (concluída) entregou a segunda sub-change: a camada de memória virtual anônima
+   POSIX (`kernel::vmm` — `reserve`/`commit`/`decommit`/`protect`/`release`, base de
+   `mmap`/`munmap`/`mprotect`) e a primitiva `Mapper::protect` em `kernel-paging` (ver
+   seção 2). A primeira sub-change (`kernel-wait-queue` — primitiva de
+   bloqueio/despertar de thread, base de `pthread_mutex`/`pthread_cond`) está em
+   andamento. Ainda faltam: `pthread_mutex`/`pthread_cond` como API nomeada, sinal de
+   safepoint (SIGSEGV de página de polling), relógio de parede
+   (`clock_gettime`), sistema de arquivos (para `open`/`read` de classes),
+   carregamento dinâmico de bibliotecas (build estático do JDK, ou um linker ELF
+   dinâmico mínimo), e o próprio porte do HotSpot — ver seção 6 para o inventário
+   completo.
 9. **Modelo híbrido de execução de JVM**: runtime compartilhado vs. JVM isolada por
    aplicação.
 10. **Java OS Platform (Java)**: gerenciamento de arquivos, serviços de sistema, rede,
