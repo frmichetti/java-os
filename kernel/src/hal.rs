@@ -16,3 +16,25 @@ pub trait Console: core::fmt::Write {}
 pub trait KeyboardDevice {
     fn poll_event(&mut self) -> Option<crate::keyboard::KeyEvent>;
 }
+
+/// Motivo pelo qual uma operação de bloco falhou — ver `design.md` da
+/// change `kernel-storage`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockError {
+    /// O buffer passado não tem exatamente `block_size()` bytes.
+    WrongBufferSize,
+    /// O dispositivo reportou um erro ao executar o comando.
+    DeviceError,
+}
+
+/// Qualquer dispositivo de armazenamento em blocos, endereçado por índice
+/// (LBA) — independe de qual controlador físico específico o implementa
+/// (hoje só AHCI, `kernel::storage::AhciDisk`). Um `buf` de tamanho
+/// diferente de `block_size()` é sempre um erro explícito (`BlockError`),
+/// nunca uma operação parcial silenciosa — ver `design.md` da change
+/// `kernel-storage`.
+pub trait BlockDevice {
+    fn block_size(&self) -> usize;
+    fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError>;
+    fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError>;
+}

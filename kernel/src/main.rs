@@ -236,6 +236,27 @@ extern "C" fn continue_boot() -> ! {
     }
     kernel::serial_println!("teclado PS/2: configurado (I/O APIC rotea IRQ1 para o Local APIC)");
 
+    // Armazenamento AHCI: depois do escalonador e do I/O APIC já prontos —
+    // ver `design.md` da change `kernel-storage`. Indisponibilidade (sem
+    // controlador AHCI, sem dispositivo SATA) é tratada explicitamente:
+    // reporta e prossegue o boot normalmente, sem travar.
+    {
+        let mut frame_allocator = kernel::phys::FRAME_ALLOCATOR.lock();
+        match kernel::storage::init(&mut frame_allocator) {
+            Ok(()) => {
+                kernel::serial_println!("armazenamento: controlador AHCI inicializado");
+                drop(frame_allocator);
+                kernel::storage_demo::run();
+            }
+            Err(e) => {
+                kernel::serial_println!(
+                    "armazenamento: indisponivel ({:?}); prosseguindo sem armazenamento",
+                    e
+                );
+            }
+        }
+    }
+
     // Depois da thread de boot já registrada (TSS.rsp0/CURRENT_KERNEL_STACK_TOP
     // corretos — ver design.md da change `kernel-syscalls`).
     unsafe { kernel::syscall::init() };

@@ -134,11 +134,12 @@
 
 - **HAL em `kernel::hal`**: `trait Console: core::fmt::Write`
   (`kernel-framebuffer-console`), sem métodos próprios além de
-  `core::fmt::Write` — suficiente para os dois consoles existentes; e
+  `core::fmt::Write` — suficiente para os dois consoles existentes;
   `trait KeyboardDevice` (`kernel-keyboard`), com um único método
-  não-bloqueante (`poll_event`), implementado por `kernel::keyboard::Ps2Keyboard`.
-  Futuros drivers (armazenamento) definirão seus próprios traits
-  (`BlockDevice`) no mesmo módulo.
+  não-bloqueante (`poll_event`), implementado por `kernel::keyboard::Ps2Keyboard`;
+  e `trait BlockDevice` (`kernel-storage`), com `block_size`/`read_block`/
+  `write_block` por LBA, implementado por `kernel::storage::AhciDisk`.
+  Futuros drivers (rede) definirão seus próprios traits no mesmo módulo.
 - **Console de framebuffer** (`kernel-framebuffer-console`, `kernel::framebuffer`):
   segundo canal de saída de texto, sobre o framebuffer linear fornecido pelo
   Limine (`FramebufferRequest`). Conversão de pixel genérica a partir das
@@ -182,8 +183,22 @@
   frequência compete mal com o timer e só a primeira tecla simulada chega
   de forma confiável (limitação de timing do ambiente de teste, não do
   kernel — ver `KNOW_ISSUES.md`).
-- Sem armazenamento ou rede ainda — os demais drivers do item 6 do roadmap
-  continuam pendentes como changes futuras.
+- **PCI** (`kernel-storage`, `kernel::pci`): acesso à configuração PCI via o
+  mecanismo legado de portas 0xCF8/0xCFC e enumeração do barramento 0 —
+  suficiente para localizar o controlador AHCI do chipset do QEMU/Q35, e
+  reutilizável por qualquer dispositivo PCI futuro (rede).
+- **Armazenamento AHCI** (`kernel-storage`, `kernel::storage`): driver de
+  bloco bruto (sem sistema de arquivos) sobre um controlador SATA/AHCI —
+  localizado via `kernel::pci`, com `ABAR` (BAR5) mapeado explicitamente
+  (mesmo tratamento do I/O APIC: a HHDM não garante cobri-lo). Inicializa
+  uma porta, emite comandos `READ`/`WRITE DMA EXT` no slot 0 por *polling*
+  (sem IRQ — decisão explícita, ver `design.md` da change). Verificado em
+  boot real: leitura do setor de boot (assinatura `0x55AA`) e uma escrita
+  seguida de leitura num LBA de teste, ambos corretos já na primeira
+  tentativa — ao contrário do teclado, este driver não depende de nenhuma
+  IRQ, então não sofre da limitação de timing do QEMU/TCG documentada em
+  `KNOW_ISSUES.md`.
+- Sem rede ainda — fica como o último driver pendente do item 6 do roadmap.
 
 ## 6. Estratégia de Portabilidade do OpenJDK (futuro — maior risco técnico do projeto)
 
@@ -308,7 +323,9 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    existente. `kernel-keyboard` (concluída) entregou o primeiro I/O APIC
    (roteamento de IRQ externa, pré-requisito para qualquer dispositivo
    externo futuro), o driver de teclado PS/2 e `trait KeyboardDevice`.
-   Ainda pendentes: armazenamento, rede.
+   `kernel-storage` (concluída) entregou acesso a configuração PCI
+   (`kernel::pci`), o driver de bloco bruto AHCI e `trait BlockDevice`.
+   Ainda pendente: rede.
 7. **Pesquisa e decisão de estratégia de porte do OpenJDK/HotSpot** (change dedicada).
 8. **Porte inicial da JVM**: primeira JVM minimamente funcional rodando um "hello
    world" Java sobre o Java OS.
