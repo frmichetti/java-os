@@ -271,6 +271,9 @@ extern "C" fn continue_boot() -> ! {
                 kernel::serial_println!("armazenamento: controlador AHCI inicializado");
                 drop(frame_allocator);
                 kernel::storage_demo::run();
+                // Sistema de arquivos FAT32 sobre a partição de boot (GPT) —
+                // ver design.md da change `kernel-fat32-filesystem`.
+                kernel::fat32_demo::run();
             }
             Err(e) => {
                 kernel::serial_println!(

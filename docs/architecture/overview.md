@@ -316,6 +316,23 @@
   tentativa — ao contrário do teclado, este driver não depende de nenhuma
   IRQ, então não sofre da limitação de timing do QEMU/TCG documentada em
   `KNOW_ISSUES.md`.
+- **Sistema de arquivos FAT32** (`kernel-fat32-filesystem`, `kernel::gpt`/
+  `kernel::fat32`): localiza a partição "EFI System Partition" lendo a
+  tabela de partição GPT do disco (`kernel::gpt::find_efi_system_partition`,
+  genérica sobre `hal::BlockDevice` — sem hardcodar o LBA de início que o
+  `xtask` usa para montar a imagem), monta essa partição como FAT32
+  (`kernel::fat32::Fat32Filesystem`, validando o setor de inicialização) e lê
+  o conteúdo completo de um arquivo dado seu caminho absoluto, resolvendo
+  diretórios e seguindo a cadeia de clusters via a FAT — somente leitura,
+  somente nomes curtos 8.3 (sem VFAT/nomes longos). Toda a lógica, incluindo
+  montagem e leitura de arquivo, é genérica sobre `hal::BlockDevice` e
+  testável em host sem hardware (ao contrário de `kernel::vmm`/
+  `kernel::syscall`, que precisam de `Mapper`/`CR3` reais para seus
+  caminhos de sucesso). Verificado em boot real: lê `/EFI/BOOT/BOOTX64.EFI`
+  da própria partição de boot (319.488 bytes, múltiplos clusters) e confirma
+  sua assinatura `MZ`. Ainda sem exposição via *syscall* (`open`/`read`) a
+  modo usuário — fica para uma sub-change futura, mesma disciplina do item 8
+  do roadmap (seção 15).
 - **Rede** (`kernel-network`, `kernel::network`): driver de placa Ethernet
   Intel 82540EM (`e1000`) — localizado via `kernel::pci`, com Bus Mastering
   habilitado explicitamente no registrador de comando PCI (`kernel::pci`
@@ -375,8 +392,10 @@ armazenamento e rede — todos implementados.
     `kernel::timer` já conta ticks desde o boot; falta relógio de parede real e,
     possivelmente, resolução mais fina.
   - *E/S de arquivo* (`open`/`read`, para carregar classes do *class path*):
-    `kernel::storage`/`hal::BlockDevice` só dão blocos brutos — falta um sistema de
-    arquivos inteiro antes mesmo de expor `open`/`read` de verdade.
+    **entregue pela change `kernel-fat32-filesystem`** — `kernel::fat32::Fat32Filesystem`
+    monta a partição de boot (localizada via `kernel::gpt`) e lê um arquivo
+    inteiro por caminho absoluto; falta apenas expor isso como *syscall*
+    (`open`/`read`) a modo usuário, numa sub-change futura.
 - **Risco não previsto originalmente, registrado sem decisão fechada**: o HotSpot "de
   fábrica" também depende de **carregamento dinâmico de bibliotecas compartilhadas**
   (`libjvm.so` carregando `libjava.so` via `dlopen`/linker dinâmico, e JNI carregando
@@ -539,10 +558,13 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    sua implementação foi descoberto e corrigido um bug pré-existente em duas
    sub-changes anteriores: `kernel::vmm::VMM_WINDOW_START` colidia com
    `kernel::stack::THREAD_STACK_POOL_BASE` (ambos no índice 352 da PML4) — ver
-   seção 1 e o design.md da change para o histórico completo. Ainda faltam:
-   sistema de arquivos (para `open`/`read` de classes), carregamento dinâmico
-   de bibliotecas (build estático do JDK, ou um linker ELF dinâmico mínimo), e
-   o próprio porte do HotSpot — ver seção 6 para o inventário completo.
+   seção 1 e o design.md da change para o histórico completo.
+   `kernel-fat32-filesystem` (concluída) entregou a sétima sub-change: o
+   sistema de arquivos (`kernel::gpt`/`kernel::fat32`, localizado via GPT,
+   somente leitura, nomes curtos 8.3 — ver seção 5). Ainda faltam:
+   carregamento dinâmico de bibliotecas (build estático do JDK, ou um linker
+   ELF dinâmico mínimo), e o próprio porte do HotSpot — ver seção 6 para o
+   inventário completo.
 9. **Modelo híbrido de execução de JVM**: runtime compartilhado vs. JVM isolada por
    aplicação.
 10. **Java OS Platform (Java)**: gerenciamento de arquivos, serviços de sistema, rede,

@@ -39,6 +39,65 @@ pub trait BlockDevice {
     fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError>;
 }
 
+/// `BlockDevice` simulado por um buffer em memória, usado por testes de host
+/// de qualquer módulo que precise de um disco de blocos sem tocar hardware
+/// (ex.: `kernel::gpt`, `kernel::fat32`) — mesmo papel de
+/// `kernel::phys::tests::SimulatedFrameStore`. Blocos de 512 bytes, fora do
+/// intervalo alocado na construção é um erro (`BlockError::DeviceError`),
+/// nunca um bloco "mágico" zerado implícito.
+#[cfg(test)]
+pub(crate) mod test_support {
+    extern crate alloc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use super::{BlockDevice, BlockError};
+
+    pub(crate) const SIMULATED_BLOCK_SIZE: usize = 512;
+
+    pub(crate) struct SimulatedBlockDevice {
+        blocks: Vec<[u8; SIMULATED_BLOCK_SIZE]>,
+    }
+
+    impl SimulatedBlockDevice {
+        /// Cria um disco simulado com `num_blocks` blocos, todos zerados.
+        pub(crate) fn new(num_blocks: usize) -> Self {
+            Self { blocks: vec![[0u8; SIMULATED_BLOCK_SIZE]; num_blocks] }
+        }
+
+        /// Acesso direto (fora do trait `BlockDevice`) a um bloco, para
+        /// montar dados de teste byte a byte sem precisar passar por
+        /// `write_block`.
+        pub(crate) fn block_mut(&mut self, lba: u64) -> &mut [u8; SIMULATED_BLOCK_SIZE] {
+            &mut self.blocks[lba as usize]
+        }
+    }
+
+    impl BlockDevice for SimulatedBlockDevice {
+        fn block_size(&self) -> usize {
+            SIMULATED_BLOCK_SIZE
+        }
+
+        fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+            if buf.len() != SIMULATED_BLOCK_SIZE {
+                return Err(BlockError::WrongBufferSize);
+            }
+            let block = self.blocks.get(lba as usize).ok_or(BlockError::DeviceError)?;
+            buf.copy_from_slice(block);
+            Ok(())
+        }
+
+        fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+            if buf.len() != SIMULATED_BLOCK_SIZE {
+                return Err(BlockError::WrongBufferSize);
+            }
+            let block = self.blocks.get_mut(lba as usize).ok_or(BlockError::DeviceError)?;
+            block.copy_from_slice(buf);
+            Ok(())
+        }
+    }
+}
+
 /// Qualquer placa de rede que envia/recebe quadros Ethernet brutos —
 /// independe de qual controlador físico específico o implementa (hoje só
 /// a placa e1000, `kernel::network::E1000Nic`). `poll_frame` é

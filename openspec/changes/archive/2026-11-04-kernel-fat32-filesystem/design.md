@@ -1,0 +1,70 @@
+# Design
+
+## Context
+
+Ver proposal.md - Why/What Changes para a motivação. Pontos do estado atual relevantes para o "como" (código lido em `kernel/src/`):
+
+- `hal::BlockDevice` já expõe `block_size() -> usize`, `read_block(lba, buf) -> Result<(), BlockError>`, `write_block(...)`; `kernel::storage::{read_block, write_block}` encaminham para o único disco global (`AhciDisk`, `BLOCK_SIZE = 512`). `BlockError` tem `WrongBufferSize`/`DeviceError`, sem distinguir "fora do intervalo do disco" de outras falhas.
+- A imagem de disco montada pelo `xtask` (`xtask/src/main.rs`) é GPT (`sgdisk --new=1:2048:0 --typecode=1:ef00`) com uma única partição do tipo "EFI System Partition" (GUID `C12A7328-F81F-11D2-BA4B-00A0C93EC93B`) começando no LBA 2048, formatada via `mformat -F` (FAT32) e populada via `mcopy` com `BOOTX64.EFI`, o binário do kernel (copiado para `::/boot/kernel`) e `limine.conf`. `PART_START_SECTOR = 2048` é um detalhe do *build*, não algo que o kernel deva hardcodar (ver Decisions).
+- `kernel::vmm`/`kernel::phys` já estabelecem o padrão deste projeto para código que interpreta uma estrutura binária: uma camada pura (parsing/contabilidade, testável em host com dados simulados) separada da camada que toca hardware de verdade (aqui, `BlockDevice`).
+- `kernel::heap` cresce sob demanda até 256 MiB — sem restrição relevante para buffers de diretório/arquivo nesta escala.
+- Nomes já presentes na imagem de boot cabem todos em 8.3 nativamente sem nome longo VFAT: `BOOT` (diretório), `KERNEL` (arquivo, sem extensão), `BOOTX64.EFI` (nome 8, extensão 3). `limine.conf` **não** cabe em 8.3 (extensão de 4 caracteres, "conf") — por isso não é um bom alvo de verificação nesta change (ver Non-Goals sobre VFAT).
+
+## Goals / Non-Goals
+
+**Goals:**
+- Localizar a partição EFI System (FAT32) do disco lendo a tabela de partição GPT via `hal::BlockDevice` já existente — sem hardcodar o LBA de início usado pelo `xtask` para montar a imagem.
+- Montar essa partição como FAT32, validando seu setor de inicialização (BPB) antes de aceitar.
+- Ler o conteúdo completo de um arquivo dado seu caminho absoluto, resolvendo diretórios intermediários e seguindo a cadeia de clusters do arquivo via a FAT (File Allocation Table) até seu tamanho declarado.
+- Lógica pura (parsing de GPT/BPB/entradas de diretório/entradas da FAT) separada da camada que toca `BlockDevice`, testável em host com buffers simulando estruturas reais — mesmo padrão de `kernel::vmm`/`kernel::phys`.
+- Um demo em modo kernel que lê um arquivo real da própria partição de boot e confirma seu conteúdo, análogo a `kernel::storage_demo`.
+
+**Non-Goals (nesta change):**
+- Qualquer escrita — criar, truncar, apagar ou modificar arquivos/diretórios. Somente leitura.
+- Nomes longos VFAT (`ATTR_LONG_NAME`, entradas de atributo `0x0F`) — resolução de caminho usa exclusivamente nomes curtos 8.3; uma entrada de nome longo encontrada durante a varredura de um diretório é simplesmente ignorada (pulada), nunca interpretada como uma entrada de arquivo/diretório comum.
+- *Syscalls* (`open`/`read`) expondo isto a modo usuário — mesma disciplina incremental já seguida por todas as sub-changes anteriores do item 8 do roadmap; fica para uma sub-change futura.
+- FAT12/FAT16, ou qualquer sistema de arquivos além de FAT32.
+- Múltiplas partições montadas simultaneamente, ou qualquer partição além da primeira "EFI System Partition" encontrada na tabela GPT.
+- Cache de blocos/diretórios entre leituras — cada `read_file` relê o que precisar do zero, sem guardar estado entre chamadas (simplicidade; se o desempenho importar no futuro, é uma otimização aditiva).
+- GPT totalmente geral (ex.: múltiplas centenas de entradas de partição, CRC32 de verificação de integridade) — suficiente para encontrar a primeira partição do tipo EFI System dentro de um número pequeno de setores da tabela de entradas (a imagem deste projeto sempre tem exatamente uma partição).
+
+## Decisions
+
+### `kernel::gpt`: parsing puro do cabeçalho e das entradas de partição GPT
+Dois parsers puros, cada um operando sobre um buffer de bytes já lido (sem `BlockDevice`, testáveis em host):
+- `GptHeader::parse(buf: &[u8; 512]) -> Option<GptHeader>`: valida a assinatura `"EFI PART"` nos primeiros 8 bytes; extrai `partition_entry_lba: u64`, `num_partition_entries: u32`, `size_of_partition_entry: u32` (todos *little-endian*, nos offsets padrão da especificação UEFI). `None` se a assinatura não bater.
+- `GptPartitionEntry::parse(buf: &[u8]) -> GptPartitionEntry`: extrai `partition_type_guid: [u8; 16]` (offset 0) e `starting_lba: u64` (offset 32) de uma entrada de `size_of_partition_entry` bytes.
+- Constante `EFI_SYSTEM_PARTITION_GUID: [u8; 16] = [0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B]` (codificação mista de GUID já resolvida, `C12A7328-F81F-11D2-BA4B-00A0C93EC93B`).
+- Função de integração `find_efi_system_partition<D: hal::BlockDevice>(device: &mut D) -> Result<u64, GptError>`: genérica sobre `hal::BlockDevice` (mesmo padrão de `kernel::phys::FrameAllocator<S: FrameStore>`, que já é genérico sobre a origem dos frames para ser testável em host com `SimulatedFrameStore` — aqui, um `BlockDevice` simulado por um buffer em memória cobre o mesmo papel). Lê o LBA 1 (cabeçalho GPT) via `device.read_block`, para cada setor da tabela de entradas (começando em `partition_entry_lba`, até um limite pequeno de setores — suficiente para a única partição desta imagem, ver Non-Goals) parseia as entradas que cabem no setor e devolve o `starting_lba` da primeira cujo `partition_type_guid` bate com `EFI_SYSTEM_PARTITION_GUID`. `GptError::NoGptHeader`/`NoEfiSystemPartition` nos casos de falha — cobre "Nenhuma partição FAT32/EFI é encontrada" da spec.
+
+### `kernel::fat32`: BPB, entradas de diretório e FAT como lógica pura; montagem e leitura como camada real
+Mesmo padrão de separação:
+- `Bpb::parse(buf: &[u8; 512]) -> Result<Bpb, Fat32Error>`: extrai `bytes_per_sector: u16`, `sectors_per_cluster: u8`, `reserved_sector_count: u16`, `num_fats: u8`, `fat_size_32: u32`, `root_cluster: u32` (offsets padrão da BPB estendida de FAT32); valida a assinatura de inicialização (`0x55`, `0xAA` nos bytes 510-511) e a *string* `"FAT32   "` no campo `FilSysType` (offset 82, 8 bytes) — cobre "Partição encontrada não é um FAT32 válido". Métodos puros derivados: `first_fat_sector() -> u64`, `first_data_sector() -> u64`, `cluster_to_sector(cluster: u32) -> u64`, `fat_entry_location(cluster: u32) -> (u64 /* setor */, usize /* offset no setor */)`.
+- `DirEntry::parse(buf: &[u8; 32]) -> DirEntryKind` (`enum`: `EndOfDirectory`, `Free`, `LongNamePart` (atributo `0x0F`, ignorada), `Entry(DirEntry)`): decodifica o nome curto 8.3 (8+3 bytes, *trim* dos espaços de preenchimento), atributos, cluster inicial (`FstClusHI:FstClusLO` combinados) e tamanho do arquivo.
+- `fat_entry_value(raw: u32) -> u32` (mascara os 4 bits altos reservados) e `is_end_of_chain(value: u32) -> bool` (`value >= 0x0FFF_FFF8`) — lógica pura sobre o valor já lido de uma entrada da FAT.
+- `fn short_name_matches(entry_name: &str, component: &str) -> bool`: comparação *case-insensitive* — cobre "Correspondência de Nomes Curtos Sem Distinção de Maiúsculas/Minúsculas".
+- Camada real, `Fat32Filesystem`: `mount<D: hal::BlockDevice>(device: &mut D, partition_start_lba: u64) -> Result<Self, Fat32Error>` (lê o setor de inicialização da partição via `device.read_block`, valida via `Bpb::parse`; rejeita com `Fat32Error::UnsupportedSectorSize` se `bpb.bytes_per_sector != device.block_size()`, evitando aritmética de setor incorreta); `read_file<D: hal::BlockDevice>(&self, device: &mut D, path: &str) -> Result<Vec<u8>, Fat32Error>` — percorre os componentes do caminho a partir de `root_cluster`, usando uma função interna `find_in_directory(device, cluster, name) -> Result<DirEntry, Fat32Error>` (lê a cadeia de clusters do diretório setor a setor, usando `DirEntry::parse`/`short_name_matches`, parando em `EndOfDirectory` ou ao encontrar a entrada), validando que cada componente intermediário seja um diretório (cobre "Um componente intermediário do caminho não é um diretório") e o último seja um arquivo (cobre "Caminho aponta para um diretório, não um arquivo"); por fim lê a cadeia de clusters do arquivo (seguindo a FAT via `fat_entry_value`/`is_end_of_chain`) até acumular `file_size` bytes. Igual a `find_efi_system_partition`, genérica sobre `D: hal::BlockDevice` — testável em host com um `BlockDevice` simulado por um buffer em memória representando uma partição FAT32 real (montada via `mformat`/`mcopy` uma única vez e embutida nos testes, ou construída byte a byte conforme a necessidade de cada cenário), sem precisar de hardware nem do disco global de `kernel::storage`.
+
+### Montagem: uma função livre que liga `kernel::gpt` + `kernel::fat32` + `kernel::storage`
+`kernel::fat32::mount_boot_partition() -> Result<Fat32Filesystem, Fat32Error>` (nome exato a definir na implementação): chama `kernel::gpt::find_efi_system_partition` e `Fat32Filesystem::mount` passando o disco global de `kernel::storage` (que já implementa `hal::BlockDevice` via `AhciDisk`) como o `device`. Função de conveniência para o demo e para uma futura exposição via *syscall*; a API de mais baixo nível (genérica sobre `D: hal::BlockDevice`) continua testável isoladamente, sem tocar hardware.
+
+### Demo em modo kernel: ler `/boot/kernel` (ou `/EFI/BOOT/BOOTX64.EFI`) e confirmar sua assinatura
+Mesmo padrão de `kernel::storage_demo` (que já confirma a assinatura `0x55AA` do setor de boot). O demo monta o sistema de arquivos, lê um arquivo cujo nome curto já é válido nativamente (ver Context — `KERNEL` ou `BOOTX64.EFI`, nunca `limine.conf`, que exigiria nome longo VFAT, fora do escopo), e confirma um fato conhecido e verificável sobre seu conteúdo sem precisar reimplementar um parser de formato executável — ex.: os bytes mágicos iniciais do formato do arquivo (`"MZ"` para `BOOTX64.EFI`, um executável PE32+/UEFI) e o tamanho lido batendo com o tamanho da entrada de diretório.
+
+## Achados durante a implementação
+
+- **Teste em host 100% viável sem tocar hardware**: ao contrário de várias changes anteriores (`kernel::vmm`'s `Vmm::commit`/`decommit` tocando `Mapper`/`CR3`, `kernel::syscall`'s `sys_vm_*` precisando de `std::sync::Once` para `Vmm::init()`), toda a lógica de `kernel::gpt`/`kernel::fat32` — incluindo a camada "real" (`Fat32Filesystem::mount`/`read_file`, genéricas sobre `hal::BlockDevice`) — é inteiramente testável em host, sem nenhuma exceção, graças à decisão de design de parametrizar por `BlockDevice` em vez de usar o disco global de `kernel::storage` diretamente. 23 dos 23 testes de `kernel::fat32` (e os 7 de `kernel::gpt`) exercitam o caminho de sucesso completo, incluindo um arquivo sintético de dois clusters não contíguos na FAT — algo que, por exemplo, `kernel::vmm`'s próprios testes nunca puderam fazer para `Vmm::commit`/`decommit`.
+- **Verificação em boot real excedeu a expectativa inicial**: o arquivo `/EFI/BOOT/BOOTX64.EFI` real da imagem de boot tem 319.488 bytes — muito maior que o arquivo de teste de dois clusters usado nos testes de host — e foi lido corretamente de ponta a ponta (assinatura `MZ` confirmada) já na primeira tentativa em `cargo xtask run`/`cargo xtask test`, sem nenhum ajuste necessário no código. Isso exercitou de verdade a resolução de diretórios (`/EFI/BOOT/`) e uma cadeia de clusters real e bem mais longa do que qualquer cenário sintético, dando confiança adicional na correção do parsing de BPB/FAT real do `mtools`/`mformat` usado pelo `xtask` (não apenas na estrutura sintética construída nos testes).
+- **`kernel::storage::with_disk`**: foi necessário adicionar esta pequena função de conveniência (não prevista em detalhe nas Decisions) para expor o disco global de `kernel::storage` como `&mut AhciDisk` (que implementa `hal::BlockDevice`) para código genérico externo, sem vazar o `Spinlock` interno — mesmo espírito de encapsulamento já usado pelo resto de `kernel::storage::read_block`/`write_block`.
+- **Confirmado em 3 execuções consecutivas de `cargo xtask run`/`cargo xtask test`**: `"fat32: /EFI/BOOT/BOOTX64.EFI lido (319488 bytes), assinatura MZ confirmada - PASSOU"` em todas, sem nenhuma `EXCECAO`/`PANIC`, e sem regressão em nenhuma das demais demos do boot (`vmm_demo`, `pthread_demo`, `wait_demo`, `safepoint_demo`, `user_demo`/`user_posix_demo`, `storage_demo`, `network`, `keyboard_demo`). `cargo test -p kernel --lib`: 197 testes passando (167 pré-existentes + 7 novos de `kernel::gpt` + 23 novos de `kernel::fat32`), sem regressão.
+
+## Risks / Trade-offs
+
+- [Varredura da tabela de entradas GPT limitada a um número pequeno de setores] → Aceitável: a imagem deste projeto sempre tem exatamente uma partição, a primeira entrada. Revisitar apenas se um layout de disco diferente for necessário no futuro.
+- [Nenhum cache entre leituras — cada `read_file` relê o diretório raiz e todos os intermediários do zero] → Aceitável nesta escala (poucas leituras, disco local); cache é uma otimização aditiva que não muda a API pública.
+- [Nomes longos VFAT não suportados — um arquivo cujo único nome prático exceda 8.3 fica inacessível por caminho nesta change] → Aceitável para o objetivo imediato (ler classes `.class`/JAR, cujos nomes de arquivo tipicamente cabem ou podem ser dispostos para caber em 8.3 nesta fase); suportar VFAT depois é aditivo (mais um tipo de entrada reconhecido na varredura de diretório, sem mudar a API de `read_file`).
+- [`kernel::gpt` e `kernel::fat32` assumem `bytes_per_sector`/tamanho de setor GPT = 512, o mesmo de `hal::BlockDevice::block_size()` hoje] → Validado explicitamente na montagem (`Fat32Error::UnsupportedSectorSize`) em vez de aritmética silenciosamente incorreta; discos de setor lógico diferente já são Non-Goal de `kernel-storage` em si.
+
+## Migration Plan
+
+Mudança puramente aditiva no binário do kernel — nenhuma migração de dado, nenhum consumidor existente afetado (`kernel::storage`/`hal::BlockDevice` inalterados). Nenhum rollback especial.

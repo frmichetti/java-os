@@ -4,9 +4,12 @@
 pub mod apic;
 pub mod clock;
 pub mod clock_demo;
+pub mod fat32;
+pub mod fat32_demo;
 pub mod fmtbuf;
 pub mod framebuffer;
 pub mod gdt;
+pub mod gpt;
 pub mod hal;
 pub mod heap;
 pub mod hhdm;

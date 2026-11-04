@@ -409,6 +409,19 @@ pub fn write_block(lba: u64, buf: &[u8]) -> Result<(), crate::hal::BlockError> {
     }
 }
 
+/// Executa `f` com acesso ao disco global como `&mut AhciDisk` (que
+/// implementa `hal::BlockDevice`), se já inicializado — `None` caso
+/// contrário. Permite que consumidores genéricos sobre `hal::BlockDevice`
+/// (ex.: `kernel::gpt`/`kernel::fat32`) operem sobre o disco real sem
+/// precisar de acesso direto ao `Spinlock` interno, mantendo o lock retido
+/// apenas durante `f` — ver design.md da change `kernel-fat32-filesystem`.
+pub fn with_disk<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut AhciDisk) -> R,
+{
+    DISK.lock().as_mut().map(f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
