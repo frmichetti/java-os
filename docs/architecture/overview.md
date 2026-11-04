@@ -396,15 +396,24 @@ armazenamento e rede — todos implementados.
     monta a partição de boot (localizada via `kernel::gpt`) e lê um arquivo
     inteiro por caminho absoluto; falta apenas expor isso como *syscall*
     (`open`/`read`) a modo usuário, numa sub-change futura.
-- **Risco não previsto originalmente, registrado sem decisão fechada**: o HotSpot "de
-  fábrica" também depende de **carregamento dinâmico de bibliotecas compartilhadas**
-  (`libjvm.so` carregando `libjava.so` via `dlopen`/linker dinâmico, e JNI carregando
-  bibliotecas nativas de aplicações) — um requisito de peso comparável aos acima, sem
-  solução óbvia num kernel sem linker dinâmico de ELF. Candidato mais promissor para
-  avaliação na change do item 8 do roadmap: build totalmente estático do JDK (linha de
-  trabalho já experimental, e ainda incompleta, no próprio projeto OpenJDK/Leyden);
-  alternativa, caso se prove inviável: implementar um linker dinâmico de ELF mínimo no
-  kernel. Nenhuma das duas é decidida nesta etapa.
+- **Carregamento dinâmico de bibliotecas — decidido (`jvm-dynamic-linking-strategy`)**:
+  o HotSpot "de fábrica" depende de **carregamento dinâmico de bibliotecas
+  compartilhadas** (`libjvm.so` carregando `libjava.so` via `dlopen`/linker dinâmico, e
+  JNI carregando bibliotecas nativas de aplicações) — um requisito de peso comparável
+  aos acima. **Decisão**: build totalmente estático do JDK/Leyden ("Hermetic Java") é
+  **rejeitado** nesta etapa — não apenas por ser experimental, mas porque o próprio
+  *workaround* que o Leyden usa para a limitação de `dlopen()` a partir de memória da
+  glibc depende de `dlopen("/proc/self/fd/" + fd)`, uma API exclusiva do Linux
+  (`/proc`) que o Java OS não tem nem planeja ter. Rota adotada: implementar um
+  **linker ELF dinâmico mínimo no próprio kernel**, inteiramente sob controle do
+  projeto. **Achado**: independentemente dessa escolha, o kernel hoje **não tem
+  nenhum carregador de executável ELF**, nem para um binário estaticamente linkado —
+  todo código de modo usuário atual (`kernel::user_demo`/`kernel::user_posix_demo`) é
+  um blob de assembly copiado manualmente para uma página. Carregar um executável ELF
+  estático (segmentos `PT_LOAD`, via `kernel::vmm`/`kernel::fat32` já prontos) e fazer
+  o linker dinâmico de `.so` (símbolos, relocações, `dlopen`/`dlsym`) são problemas
+  distintos — o primeiro é pré-requisito do segundo e é a próxima sub-change concreta
+  do item 8 (ver seção 15).
 - Esta change não implementa nenhuma primitiva nova — isso fica inteiramente para a
   change do item 8 do roadmap ("Porte inicial da JVM"), que decide a forma concreta de
   cada primitiva do inventário acima (ex.: syscalls novas vs. extensão das existentes)
@@ -561,10 +570,16 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    seção 1 e o design.md da change para o histórico completo.
    `kernel-fat32-filesystem` (concluída) entregou a sétima sub-change: o
    sistema de arquivos (`kernel::gpt`/`kernel::fat32`, localizado via GPT,
-   somente leitura, nomes curtos 8.3 — ver seção 5). Ainda faltam:
-   carregamento dinâmico de bibliotecas (build estático do JDK, ou um linker
-   ELF dinâmico mínimo), e o próprio porte do HotSpot — ver seção 6 para o
-   inventário completo.
+   somente leitura, nomes curtos 8.3 — ver seção 5).
+   `jvm-dynamic-linking-strategy` (concluída) fechou a decisão de
+   carregamento dinâmico de bibliotecas, pendente desde
+   `jvm-posix-compat-strategy`: build estático do JDK/Leyden rejeitado
+   (dependência de `/proc/self/fd`, exclusiva do Linux); linker ELF dinâmico
+   mínimo no kernel adotado — ver seção 6. Ainda faltam, nesta ordem: um
+   **carregador de executável ELF estático** (pré-requisito identificado por
+   esta decisão, ainda inexistente — próxima sub-change concreta), o linker
+   ELF dinâmico mínimo (`.so`, `dlopen`/`dlsym`) propriamente dito, e o
+   próprio porte do HotSpot — ver seção 6 para o inventário completo.
 9. **Modelo híbrido de execução de JVM**: runtime compartilhado vs. JVM isolada por
    aplicação.
 10. **Java OS Platform (Java)**: gerenciamento de arquivos, serviços de sistema, rede,
