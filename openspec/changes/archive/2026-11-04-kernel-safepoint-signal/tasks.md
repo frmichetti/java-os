@@ -1,0 +1,27 @@
+# Tasks
+
+## 1. `kernel::safepoint`: registro puro de faixas
+
+- [x] 1.1 Implementar `SafepointRegistry` (privada, `Vec<(base: u64, size: u64)>`) com `register(&mut self, base: u64, size: u64)` e `contains(&self, addr: u64) -> bool`. Verificar com testes unitários em host: endereço dentro de uma faixa registrada é contido; endereço fora de qualquer faixa registrada não é contido; endereço na borda exata (`base + size`, exclusivo) não é contido; duas faixas registradas, consulta funciona para ambas.
+- [x] 1.2 Implementar `pub fn register(base: u64, size: u64) -> Result<(), SafepointError>`, validando via `kernel::vmm::VMM.lock().region_containing(base)` que `[base, base+size)` cai inteiramente dentro de uma reserva viva antes de inserir em uma instância global (`Spinlock<SafepointRegistry>`) — cobre "Registro de Faixa de Safepoint" da spec `kernel-safepoint`. Verificar com teste unitário em host (mesmo padrão `std::sync::Once` de `kernel::syscall::tests::ensure_vmm_initialized`, já que `Vmm::init()` nunca roda fora de `continue_boot`): registrar uma faixa dentro de uma reserva viva recém-criada é aceito; registrar uma faixa fora de qualquer reserva viva (ex.: endereço 0) é rejeitado, sem afetar o registro de faixas já aceitas.
+- [x] 1.3 Implementar `pub fn is_registered(addr: u64) -> bool`, delegando à instância global de `SafepointRegistry`. Verificar com teste unitário em host: endereço dentro de uma faixa registrada via `register` (tarefa 1.2) devolve `true`; endereço nunca registrado devolve `false`.
+
+## 2. `kernel::idt`: page fault recuperável
+
+- [x] 2.1 Extrair a condição "esta falta é por ausência de página" (`error_code` bit 0 = 0) para uma função pura `fn is_page_absent(error_code: u64) -> bool`. Verificar com testes unitários em host: `0x0` (ausência) e `0x0` combinado com outros bits irrelevantes (ex. `0x4`, acesso em modo usuário) devolvem `true`; `0x1` e `0x3` (violação de permissão, com/sem outros bits) devolvem `false`.
+- [x] 2.2 Em `page_fault_handler`, antes do comportamento fatal existente, retornar imediatamente (sem reportar nem haltar) se `is_page_absent(error_code)` e `kernel::safepoint::is_registered(read_cr2())` — cobre "Falta de Página por Ausência numa Faixa Registrada é Recuperável" e preserva "Falta de Página Fora de uma Faixa Registrada Continua Fatal" da spec `kernel-safepoint`, e o requisito modificado "Tratamento de Exceções de CPU" de `kernel-interrupts`. Não muda a assinatura do handler nem toca os campos de `frame` (o `iretq` gerado pela ABI `extern "x86-interrupt"` já retoma exatamente a instrução que faltou, sem nenhuma ação adicional — ver design.md). Verificar que `cargo kernel-build` compila; o comportamento de retomada automática só é verificável em boot real (tarefa 4), já que `read_cr2()` lê um registrador de controle (privilegiado, mesma limitação já documentada para `Mapper`/`CR3` — ver design.md de `kernel-jvm-posix-syscalls`, "Escopo de testes em host").
+
+## 3. Demonstração em modo kernel
+
+- [x] 3.1 Implementar `kernel::safepoint_demo` com duas threads de kernel compartilhando o espaço de endereçamento corrente (mesmo padrão de `kernel::wait_demo`/`kernel::pthread_demo`, via `scheduler::spawn_sharing_current_address_space`): uma thread coordenadora reserva e compromete uma página via `kernel::vmm`, registra-a via `kernel::safepoint::register`, descompromete-a (arma o safepoint), aguarda um número fixo de ticks do timer (mesma técnica de `kernel::wait_demo`, `crate::timer::ticks()`) e a compromete de novo (libera); uma thread sondadora lê repetidamente (via `core::ptr::read_volatile`) um byte da página registrada, por um número fixo de iterações que atravesse a janela de descomprometimento/recomprometimento, contando quantas leituras completam, e reporta o resultado final pelo console serial (`"safepoint: N leituras completadas sem halt - PASSOU"`, análogo às mensagens de `vmm_demo`/`pthread_demo`). Verificar que `cargo kernel-build` compila.
+- [x] 3.2 Chamar `kernel::safepoint_demo` (spawn das duas threads) em `continue_boot` (`kernel/src/main.rs`), depois de `kernel::vmm::VMM.lock().init()` e do escalonador já instalado (mesmo ponto onde `kernel::wait_demo`/`kernel::pthread_demo` já são chamados). Verificar com `cargo xtask test` que o boot continua passando sem regressão no console serial.
+
+## 4. Verificação em boot real e documentação
+
+- [x] 4.1 Confirmar em boot real (console serial, via `cargo xtask run -- -serial stdio -display none`) que a mensagem final de `kernel::safepoint_demo` reporta a contagem completa esperada de leituras, sem nenhuma `EXCECAO #PF` nem halt no log — inclusive durante a janela em que a página estava descomprometida (confirmável observando que o log de boot continua progredindo normalmente para as demais demos depois dela). Documentar o resultado em design.md, como já é costume neste projeto.
+- [x] 4.2 Confirmar `cargo test -p kernel --lib` (suíte completa de host) sem regressão, incluindo todos os novos testes das tarefas 1 e 2.
+- [x] 4.3 Atualizar `docs/architecture/overview.md`: seção 1 (Kernel) ou seção 6 (estratégia POSIX), registrando `kernel::safepoint` e a mudança em `kernel::idt::page_fault_handler`; e o item 8 do roadmap (seção 15), registrando esta sub-change como concluída e removendo "sinal de safepoint" da lista do que ainda falta (mantendo sistema de arquivos, carregamento dinâmico de bibliotecas e o porte do HotSpot). Verificar lendo o arquivo atualizado.
+
+## Workflow follow-up
+
+- Arquivar esta change após a aprovação do usuário para as modificações propostas.

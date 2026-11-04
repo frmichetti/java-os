@@ -26,6 +26,8 @@ pub mod process;
 pub mod pthread;
 pub mod pthread_demo;
 pub mod pthread_handles;
+pub mod safepoint;
+pub mod safepoint_demo;
 pub mod scheduler;
 pub mod serial;
 pub mod stack;

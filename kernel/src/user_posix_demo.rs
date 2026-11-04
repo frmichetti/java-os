@@ -25,10 +25,10 @@ core::arch::global_asm!(
     "syscall",
     "mov r12, rax", // r12 = endereco reservado, preservado entre syscalls (callee-saved)
     "mov byte ptr [rip + st0], 'F'",
-    "movabs r11, 0xffffb00000000000", // VMM_WINDOW_START
+    "movabs r11, 0xffffc00000000000", // VMM_WINDOW_START
     "cmp r12, r11",
     "jb 1f",
-    "movabs r11, 0xffffb01000000000", // VMM_WINDOW_START + VMM_WINDOW_SIZE
+    "movabs r11, 0xffffc01000000000", // VMM_WINDOW_START + VMM_WINDOW_SIZE
     "cmp r12, r11",
     "jae 1f",
     "mov byte ptr [rip + st0], 'P'",

@@ -343,6 +343,14 @@ extern "C" fn continue_boot() -> ! {
             .expect("spawn da produtora da caixa de pthread_demo falhou");
         kernel::scheduler::spawn_sharing_current_address_space(&mut frame_allocator, kernel::pthread_demo::box_consumer)
             .expect("spawn da consumidora da caixa de pthread_demo falhou");
+
+        // Demonstração de `kernel::safepoint` (página de poll armada/liberada
+        // via `kernel::vmm`) — ver design.md da change
+        // `kernel-safepoint-signal`.
+        kernel::scheduler::spawn_sharing_current_address_space(&mut frame_allocator, kernel::safepoint_demo::coordinator)
+            .expect("spawn da coordenadora de safepoint_demo falhou");
+        kernel::scheduler::spawn_sharing_current_address_space(&mut frame_allocator, kernel::safepoint_demo::poller)
+            .expect("spawn da sondadora de safepoint_demo falhou");
     }
 
     idle_loop();

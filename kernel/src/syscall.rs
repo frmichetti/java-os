@@ -441,23 +441,11 @@ mod tests {
         assert_eq!(prot_to_page_flags(0b11), PageFlags { writable: true, user_accessible: true, executable: true });
     }
 
-    /// Serializa os testes que tocam `kernel::vmm::VMM` (um único `Spinlock`
-    /// global compartilhado por todo o processo de teste) — mesmo motivo e
-    /// mesmo padrão de `kernel::wait_queue::tests::BLOCK_INTENT_TEST_LOCK`:
-    /// sem isso, dois destes testes rodando em paralelo (padrão do executor
-    /// de testes do Rust) poderiam reservar/liberar faixas uns por cima dos
-    /// outros.
-    static VM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Registra a janela gerenciada (`Vmm::init`) no `VMM` global exatamente
-    /// uma vez por processo de teste — em boot real isso é feito por
-    /// `continue_boot`, que nenhum teste de host executa. Chamar `init()`
-    /// mais de uma vez duplicaria a janela livre (`RangeAllocator::add_window`
-    /// não é idempotente), por isso o `std::sync::Once`.
-    fn ensure_vmm_initialized() {
-        static INIT: std::sync::Once = std::sync::Once::new();
-        INIT.call_once(|| VMM.lock().init());
-    }
+    /// Serializa os testes que tocam `kernel::vmm::VMM` — compartilhado com
+    /// `kernel::safepoint::tests`, já que módulos diferentes rodam em
+    /// paralelo por padrão (um lock local aqui não coordenaria com um lock
+    /// local lá) — ver `kernel::vmm::test_support`.
+    use crate::vmm::test_support::{VMM_TEST_LOCK as VM_TEST_LOCK, ensure_vmm_initialized};
 
     #[test]
     fn vm_reserve_returns_an_address_inside_the_managed_window() {

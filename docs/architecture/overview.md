@@ -75,8 +75,15 @@
   superiores (`0xffffffff80000000`), exigido pelo `code-model=kernel`. A HHDM
   (higher-half direct map) fornecida pelo Limine ocupa o índice 256 da PML4; o heap
   do kernel está reservado a partir de `0xffff_9000_0000_0000` (índice 288); a stack
-  dedicada do kernel está reservada a partir de `0xffff_a000_0000_0000` (índice 320),
-  com a guard page logo abaixo (ver `kernel-stack-guard-page`).
+  dedicada do kernel (thread de boot) está reservada a partir de
+  `0xffff_a000_0000_0000` (índice 320), com a guard page logo abaixo (ver
+  `kernel-stack-guard-page`); o pool de stacks de kernel de cada thread nova está
+  reservado a partir de `0xffff_b000_0000_0000` (índice 352, `kernel::stack::THREAD_STACK_POOL_BASE`,
+  ver `kernel-process-scheduler`); a janela de memória virtual anônima de
+  `kernel::vmm` está reservada a partir de `0xffff_c000_0000_0000` (índice 384 —
+  **corrigido pela change `kernel-safepoint-signal`**: originalmente também usava o
+  índice 352, colidindo silenciosamente com o pool de stacks de thread acima; ver
+  `design.md` dessa change para o histórico completo).
 - **Alocador físico**: `kernel::phys::FrameAllocator` — uma lista livre intrusiva (cada
   frame livre guarda, nos seus próprios bytes via HHDM, o endereço do próximo frame
   livre) inicializada a partir das regiões `usable` do memory map do Limine. Detecta
@@ -101,8 +108,9 @@
   sub-região já comprometida sem desmapear (`protect`, sobre a nova primitiva
   `Mapper::protect` de `kernel-paging`) e liberar uma reserva inteira com
   reaproveitamento do espaço virtual por reservas futuras (`release`). Opera sobre
-  uma janela fixa de 64 GiB a partir de `0xffff_b000_0000_0000` (índice 352 da PML4,
-  o primeiro livre após a stack dedicada do kernel), só em modo kernel por enquanto —
+  uma janela fixa de 64 GiB a partir de `0xffff_c000_0000_0000` (índice 384 da PML4 —
+  ver seção 1 para o endereço corrigido pela change `kernel-safepoint-signal`), só em
+  modo kernel por enquanto —
   sem nenhuma *syscall* exposta a modo usuário e sem integração com
   `kernel::process::Process` (uma faixa de reserva por processo fica para uma
   sub-change futura). Verificado em boot real: o caminho feliz completo de
@@ -356,9 +364,13 @@ armazenamento e rede — todos implementados.
     *busy-wait* via `kernel::sync::Spinlock`) — o maior gap estrutural identificado.
   - *Sinal de safepoint* (`SIGSEGV` numa página de polling protegida, para parar todas
     as threads Java simultaneamente sem polling explícito em cada ponto de segurança):
-    o `page_fault_handler` da IDT (vetor 14) existe, mas hoje trata qualquer falta de
-    página como evento fatal — falta um mecanismo de "esta página gera um desvio para
-    um handler escolhido pelo processo", análogo a `sigaction(SIGSEGV, ...)`.
+    **entregue pela change `kernel-safepoint-signal`** — `kernel::safepoint::register`
+    permite marcar uma faixa de endereço como ponto de poll; uma falta de página por
+    ausência (`P=0`) dentro dela retoma a execução automaticamente (`iretq` sem ação
+    adicional) em vez do `page_fault_handler` haltar o kernel, combinado com
+    `SYSCALL_VM_DECOMMIT`/`SYSCALL_VM_COMMIT` já existentes para armar/liberar a
+    página — sem desvio genérico para um handler escolhido pelo processo (decisão
+    explícita: ver design.md da change, "Por que não bloquear a thread").
   - *Relógio* (`clock_gettime`, para `System.nanoTime()`/`currentTimeMillis()`):
     `kernel::timer` já conta ticks desde o boot; falta relógio de parede real e,
     possivelmente, resolução mais fina.
@@ -520,11 +532,17 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    — `SYSCALL_VM_*`, `SYSCALL_MUTEX_*`, `SYSCALL_COND_*`, `SYSCALL_CLOCK_*`),
    com tabelas de handle dinâmicas para mutex/condvar nomeados
    (`kernel::pthread_handles`) e tradução endereço→`Region`
-   (`Vmm::region_containing`) para as chamadas de memória virtual. Ainda
-   faltam: sinal de safepoint (SIGSEGV de página de polling), sistema de
-   arquivos (para `open`/`read` de classes), carregamento dinâmico de
-   bibliotecas (build estático do JDK, ou um linker ELF dinâmico mínimo), e o
-   próprio porte do HotSpot — ver seção 6 para o inventário completo.
+   (`Vmm::region_containing`) para as chamadas de memória virtual.
+   `kernel-safepoint-signal` (concluída) entregou a sexta sub-change: o sinal de
+   safepoint (`kernel::safepoint::register`, falta de página por ausência numa
+   faixa registrada retoma a execução em vez de haltar — ver seção 6). Durante
+   sua implementação foi descoberto e corrigido um bug pré-existente em duas
+   sub-changes anteriores: `kernel::vmm::VMM_WINDOW_START` colidia com
+   `kernel::stack::THREAD_STACK_POOL_BASE` (ambos no índice 352 da PML4) — ver
+   seção 1 e o design.md da change para o histórico completo. Ainda faltam:
+   sistema de arquivos (para `open`/`read` de classes), carregamento dinâmico
+   de bibliotecas (build estático do JDK, ou um linker ELF dinâmico mínimo), e
+   o próprio porte do HotSpot — ver seção 6 para o inventário completo.
 9. **Modelo híbrido de execução de JVM**: runtime compartilhado vs. JVM isolada por
    aplicação.
 10. **Java OS Platform (Java)**: gerenciamento de arquivos, serviços de sistema, rede,

@@ -111,12 +111,32 @@ fn read_cr2() -> u64 {
     value
 }
 
+/// Bit 0 (`P`) do código de erro de `#PF`: `0` indica que a causa foi uma
+/// página ausente (não mapeada); `1` indica violação de permissão numa
+/// página presente. Função pura, testável sem hardware — ver design.md da
+/// change `kernel-safepoint-signal`.
+fn is_page_absent(error_code: u64) -> bool {
+    const PAGE_FAULT_ERROR_PRESENT: u64 = 1 << 0;
+    error_code & PAGE_FAULT_ERROR_PRESENT == 0
+}
+
 /// Reporta uma exceção de CPU pelo canal de boot e entra em halt — cobre
-/// "Tratamento de Exceções de CPU" da spec `kernel-interrupts`.
+/// "Tratamento de Exceções de CPU" da spec `kernel-interrupts`. **Exceção**:
+/// uma falta por ausência de página dentro de uma faixa registrada como
+/// ponto de poll de safepoint (`kernel::safepoint`) retoma a execução
+/// normalmente em vez de haltar — o `iretq` gerado pela ABI `extern
+/// "x86-interrupt"` já faz isso sozinho ao retornar, já que `frame` nunca é
+/// alterado; ver design.md da change `kernel-safepoint-signal`, "Mecanismo:
+/// 'retry automático'...".
 extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, error_code: u64) {
+    let address = read_cr2();
+    if is_page_absent(error_code) && crate::safepoint::is_registered(address) {
+        return;
+    }
+
     crate::serial_println_emergency!(
         "EXCECAO #PF (page fault): endereco=0x{:x} codigo_erro=0x{:x} rip=0x{:x}",
-        read_cr2(),
+        address,
         error_code,
         frame.instruction_pointer,
     );
@@ -214,6 +234,20 @@ mod tests {
     #[test]
     fn missing_entry_is_not_present() {
         assert!(!IdtEntry::missing().is_present());
+    }
+
+    #[test]
+    fn page_absence_is_recognized_regardless_of_other_bits() {
+        assert!(is_page_absent(0x0));
+        // Bit de "acesso em modo usuario" (bit 2) ligado, sem o bit de
+        // presenca: ainda e ausencia.
+        assert!(is_page_absent(0x4));
+    }
+
+    #[test]
+    fn permission_violation_is_not_page_absence() {
+        assert!(!is_page_absent(0x1));
+        assert!(!is_page_absent(0x3));
     }
 
     #[test]

@@ -22,9 +22,22 @@ use crate::phys::{FrameAllocator, FrameStore};
 use crate::sync::Spinlock;
 
 /// Primeiro endereço virtual da faixa fixa reservada para `kernel::vmm`:
-/// índice 352 da PML4 (o primeiro índice livre após a stack dedicada do
-/// kernel, índice 320) — ver design.md, "Faixa virtual fixa para reservas".
-pub const VMM_WINDOW_START: u64 = 0xffff_b000_0000_0000;
+/// índice 384 da PML4 — ver design.md, "Faixa virtual fixa para reservas".
+///
+/// **Correção (change `kernel-safepoint-signal`):** originalmente este valor
+/// era `0xffff_b000_0000_0000` (índice 352), a partir da suposição (errada)
+/// de que seria "o primeiro índice livre após a stack dedicada do kernel
+/// (índice 320)" — mas o índice 352 já estava ocupado por
+/// `kernel::stack::THREAD_STACK_POOL_BASE` (o pool de stacks de kernel de
+/// cada thread, de `kernel-process-scheduler`, uma change anterior). Como
+/// nenhuma verificação anterior exercitava `kernel::vmm` e o pool de stacks
+/// ao mesmo tempo além de poucas páginas, a colisão ficou latente até o demo
+/// de `kernel-safepoint-signal` tentar comprometer uma página que já era a
+/// stack de kernel viva de outra thread — `Mapper::map` rejeitou com
+/// `AlreadyMapped` (ou, pior, corromperia a stack silenciosamente se
+/// `allow_replace` fosse `true`). Ver `docs/architecture/overview.md`, seção
+/// 1, para o índice de PML4 de cada faixa reservada.
+pub const VMM_WINDOW_START: u64 = 0xffff_c000_0000_0000;
 
 /// Tamanho da sub-faixa de fato gerenciada pelo alocador de faixas, dentro
 /// do índice de PML4 reservado (que cobre 512 GiB inteiros).
@@ -452,6 +465,29 @@ impl Vmm {
 /// logo após o heap do kernel estar pronto — mesmo padrão de
 /// `kernel::phys::FRAME_ALLOCATOR`.
 pub static VMM: Spinlock<Vmm> = Spinlock::new(Vmm::new());
+
+/// Suporte compartilhado para qualquer módulo cujos testes de host precisem
+/// reservar/liberar através do `VMM` global — `Vmm::init()` nunca roda fora
+/// de `continue_boot`, e o `VMM` é um único `Spinlock` compartilhado por todo
+/// o processo de teste (módulos diferentes rodam em paralelo por padrão). Ver
+/// design.md da change `kernel-jvm-posix-syscalls`, "Escopo de testes em
+/// host" — consumido por `kernel::syscall`/`kernel::safepoint`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::VMM;
+
+    /// Serializa qualquer teste (de qualquer módulo) que toque o `VMM`
+    /// global.
+    pub(crate) static VMM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Registra a janela gerenciada (`Vmm::init`) exatamente uma vez por
+    /// processo de teste — chamar mais de uma vez duplicaria a janela livre
+    /// (`RangeAllocator::add_window` não é idempotente).
+    pub(crate) fn ensure_vmm_initialized() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| VMM.lock().init());
+    }
+}
 
 #[cfg(test)]
 mod tests {
