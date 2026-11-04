@@ -250,6 +250,48 @@ pub fn spawn_user_demo<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>) -
     Ok(thread_id)
 }
 
+/// Endereço virtual, na metade inferior, onde o código do programa de teste
+/// de modo usuário `kernel::user_posix_demo` é copiado — distinto de
+/// `USER_DEMO_CODE_VIRT` só por clareza ao ler despejos de depuração (cada
+/// um vive no seu próprio `AddressSpace`, então não há colisão real possível
+/// mesmo que os valores fossem iguais).
+const USER_POSIX_DEMO_CODE_VIRT: u64 = 0x0000_3000_0000_0000;
+/// Endereço virtual, na metade inferior, onde a stack de usuário do
+/// programa de teste é mapeada.
+const USER_POSIX_DEMO_STACK_VIRT: u64 = 0x0000_4000_0000_0000;
+const USER_POSIX_DEMO_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
+
+/// Cria o processo de demonstração de modo usuário
+/// `kernel::user_posix_demo`: mesma estrutura de [`spawn_user_demo`], com seu
+/// próprio `AddressSpace`, página de código e stack dedicadas — ver
+/// `design.md` da change `kernel-jvm-posix-syscalls`, "Escopo da verificação
+/// em boot real".
+pub fn spawn_user_posix_demo<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>) -> Result<ThreadId, ProcessError> {
+    let address_space = Process::begin_new_user(frame_allocator)?;
+    let root = address_space.root();
+
+    let code_frame = crate::paging::Mapper::for_root(frame_allocator, root)
+        .map_new(
+            USER_POSIX_DEMO_CODE_VIRT,
+            crate::paging::PageFlags { writable: true, user_accessible: true, executable: true },
+            false,
+        )
+        .map_err(ProcessError::AddressSpace)?;
+    let code_hhdm_addr = crate::hhdm::phys_to_virt(crate::hhdm::offset(), code_frame);
+    unsafe { crate::user_posix_demo::copy_into(code_hhdm_addr) };
+
+    let (process, thread) = Process::finish_new_user(
+        frame_allocator,
+        address_space,
+        USER_POSIX_DEMO_CODE_VIRT,
+        USER_POSIX_DEMO_STACK_VIRT,
+        USER_POSIX_DEMO_STACK_SIZE,
+    )?;
+    let thread_id = register_thread(thread);
+    with_interrupts_disabled(|| PROCESSES.lock().push(process));
+    Ok(thread_id)
+}
+
 /// Chamada pela rotina de entrada do timer ([`timer_entry`]) com o `rsp` da
 /// thread que acabou de ser interrompida. Mantém o incremento do contador
 /// Lógica de decisão de escalonamento em si — compartilhada entre

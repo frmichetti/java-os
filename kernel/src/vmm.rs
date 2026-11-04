@@ -259,6 +259,20 @@ impl ReservationTable {
         }
     }
 
+    /// Busca a reserva viva cujo intervalo `[base, base+size)` contém
+    /// `addr` — ver design.md da change `kernel-jvm-posix-syscalls`, "VM por
+    /// endereço". `None` se `addr` não cair dentro de nenhuma reserva viva
+    /// (incluindo uma já liberada: `remove` já apagou sua entrada deste
+    /// `BTreeMap`).
+    fn region_containing(&self, addr: u64) -> Option<Region> {
+        let (&base, state) = self.reservations.range(..=addr).next_back()?;
+        if addr < base + state.size {
+            Some(Region { base, size: state.size, generation: state.generation })
+        } else {
+            None
+        }
+    }
+
     /// Remove a reserva por completo, devolvendo os offsets (em bytes, a
     /// partir da base da reserva) de cada página que ainda estava
     /// comprometida — para o chamador descomprometer de verdade antes de
@@ -301,6 +315,15 @@ impl Vmm {
     /// antes de qualquer `reserve`.
     pub fn init(&mut self) {
         self.ranges.add_window(VMM_WINDOW_START, VMM_WINDOW_SIZE);
+    }
+
+    /// Traduz um endereço virtual para o `Region` da reserva viva que o
+    /// contém, se houver — ver design.md da change `kernel-jvm-posix-syscalls`,
+    /// "VM por endereço": necessário porque a ABI de syscall (convenção
+    /// `mmap`/`munmap`/`mprotect`: endereço + tamanho) não tem onde carregar
+    /// de volta o `Region` opaco que `reserve` devolveu.
+    pub fn region_containing(&self, addr: u64) -> Option<Region> {
+        self.table.region_containing(addr)
     }
 
     /// Reserva `size` bytes (arredondado para cima em páginas) de memória
@@ -558,6 +581,34 @@ mod tests {
         table.validate_commit(&region, PAGE_SIZE, PAGE_SIZE).unwrap();
         table.mark_committed(&region, PAGE_SIZE, PAGE_SIZE);
         assert!(table.validate_fully_committed(&region, 0, 2 * PAGE_SIZE).is_ok());
+    }
+
+    #[test]
+    fn region_containing_finds_the_reservation_that_owns_the_address() {
+        let mut table = ReservationTable::empty();
+        let region = table.reserve(0x1000, 4 * PAGE_SIZE);
+
+        assert_eq!(table.region_containing(0x1000), Some(region));
+        assert_eq!(table.region_containing(0x1000 + PAGE_SIZE), Some(region));
+        assert_eq!(table.region_containing(0x1000 + 4 * PAGE_SIZE - 1), Some(region));
+    }
+
+    #[test]
+    fn region_containing_rejects_an_address_outside_any_reservation() {
+        let mut table = ReservationTable::empty();
+        table.reserve(0x1000, PAGE_SIZE);
+
+        assert_eq!(table.region_containing(0x0999), None);
+        assert_eq!(table.region_containing(0x1000 + PAGE_SIZE), None);
+    }
+
+    #[test]
+    fn region_containing_rejects_an_address_inside_a_released_reservation() {
+        let mut table = ReservationTable::empty();
+        let region = table.reserve(0x1000, PAGE_SIZE);
+        table.remove(&region).unwrap();
+
+        assert_eq!(table.region_containing(0x1000), None);
     }
 
     #[test]

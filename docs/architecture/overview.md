@@ -192,14 +192,48 @@
   coerente com a thread corrente, a cada troca de contexto.
 - **ABI definida nesta primeira implementação**: número da chamada em `RAX`,
   até quatro argumentos em `RDI`/`RSI`/`RDX`/`R10`, retorno em `RAX`; um número
-  de chamada desconhecido é rejeitado explicitamente. Duas chamadas
-  implementadas: escrita no console e consulta do contador de ticks do kernel.
+  de chamada desconhecido é rejeitado explicitamente.
+- **Chamadas implementadas** (ver design.md das changes `kernel-syscalls` e
+  `kernel-jvm-posix-syscalls`, que estendeu a tabela abaixo expondo a modo
+  usuário as primitivas POSIX já construídas em modo kernel — `kernel::vmm`,
+  `kernel::pthread`, `kernel::clock`):
+
+  | Número | Nome | Argumentos | Retorno |
+  |---|---|---|---|
+  | 0 | `SYSCALL_WRITE` | `ptr`, `len` | bytes escritos |
+  | 1 | `SYSCALL_GET_TICKS` | — | contador de ticks |
+  | 2 | `SYSCALL_VM_RESERVE` | `size` | endereço base, ou erro |
+  | 3 | `SYSCALL_VM_COMMIT` | `addr`, `len`, `prot` | `0`, ou erro |
+  | 4 | `SYSCALL_VM_DECOMMIT` | `addr`, `len` | `0`, ou erro |
+  | 5 | `SYSCALL_VM_PROTECT` | `addr`, `len`, `prot` | `0`, ou erro |
+  | 6 | `SYSCALL_VM_RELEASE` | `addr` | `0`, ou erro |
+  | 7 | `SYSCALL_MUTEX_CREATE` | — | handle, ou erro |
+  | 8 | `SYSCALL_MUTEX_LOCK` | `handle` | `0`, ou erro |
+  | 9 | `SYSCALL_MUTEX_UNLOCK` | `handle` | `0`, ou erro |
+  | 10 | `SYSCALL_COND_CREATE` | — | handle, ou erro |
+  | 11 | `SYSCALL_COND_WAIT` | `cond_handle`, `mutex_handle` | `0`, ou erro |
+  | 12 | `SYSCALL_COND_NOTIFY_ONE` | `handle` | `0`, ou erro |
+  | 13 | `SYSCALL_COND_NOTIFY_ALL` | `handle` | `0`, ou erro |
+  | 14 | `SYSCALL_CLOCK_WALL` | — | nanossegundos desde a época |
+  | 15 | `SYSCALL_CLOCK_MONOTONIC` | — | nanossegundos monotônicos |
+
+  As chamadas de memória virtual (2-6) endereçam por ponteiro (convenção
+  `mmap`/`munmap`/`mprotect`: `prot` é uma máscara de 2 bits, bit 0 =
+  gravável, bit 1 = executável, com `user_accessible` sempre forçado,
+  independentemente do valor recebido). As de mutex/condvar (7-13) criam
+  objetos nomeados dinamicamente (`kernel::pthread_handles`, via `Box::leak`,
+  sem destruição ainda) identificados por um `handle` opaco. Todo erro
+  alcançável por estas chamadas colapsa no mesmo sentinela `SYSCALL_ERROR` já
+  usado por "número de chamada desconhecido" — nenhum esquema de erro
+  granular (estilo `errno`) existe ainda.
 - **Limitação atual**: sem carregador de executáveis — o único código de
-  modo usuário existente é um programa de teste gerado em compilação e copiado
-  para uma página de usuário em runtime (`kernel::user_demo`), usado para
-  provar o mecanismo ponta a ponta. Uma exceção causada por código de modo
-  usuário ainda halta o kernel inteiro (sem isolamento de falhas por
-  processo/thread ainda).
+  modo usuário existente são programas de teste gerados em compilação e
+  copiados para uma página de usuário em runtime (`kernel::user_demo`,
+  `kernel::user_posix_demo`), usados para provar o mecanismo ponta a ponta.
+  Uma exceção causada por código de modo usuário ainda halta o kernel inteiro
+  (sem isolamento de falhas por processo/thread ainda), e as tabelas de
+  handle de mutex/condvar e a janela de `kernel::vmm` continuam globais ao
+  kernel inteiro, sem isolamento entre processos diferentes.
 - Separação esperada entre syscalls "de sistema" e a superfície exposta à JVM
   fica para quando a JVM existir (roadmap itens 7-9).
 
@@ -481,11 +515,16 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    construídos sobre `kernel::wait_queue`. `kernel-wall-clock` (concluída) entregou
    a quarta sub-change: relógio de parede e monotônico (`kernel::clock` —
    `wall_clock_nanos`/`monotonic_nanos`, base de `clock_gettime`, ver seção 1).
-   Ainda faltam: *syscalls* expondo essas primitivas a modo usuário, sinal de
-   safepoint (SIGSEGV de página de polling), sistema de arquivos (para `open`/
-   `read` de classes), carregamento dinâmico de bibliotecas (build estático do
-   JDK, ou um linker ELF dinâmico mínimo), e o próprio porte do HotSpot — ver
-   seção 6 para o inventário completo.
+   `kernel-jvm-posix-syscalls` (concluída) entregou a quinta sub-change: as
+   *syscalls* expondo todas as primitivas acima a modo usuário (ver seção 4
+   — `SYSCALL_VM_*`, `SYSCALL_MUTEX_*`, `SYSCALL_COND_*`, `SYSCALL_CLOCK_*`),
+   com tabelas de handle dinâmicas para mutex/condvar nomeados
+   (`kernel::pthread_handles`) e tradução endereço→`Region`
+   (`Vmm::region_containing`) para as chamadas de memória virtual. Ainda
+   faltam: sinal de safepoint (SIGSEGV de página de polling), sistema de
+   arquivos (para `open`/`read` de classes), carregamento dinâmico de
+   bibliotecas (build estático do JDK, ou um linker ELF dinâmico mínimo), e o
+   próprio porte do HotSpot — ver seção 6 para o inventário completo.
 9. **Modelo híbrido de execução de JVM**: runtime compartilhado vs. JVM isolada por
    aplicação.
 10. **Java OS Platform (Java)**: gerenciamento de arquivos, serviços de sistema, rede,

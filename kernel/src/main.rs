@@ -315,6 +315,11 @@ extern "C" fn continue_boot() -> ! {
             .expect("preparar o pool de stacks de thread falhou");
         kernel::scheduler::spawn_user_demo(&mut frame_allocator)
             .expect("spawn do processo de demonstracao em modo usuario falhou");
+        // Demonstração das novas syscalls desta change (VM anônima, mutex/
+        // condvar nomeados, relógios) — ver design.md da change
+        // `kernel-jvm-posix-syscalls`, "Escopo da verificação em boot real".
+        kernel::scheduler::spawn_user_posix_demo(&mut frame_allocator)
+            .expect("spawn do processo de demonstracao das syscalls posix da jvm falhou");
         // Thread de demonstração do teclado (ver `design.md` da change
         // `kernel-keyboard`): compartilha o espaço de endereçamento da
         // thread de boot (não precisa de isolamento próprio), evitando uma

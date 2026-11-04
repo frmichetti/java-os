@@ -3,6 +3,8 @@
 
 use crate::apic::{rdmsr, wrmsr};
 use crate::gdt::KERNEL_CODE_SELECTOR;
+use crate::paging::PageFlags;
+use crate::vmm::VMM;
 
 const IA32_EFER: u32 = 0xC000_0080;
 const IA32_STAR: u32 = 0xC000_0081;
@@ -38,6 +40,23 @@ fn star_value(syscall_cs_base: u16, sysret_selector_base: u16) -> u64 {
 /// sobrescreve), retorno em `RAX`.
 pub const SYSCALL_WRITE: u64 = 0;
 pub const SYSCALL_GET_TICKS: u64 = 1;
+
+/// Ver design.md da change `kernel-jvm-posix-syscalls`, "Numeração de
+/// syscalls" — tabela completa de argumentos/retorno de cada uma.
+pub const SYSCALL_VM_RESERVE: u64 = 2;
+pub const SYSCALL_VM_COMMIT: u64 = 3;
+pub const SYSCALL_VM_DECOMMIT: u64 = 4;
+pub const SYSCALL_VM_PROTECT: u64 = 5;
+pub const SYSCALL_VM_RELEASE: u64 = 6;
+pub const SYSCALL_MUTEX_CREATE: u64 = 7;
+pub const SYSCALL_MUTEX_LOCK: u64 = 8;
+pub const SYSCALL_MUTEX_UNLOCK: u64 = 9;
+pub const SYSCALL_COND_CREATE: u64 = 10;
+pub const SYSCALL_COND_WAIT: u64 = 11;
+pub const SYSCALL_COND_NOTIFY_ONE: u64 = 12;
+pub const SYSCALL_COND_NOTIFY_ALL: u64 = 13;
+pub const SYSCALL_CLOCK_WALL: u64 = 14;
+pub const SYSCALL_CLOCK_MONOTONIC: u64 = 15;
 
 /// Valor devolvido em `RAX` para um número de chamada não reconhecido, em
 /// vez de executar qualquer serviço — ver spec `kernel-syscalls`, "Despacho
@@ -78,6 +97,196 @@ fn sys_get_ticks() -> u64 {
     crate::timer::ticks()
 }
 
+/// Decodifica a máscara `prot` de uma chamada de VM (bit 0 = gravável, bit 1
+/// = executável; demais bits ignorados) em `PageFlags`, forçando sempre
+/// `user_accessible: true` — um chamador de modo usuário nunca pode, através
+/// desta syscall, pedir nem receber uma página inacessível a partir do anel
+/// 3, independentemente do valor bruto recebido. Função pura, testável sem
+/// hardware — ver design.md, "Permissões de página".
+fn prot_to_page_flags(prot: u64) -> PageFlags {
+    PageFlags { writable: prot & 0b01 != 0, user_accessible: true, executable: prot & 0b10 != 0 }
+}
+
+/// Reserva `size` bytes de memória virtual anônima — cobre
+/// `SYSCALL_VM_RESERVE`. Devolve o endereço base da reserva, ou
+/// `SYSCALL_ERROR` (tamanho zero, ou sem espaço virtual livre suficiente).
+fn sys_vm_reserve(size: u64) -> u64 {
+    match VMM.lock().reserve(size) {
+        Ok(region) => region.base(),
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+/// Compromete `len` bytes a partir de `addr` (que deve cair dentro de uma
+/// reserva viva) com as permissões decodificadas de `prot` — cobre
+/// `SYSCALL_VM_COMMIT`. `addr` é traduzido para o `Region` que o contém via
+/// `Vmm::region_containing` (ver design.md, "VM por endereço"); qualquer
+/// endereço fora de uma reserva viva, ou condição de `VmmError`, devolve
+/// `SYSCALL_ERROR`.
+fn sys_vm_commit(addr: u64, len: u64, prot: u64) -> u64 {
+    let flags = prot_to_page_flags(prot);
+    // Mesma ordem de aquisição de `kernel::vmm_demo` (frame allocator antes
+    // de `VMM`) — evitar inversão de ordem de locks entre os dois pontos do
+    // kernel que tocam ambos.
+    let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
+    let mut vmm = VMM.lock();
+    let Some(region) = vmm.region_containing(addr) else {
+        return SYSCALL_ERROR;
+    };
+    let offset = addr - region.base();
+    match vmm.commit(&mut frame_allocator, &region, offset, len, flags) {
+        Ok(()) => 0,
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+/// Descompromete `len` bytes a partir de `addr` — cobre
+/// `SYSCALL_VM_DECOMMIT`. Mesma tradução addr→`Region` de [`sys_vm_commit`].
+fn sys_vm_decommit(addr: u64, len: u64) -> u64 {
+    let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
+    let mut vmm = VMM.lock();
+    let Some(region) = vmm.region_containing(addr) else {
+        return SYSCALL_ERROR;
+    };
+    let offset = addr - region.base();
+    match vmm.decommit(&mut frame_allocator, &region, offset, len) {
+        Ok(()) => 0,
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+/// Altera as permissões de `len` bytes a partir de `addr` para as
+/// decodificadas de `prot` — cobre `SYSCALL_VM_PROTECT`. Mesma tradução
+/// addr→`Region` de [`sys_vm_commit`].
+fn sys_vm_protect(addr: u64, len: u64, prot: u64) -> u64 {
+    let flags = prot_to_page_flags(prot);
+    let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
+    let mut vmm = VMM.lock();
+    let Some(region) = vmm.region_containing(addr) else {
+        return SYSCALL_ERROR;
+    };
+    let offset = addr - region.base();
+    match vmm.protect(&mut frame_allocator, &region, offset, len, flags) {
+        Ok(()) => 0,
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+/// Libera por completo a reserva cuja base é exatamente `addr` — cobre
+/// `SYSCALL_VM_RELEASE`. Ao contrário de `commit`/`decommit`/`protect`
+/// (que aceitam qualquer endereço dentro da reserva), `release` exige a
+/// base exata: um endereço que caia no meio de uma reserva viva, mas não
+/// seja sua base, é rejeitado (mesma convenção de `munmap`, que opera sobre
+/// o mapeamento inteiro identificado pelo seu endereço inicial) — ver
+/// design.md, tabela de numeração.
+fn sys_vm_release(addr: u64) -> u64 {
+    let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
+    let mut vmm = VMM.lock();
+    let Some(region) = vmm.region_containing(addr) else {
+        return SYSCALL_ERROR;
+    };
+    if region.base() != addr {
+        return SYSCALL_ERROR;
+    }
+    match vmm.release(&mut frame_allocator, region) {
+        Ok(()) => 0,
+        Err(_) => SYSCALL_ERROR,
+    }
+}
+
+/// Cria um novo mutex nomeado — cobre `SYSCALL_MUTEX_CREATE`. Nunca falha.
+fn sys_mutex_create() -> u64 {
+    crate::pthread_handles::create_mutex()
+}
+
+/// Adquire o mutex identificado por `handle`, bloqueando a thread chamadora
+/// (sem busy-wait) se já estiver tomado por outra thread — cobre
+/// `SYSCALL_MUTEX_LOCK`. `SYSCALL_ERROR` se `handle` não corresponder a
+/// nenhum mutex criado.
+fn sys_mutex_lock(handle: u64) -> u64 {
+    match crate::pthread_handles::mutex(handle) {
+        Some(mutex) => {
+            mutex.lock();
+            0
+        }
+        None => SYSCALL_ERROR,
+    }
+}
+
+/// Libera o mutex identificado por `handle`, acordando uma thread em espera
+/// para adquiri-lo, se houver — cobre `SYSCALL_MUTEX_UNLOCK`. `SYSCALL_ERROR`
+/// se `handle` não corresponder a nenhum mutex criado.
+fn sys_mutex_unlock(handle: u64) -> u64 {
+    match crate::pthread_handles::mutex(handle) {
+        Some(mutex) => {
+            mutex.unlock();
+            0
+        }
+        None => SYSCALL_ERROR,
+    }
+}
+
+/// Cria uma nova variável de condição nomeada — cobre `SYSCALL_COND_CREATE`.
+/// Nunca falha.
+fn sys_cond_create() -> u64 {
+    crate::pthread_handles::create_cond()
+}
+
+/// Libera `mutex_handle` e bloqueia a thread chamadora em `cond_handle`,
+/// reaquirindo o mesmo mutex antes de retornar quando notificada — cobre
+/// `SYSCALL_COND_WAIT`. `SYSCALL_ERROR` se `cond_handle` ou `mutex_handle`
+/// não corresponderem a objetos criados, sem bloquear a thread chamadora nem
+/// alterar o estado do mutex nesse caso.
+fn sys_cond_wait(cond_handle: u64, mutex_handle: u64) -> u64 {
+    let Some(cond) = crate::pthread_handles::cond(cond_handle) else {
+        return SYSCALL_ERROR;
+    };
+    let Some(mutex) = crate::pthread_handles::mutex(mutex_handle) else {
+        return SYSCALL_ERROR;
+    };
+    cond.wait(mutex);
+    0
+}
+
+/// Acorda a thread esperando há mais tempo na variável de condição
+/// identificada por `handle`, se houver — cobre `SYSCALL_COND_NOTIFY_ONE`.
+/// `SYSCALL_ERROR` se `handle` não corresponder a nenhuma variável de
+/// condição criada.
+fn sys_cond_notify_one(handle: u64) -> u64 {
+    match crate::pthread_handles::cond(handle) {
+        Some(cond) => {
+            cond.notify_one();
+            0
+        }
+        None => SYSCALL_ERROR,
+    }
+}
+
+/// Acorda todas as threads atualmente esperando na variável de condição
+/// identificada por `handle` — cobre `SYSCALL_COND_NOTIFY_ALL`.
+/// `SYSCALL_ERROR` se `handle` não corresponder a nenhuma variável de
+/// condição criada.
+fn sys_cond_notify_all(handle: u64) -> u64 {
+    match crate::pthread_handles::cond(handle) {
+        Some(cond) => {
+            cond.notify_all();
+            0
+        }
+        None => SYSCALL_ERROR,
+    }
+}
+
+/// Consulta o relógio de parede — cobre `SYSCALL_CLOCK_WALL`. Nunca falha.
+fn sys_clock_wall() -> u64 {
+    crate::clock::wall_clock_nanos()
+}
+
+/// Consulta o relógio monotônico — cobre `SYSCALL_CLOCK_MONOTONIC`. Nunca
+/// falha.
+fn sys_clock_monotonic() -> u64 {
+    crate::clock::monotonic_nanos()
+}
+
 /// Despacha uma chamada de sistema pelo número (`RAX` na entrada de
 /// `syscall`), com até quatro argumentos. Devolve o valor de retorno (`RAX`
 /// na saída) — `SYSCALL_ERROR` para um número não reconhecido. `extern "C"`
@@ -88,10 +297,24 @@ fn sys_get_ticks() -> u64 {
 /// Para `SYSCALL_WRITE`, `arg0`/`arg1` são repassados como `ptr`/`len` para
 /// [`sys_write`] sem validação — ver lá.
 #[unsafe(no_mangle)]
-unsafe extern "C" fn dispatch(number: u64, arg0: u64, arg1: u64, _arg2: u64, _arg3: u64) -> u64 {
+unsafe extern "C" fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg3: u64) -> u64 {
     match number {
         SYSCALL_WRITE => unsafe { sys_write(arg0, arg1) },
         SYSCALL_GET_TICKS => sys_get_ticks(),
+        SYSCALL_VM_RESERVE => sys_vm_reserve(arg0),
+        SYSCALL_VM_COMMIT => sys_vm_commit(arg0, arg1, arg2),
+        SYSCALL_VM_DECOMMIT => sys_vm_decommit(arg0, arg1),
+        SYSCALL_VM_PROTECT => sys_vm_protect(arg0, arg1, arg2),
+        SYSCALL_VM_RELEASE => sys_vm_release(arg0),
+        SYSCALL_MUTEX_CREATE => sys_mutex_create(),
+        SYSCALL_MUTEX_LOCK => sys_mutex_lock(arg0),
+        SYSCALL_MUTEX_UNLOCK => sys_mutex_unlock(arg0),
+        SYSCALL_COND_CREATE => sys_cond_create(),
+        SYSCALL_COND_WAIT => sys_cond_wait(arg0, arg1),
+        SYSCALL_COND_NOTIFY_ONE => sys_cond_notify_one(arg0),
+        SYSCALL_COND_NOTIFY_ALL => sys_cond_notify_all(arg0),
+        SYSCALL_CLOCK_WALL => sys_clock_wall(),
+        SYSCALL_CLOCK_MONOTONIC => sys_clock_monotonic(),
         _ => SYSCALL_ERROR,
     }
 }
@@ -204,4 +427,169 @@ mod tests {
     // causaria um crash do próprio processo de teste, mesma limitação já
     // documentada para `Mapper::map`/`AddressSpace::new` (que tocam
     // `CR3`/HHDM reais). Verificado em boot real na tarefa 6.1.
+
+    #[test]
+    fn prot_to_page_flags_always_forces_user_accessible() {
+        // Nenhuma combinação de bits de entrada consegue produzir
+        // `user_accessible: false` — ver design.md, "Permissões de página".
+        for prot in 0..=0b11u64 {
+            assert!(prot_to_page_flags(prot).user_accessible);
+        }
+        assert_eq!(prot_to_page_flags(0), PageFlags { writable: false, user_accessible: true, executable: false });
+        assert_eq!(prot_to_page_flags(0b01), PageFlags { writable: true, user_accessible: true, executable: false });
+        assert_eq!(prot_to_page_flags(0b10), PageFlags { writable: false, user_accessible: true, executable: true });
+        assert_eq!(prot_to_page_flags(0b11), PageFlags { writable: true, user_accessible: true, executable: true });
+    }
+
+    /// Serializa os testes que tocam `kernel::vmm::VMM` (um único `Spinlock`
+    /// global compartilhado por todo o processo de teste) — mesmo motivo e
+    /// mesmo padrão de `kernel::wait_queue::tests::BLOCK_INTENT_TEST_LOCK`:
+    /// sem isso, dois destes testes rodando em paralelo (padrão do executor
+    /// de testes do Rust) poderiam reservar/liberar faixas uns por cima dos
+    /// outros.
+    static VM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Registra a janela gerenciada (`Vmm::init`) no `VMM` global exatamente
+    /// uma vez por processo de teste — em boot real isso é feito por
+    /// `continue_boot`, que nenhum teste de host executa. Chamar `init()`
+    /// mais de uma vez duplicaria a janela livre (`RangeAllocator::add_window`
+    /// não é idempotente), por isso o `std::sync::Once`.
+    fn ensure_vmm_initialized() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| VMM.lock().init());
+    }
+
+    #[test]
+    fn vm_reserve_returns_an_address_inside_the_managed_window() {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ensure_vmm_initialized();
+        let addr = unsafe { dispatch(SYSCALL_VM_RESERVE, crate::paging::PAGE_SIZE, 0, 0, 0) };
+        assert_ne!(addr, SYSCALL_ERROR);
+        assert!(addr >= crate::vmm::VMM_WINDOW_START);
+        assert!(addr < crate::vmm::VMM_WINDOW_START + crate::vmm::VMM_WINDOW_SIZE);
+    }
+
+    #[test]
+    fn vm_reserve_with_zero_size_returns_error_sentinel() {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(unsafe { dispatch(SYSCALL_VM_RESERVE, 0, 0, 0, 0) }, SYSCALL_ERROR);
+    }
+
+    #[test]
+    fn vm_commit_outside_any_reservation_returns_error_sentinel_without_touching_the_mapper() {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Endereço bem fora da janela gerenciada: nunca corresponde a nenhuma
+        // reserva viva, então `region_containing` rejeita antes de chegar a
+        // `Vmm::commit`/`Mapper` (que não seriam seguros de tocar em host).
+        let result = unsafe { dispatch(SYSCALL_VM_COMMIT, 0, crate::paging::PAGE_SIZE, 0b01, 0) };
+        assert_eq!(result, SYSCALL_ERROR);
+    }
+
+    #[test]
+    fn vm_decommit_outside_any_reservation_returns_error_sentinel_without_touching_the_mapper() {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let result = unsafe { dispatch(SYSCALL_VM_DECOMMIT, 0, crate::paging::PAGE_SIZE, 0, 0) };
+        assert_eq!(result, SYSCALL_ERROR);
+    }
+
+    #[test]
+    fn vm_protect_outside_any_reservation_returns_error_sentinel_without_touching_the_mapper() {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let result = unsafe { dispatch(SYSCALL_VM_PROTECT, 0, crate::paging::PAGE_SIZE, 0b01, 0) };
+        assert_eq!(result, SYSCALL_ERROR);
+    }
+
+    #[test]
+    fn vm_release_outside_any_reservation_returns_error_sentinel() {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let result = unsafe { dispatch(SYSCALL_VM_RELEASE, 0, 0, 0, 0) };
+        assert_eq!(result, SYSCALL_ERROR);
+    }
+
+    #[test]
+    fn vm_release_right_after_reserve_succeeds_and_frees_the_address_for_reuse() {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ensure_vmm_initialized();
+        let size = crate::paging::PAGE_SIZE;
+        let addr = unsafe { dispatch(SYSCALL_VM_RESERVE, size, 0, 0, 0) };
+        assert_ne!(addr, SYSCALL_ERROR);
+
+        // Nada foi comprometido ainda: `Vmm::release` nunca chega a chamar
+        // `Mapper::unmap` (laço sobre offsets comprometidos fica vazio),
+        // então este caminho de sucesso é seguro em host — ver design.md,
+        // "Escopo de testes em host".
+        let release_result = unsafe { dispatch(SYSCALL_VM_RELEASE, addr, 0, 0, 0) };
+        assert_eq!(release_result, 0);
+
+        let reused = unsafe { dispatch(SYSCALL_VM_RESERVE, size, 0, 0, 0) };
+        assert_eq!(reused, addr, "reserva do mesmo tamanho logo apos liberar deveria reaproveitar o endereco liberado");
+    }
+
+    #[test]
+    fn mutex_create_then_lock_on_a_free_mutex_succeeds_without_touching_the_scheduler() {
+        // `try_acquire` é uma CAS atômica pura, nunca chega a `WaitQueue` —
+        // seguro em host mesmo sem o guard de `VM_TEST_LOCK` (não toca
+        // `VMM`/`FRAME_ALLOCATOR`).
+        let handle = unsafe { dispatch(SYSCALL_MUTEX_CREATE, 0, 0, 0, 0) };
+        assert_ne!(handle, SYSCALL_ERROR);
+        assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_LOCK, handle, 0, 0, 0) }, 0);
+    }
+
+    #[test]
+    fn mutex_lock_with_an_unknown_handle_returns_error_sentinel() {
+        assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_LOCK, u64::MAX / 2, 0, 0, 0) }, SYSCALL_ERROR);
+    }
+
+    #[test]
+    fn mutex_unlock_with_an_unknown_handle_returns_error_sentinel() {
+        // Só o caminho de rejeição é testável em host: o de sucesso sempre
+        // chama `scheduler::with_interrupts_disabled` — ver design.md,
+        // "Escopo de testes em host".
+        assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_UNLOCK, u64::MAX / 2, 0, 0, 0) }, SYSCALL_ERROR);
+    }
+
+    #[test]
+    fn cond_create_returns_a_usable_handle() {
+        let handle = unsafe { dispatch(SYSCALL_COND_CREATE, 0, 0, 0, 0) };
+        assert_ne!(handle, SYSCALL_ERROR);
+    }
+
+    #[test]
+    fn cond_wait_with_an_unknown_cond_handle_returns_error_sentinel_without_touching_the_mutex() {
+        let mutex_handle = unsafe { dispatch(SYSCALL_MUTEX_CREATE, 0, 0, 0, 0) };
+        let result = unsafe { dispatch(SYSCALL_COND_WAIT, u64::MAX / 2, mutex_handle, 0, 0) };
+        assert_eq!(result, SYSCALL_ERROR);
+    }
+
+    #[test]
+    fn cond_wait_with_an_unknown_mutex_handle_returns_error_sentinel() {
+        let cond_handle = unsafe { dispatch(SYSCALL_COND_CREATE, 0, 0, 0, 0) };
+        let result = unsafe { dispatch(SYSCALL_COND_WAIT, cond_handle, u64::MAX / 2, 0, 0) };
+        assert_eq!(result, SYSCALL_ERROR);
+    }
+
+    #[test]
+    fn cond_notify_one_and_all_with_an_unknown_handle_return_error_sentinel() {
+        // Mesma limitação do caminho de sucesso de `SYSCALL_MUTEX_UNLOCK`:
+        // `notify_one`/`notify_all` sempre chamam
+        // `scheduler::with_interrupts_disabled`, mesmo sem ninguém esperando.
+        assert_eq!(unsafe { dispatch(SYSCALL_COND_NOTIFY_ONE, u64::MAX / 2, 0, 0, 0) }, SYSCALL_ERROR);
+        assert_eq!(unsafe { dispatch(SYSCALL_COND_NOTIFY_ALL, u64::MAX / 2, 0, 0, 0) }, SYSCALL_ERROR);
+    }
+
+    #[test]
+    fn vm_release_at_a_non_base_address_is_rejected() {
+        let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ensure_vmm_initialized();
+        let size = 2 * crate::paging::PAGE_SIZE;
+        let addr = unsafe { dispatch(SYSCALL_VM_RESERVE, size, 0, 0, 0) };
+        assert_ne!(addr, SYSCALL_ERROR);
+
+        let result = unsafe { dispatch(SYSCALL_VM_RELEASE, addr + crate::paging::PAGE_SIZE, 0, 0, 0) };
+        assert_eq!(result, SYSCALL_ERROR);
+
+        // A reserva original continua viva: liberar pelo endereço base certo
+        // ainda funciona depois da tentativa rejeitada.
+        assert_eq!(unsafe { dispatch(SYSCALL_VM_RELEASE, addr, 0, 0, 0) }, 0);
+    }
 }
