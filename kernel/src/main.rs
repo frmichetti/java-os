@@ -52,6 +52,11 @@ pub extern "C" fn kernel_main() -> ! {
     unsafe { core::arch::asm!("cli") };
 
     unsafe { kernel::gdt::init() };
+    // CR0/CR4 explicitos (FXSAVE/FXRSTOR/SSE) e template de FPU — ver
+    // design.md da change `kernel-fpu-context-switch`. Antes de qualquer
+    // thread poder ser registrada (kernel::scheduler::register_boot_thread,
+    // mais abaixo), que é o primeiro ponto em que uma área de FPU é alocada.
+    unsafe { kernel::fpu::init() };
     kernel::idt::install_default_handlers();
     kernel::idt::install_exception_handlers();
     unsafe { kernel::idt::load() };
@@ -331,6 +336,10 @@ extern "C" fn continue_boot() -> ! {
         // — ver design.md, tarefa 1.6.
         kernel::scheduler::spawn_exit_demo(&mut frame_allocator)
             .expect("spawn do processo de demonstracao de SYSCALL_EXIT falhou");
+        // Verificação de FXSAVE/FXRSTOR por thread (change
+        // `kernel-fpu-context-switch`) — ver design.md, tarefas 4.1-4.3.
+        kernel::scheduler::spawn_fpu_demo(&mut frame_allocator)
+            .expect("spawn dos processos de demonstracao de FPU/SSE falhou");
         // Executavel de teste do carregador de executaveis ELF64 estaticos
         // (`kernel::elf`/`spawn_from_elf`) — ver spec `kernel-elf-loader` e
         // design.md da change `kernel-elf-loader`, "Verificacao em boot

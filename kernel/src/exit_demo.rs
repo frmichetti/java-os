@@ -11,8 +11,8 @@ core::arch::global_asm!(
     ".global exit_demo_start",
     ".global exit_demo_end",
     "exit_demo_start:",
-    "lea rdi, [rip + msg1]",
-    "mov esi, [rip + msg1len]",
+    "lea rdi, [rip + .Led_msg1]",
+    "mov esi, [rip + .Led_msg1len]",
     "xor eax, eax", // SYSCALL_WRITE
     "syscall",
     "mov eax, 21", // SYSCALL_EXIT
@@ -21,19 +21,19 @@ core::arch::global_asm!(
     // escalonador tiver um bug e retomar esta thread mesmo assim, isto
     // imprime repetidamente em vez de falhar silenciosamente.
     "9:",
-    "lea rdi, [rip + msg_err]",
-    "mov esi, [rip + msg_err_len]",
+    "lea rdi, [rip + .Led_msg_err]",
+    "mov esi, [rip + .Led_msg_err_len]",
     "xor eax, eax",
     "syscall",
     "jmp 9b",
-    "msg1len: .long msg1_end - msg1",
-    "msg1:",
+    ".Led_msg1len: .long .Led_msg1_end - .Led_msg1",
+    ".Led_msg1:",
     ".ascii \"exit_demo: mensagem antes de SYSCALL_EXIT\\n\"",
-    "msg1_end:",
-    "msg_err_len: .long msg_err_end - msg_err",
-    "msg_err:",
+    ".Led_msg1_end:",
+    ".Led_msg_err_len: .long .Led_msg_err_end - .Led_msg_err",
+    ".Led_msg_err:",
     ".ascii \"exit_demo: ERRO - thread retomada apos SYSCALL_EXIT\\n\"",
-    "msg_err_end:",
+    ".Led_msg_err_end:",
     "exit_demo_end:",
 );
 

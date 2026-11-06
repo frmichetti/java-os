@@ -60,6 +60,14 @@ static READY_QUEUE: Spinlock<ReadyQueue> = Spinlock::new(ReadyQueue::new());
 #[unsafe(no_mangle)]
 static mut CURRENT_KERNEL_STACK_TOP: u64 = 0;
 
+/// Endereço da área de `FXSAVE` (`kernel::fpu::FxSaveArea`) da thread
+/// corrente — consultada diretamente por nome pelas rotinas assembly
+/// `timer_entry`/`block_entry` (`FXSAVE`/`FXRSTOR [CURRENT_FPU_AREA]`),
+/// atualizada por `schedule_next` no mesmo trecho que já atualiza
+/// `TSS.rsp0`/`CR3`. Ver design.md da change `kernel-fpu-context-switch`.
+#[unsafe(no_mangle)]
+static mut CURRENT_FPU_AREA: u64 = 0;
+
 /// Contextos de todas as threads registradas, indexados por `ThreadId`. Sem
 /// remoção — esta change não implementa encerramento de thread (ver
 /// design.md — Non-Goals).
@@ -142,9 +150,14 @@ fn register_thread(thread: Thread) -> ThreadId {
             let mut contexts = CONTEXTS.lock();
             let index = id.0 as usize;
             if contexts.len() <= index {
-                contexts.resize_with(index + 1, || Context { rsp: 0, kernel_stack_top: 0, address_space_root: 0 });
+                contexts.resize_with(index + 1, || Context { rsp: 0, kernel_stack_top: 0, address_space_root: 0, fpu_state: 0 });
             }
             contexts[index] = thread.context;
+            // Área de FXSAVE própria desta thread, alocada aqui (único ponto
+            // de registro de todas as threads) em vez de em cada local que
+            // constrói um `Context` — ver design.md da change
+            // `kernel-fpu-context-switch`, "Área de FXSAVE por thread".
+            contexts[index].fpu_state = crate::fpu::new_area();
         }
         {
             let mut terminated = TERMINATED.lock();
@@ -196,13 +209,22 @@ pub fn register_boot_thread() -> ThreadId {
     let boot_process = process::next_process_id_for_scheduler();
     let kernel_stack_top = crate::stack::KERNEL_STACK_BASE + crate::stack::KERNEL_STACK_SIZE;
     let address_space_root = crate::paging::current_root();
-    let thread = Thread { id, process: boot_process, context: Context { rsp: 0, kernel_stack_top, address_space_root } };
+    let thread = Thread { id, process: boot_process, context: Context { rsp: 0, kernel_stack_top, address_space_root, fpu_state: 0 } };
     // A stack de kernel confiável precisa estar correta desde já — não dá
     // para esperar o primeiro tick do timer, já que uma troca de privilégio
     // pode, em tese, acontecer antes dele (ver design.md da change
     // `kernel-syscalls`).
     set_current_kernel_stack(kernel_stack_top);
-    register_thread(thread)
+    let thread_id = register_thread(thread);
+    // Mesmo racional de `set_current_kernel_stack` acima, para
+    // `CURRENT_FPU_AREA` (ver design.md da change `kernel-fpu-context-switch`):
+    // `timer_entry`/`block_entry` fazem `FXSAVE [CURRENT_FPU_AREA]` *antes*
+    // de `schedule_next` rodar pela primeira vez — sem isto, o primeiro tick
+    // do timer executaria `FXSAVE [0]` (valor inicial da global) e geraria
+    // um page fault. Achado real em boot: confirmado via
+    // `EXCECAO #PF (page fault): endereco=0x0` antes desta correção.
+    unsafe { CURRENT_FPU_AREA = CONTEXTS.lock()[thread_id.0 as usize].fpu_state };
+    thread_id
 }
 
 /// Cria um novo processo com uma thread executando `entry` e a adiciona à
@@ -436,6 +458,49 @@ pub const ELF_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
 pub const LIBC_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_0300_0000_0000;
 pub const LIBC_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
 
+/// Endereços virtuais das duas variantes de `kernel::fpu_demo` (change
+/// `kernel-fpu-context-switch`) — mesma faixa baixa e mesmo racional de
+/// `EXIT_DEMO_CODE_VIRT`/`LIBC_TEST_PROGRAM_STACK_VIRT` (bem abaixo do
+/// início da HHDM compartilhada).
+const FPU_DEMO_A_CODE_VIRT: u64 = 0x0000_0400_0000_0000;
+const FPU_DEMO_A_STACK_VIRT: u64 = 0x0000_0500_0000_0000;
+const FPU_DEMO_B_CODE_VIRT: u64 = 0x0000_0600_0000_0000;
+const FPU_DEMO_B_STACK_VIRT: u64 = 0x0000_0700_0000_0000;
+const FPU_DEMO_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
+
+/// Cria os processos de demonstração/verificação de
+/// `kernel::fpu_demo` (duas variantes, A e B, cada uma num `AddressSpace`
+/// próprio) — mesma estrutura de [`spawn_exit_demo`]. Ver design.md da
+/// change `kernel-fpu-context-switch`, tarefas 4.1-4.3: prova que o estado
+/// de FPU/SSE de cada thread sobrevive à preempção sem se misturar com o de
+/// outra.
+pub fn spawn_fpu_demo<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>) -> Result<(ThreadId, ThreadId), ProcessError> {
+    let spawn_variant = |frame_allocator: &mut FrameAllocator<S>,
+                          code_virt: u64,
+                          stack_virt: u64,
+                          copy_fn: unsafe fn(u64)|
+     -> Result<ThreadId, ProcessError> {
+        let address_space = Process::begin_new_user(frame_allocator)?;
+        let root = address_space.root();
+
+        let code_frame = crate::paging::Mapper::for_root(frame_allocator, root)
+            .map_new(code_virt, crate::paging::PageFlags { writable: true, user_accessible: true, executable: true }, false)
+            .map_err(ProcessError::AddressSpace)?;
+        let code_hhdm_addr = crate::hhdm::phys_to_virt(crate::hhdm::offset(), code_frame);
+        unsafe { copy_fn(code_hhdm_addr) };
+
+        let (process, thread) =
+            Process::finish_new_user(frame_allocator, address_space, code_virt, stack_virt, FPU_DEMO_STACK_SIZE)?;
+        let thread_id = register_thread(thread);
+        with_interrupts_disabled(|| PROCESSES.lock().push(process));
+        Ok(thread_id)
+    };
+
+    let a = spawn_variant(frame_allocator, FPU_DEMO_A_CODE_VIRT, FPU_DEMO_A_STACK_VIRT, crate::fpu_demo::copy_into_a)?;
+    let b = spawn_variant(frame_allocator, FPU_DEMO_B_CODE_VIRT, FPU_DEMO_B_STACK_VIRT, crate::fpu_demo::copy_into_b)?;
+    Ok((a, b))
+}
+
 /// Carrega um executável ELF64 estático do sistema de arquivos `fs` em
 /// `path` e o coloca para rodar em um novo processo de modo usuário — ver
 /// spec `kernel-elf-loader` e `design.md` da change `kernel-elf-loader`,
@@ -533,6 +598,12 @@ fn schedule_next(current_rsp: u64) -> u64 {
         // inferior (ex.: código/stack de uma thread de usuário) — sem isso,
         // a CPU continuaria com a PML4 de outro processo ativa.
         unsafe { crate::paging::switch_address_space(contexts[next.0 as usize].address_space_root) };
+        // Mesmo trecho que já atualiza TSS.rsp0/CR3 acima — ver design.md da
+        // change `kernel-fpu-context-switch`: `timer_entry`/`block_entry`
+        // fazem `FXRSTOR [CURRENT_FPU_AREA]` logo depois de trocar `RSP`,
+        // então esta global precisa já estar correta antes de `schedule_next`
+        // retornar.
+        unsafe { CURRENT_FPU_AREA = contexts[next.0 as usize].fpu_state };
         contexts[next.0 as usize].rsp
     })
 }
@@ -584,6 +655,12 @@ core::arch::global_asm!(
     "push r13",
     "push r14",
     "push r15",
+    // FXSAVE do estado de FPU/SSE da thread que está saindo, na área
+    // apontada por CURRENT_FPU_AREA (ainda a da thread corrente neste
+    // ponto) — ver design.md da change `kernel-fpu-context-switch`. `rax`
+    // já foi salvo pelo `push rax` acima, livre como escrátio de endereço.
+    "mov rax, [CURRENT_FPU_AREA]",
+    "fxsave [rax]",
     // `current_rsp` (1o argumento, SysV) antes de qualquer outra coisa
     // tocar RSP.
     "mov rdi, rsp",
@@ -596,6 +673,12 @@ core::arch::global_asm!(
     // `on_timer_tick` devolve, em RAX (SysV), o `rsp` salvo da próxima
     // thread.
     "mov rsp, rax",
+    // FXRSTOR do estado de FPU/SSE da nova thread corrente — `schedule_next`
+    // já atualizou CURRENT_FPU_AREA antes de retornar. `rax` já foi
+    // consumido pelo `mov rsp, rax` acima; o `pop rax` mais abaixo restaura
+    // o valor correto a partir da stack da nova thread, não deste `mov`.
+    "mov rax, [CURRENT_FPU_AREA]",
+    "fxrstor [rax]",
     "pop r15",
     "pop r14",
     "pop r13",
@@ -637,10 +720,16 @@ core::arch::global_asm!(
     "push r13",
     "push r14",
     "push r15",
+    // Mesma disciplina de FXSAVE/FXRSTOR de `timer_entry` acima — ver
+    // design.md da change `kernel-fpu-context-switch`.
+    "mov rax, [CURRENT_FPU_AREA]",
+    "fxsave [rax]",
     "mov rdi, rsp",
     "and rsp, -16",
     "call on_block_request",
     "mov rsp, rax",
+    "mov rax, [CURRENT_FPU_AREA]",
+    "fxrstor [rax]",
     "pop r15",
     "pop r14",
     "pop r13",

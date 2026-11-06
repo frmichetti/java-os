@@ -12,6 +12,8 @@ pub mod fat32_demo;
 pub mod file_handles;
 pub mod file_syscalls_demo;
 pub mod fmtbuf;
+pub mod fpu;
+pub mod fpu_demo;
 pub mod framebuffer;
 pub mod gdt;
 pub mod gpt;

@@ -12,8 +12,9 @@
 > `kernel-interrupts-timer`, `kernel-stack-guard-page`, `kernel-process-scheduler`,
 > `kernel-syscalls`, `kernel-posix-virtual-memory`, `kernel-wait-queue`,
 > `kernel-pthread-sync`, `kernel-wall-clock`, `kernel-elf-loader`,
-> `kernel-dynamic-linker`, `kernel-fat32-filesystem`, `kernel-file-syscalls` e
-> `libc-minimal-port`); as demais ficam registradas aqui para orientar changes futuras.
+> `kernel-dynamic-linker`, `kernel-fat32-filesystem`, `kernel-file-syscalls`,
+> `libc-minimal-port` e `kernel-fpu-context-switch`); as demais ficam registradas aqui
+> para orientar changes futuras.
 
 ## 1. Arquitetura do Kernel
 
@@ -135,14 +136,16 @@
 - **Threads** (`kernel::process::Thread`): a unidade de escalonamento dentro de um
   processo. Cada thread tem sua própria stack de kernel (64 KiB, protegida por guard
   page — generalização de `kernel-stack-guard-page` para um pool de stacks, uma por
-  thread) e seu próprio contexto de registradores da CPU. **Limitação conhecida**
-  (achado da change `libc-minimal-port`): `kernel::process::Context` só cobre
-  registradores de uso geral — FPU/SSE/XMM **não são salvos nem restaurados** na troca
-  de contexto. Por isso o target de modo usuário (`x86_64-java_os_user.json`) desabilita
-  SSE/AVX inteiramente (`soft-float`): usar ponto flutuante hoje corromperia
-  silenciosamente o estado na primeira preempção. Bloqueador para `double`/`float` em
-  qualquer programa de usuário (inclusive o próprio HotSpot, que usa esses tipos como
-  primitivos Java) até uma change futura implementar `FXSAVE`/`FXRSTOR` por thread.
+  thread) e seu próprio contexto de registradores da CPU — incluindo, desde a change
+  `kernel-fpu-context-switch`, estado de FPU/SSE/XMM (`kernel::fpu::FxSaveArea`, 512
+  bytes alinhados a 16, uma por thread, salva/restaurada via `FXSAVE`/`FXRSTOR` nas
+  rotinas `timer_entry`/`block_entry`). `CR0`/`CR4` são configurados explicitamente no
+  boot (`kernel::fpu::init`) para habilitar isso — antes disso, dependia implicitamente
+  do firmware. O target de modo usuário (`x86_64-java_os_user.json`) tem SSE/SSE2/SSE3/
+  SSSE3/SSE4.x habilitados desde essa change — programas de usuário podem usar
+  `double`/`float` de verdade. `AVX`/`AVX2` permanecem desabilitados (exigiriam `XSAVE`,
+  mais largo que a área legada de `FXSAVE`); o target do próprio kernel
+  (`x86_64-java_os.json`) permanece soft-float — o kernel nunca usa ponto flutuante.
 - **Escalonador** (`kernel::scheduler`): preemptivo, round-robin, disparado pelo timer
   periódico do Local APIC já existente (`kernel-timer`) — a cada tick, o contexto da
   thread corrente é salvo e a próxima thread pronta é retomada, sem exigir cooperação.
@@ -507,6 +510,15 @@ armazenamento e rede — todos implementados.
   nenhuma forma de terminar um processo existia. Verificado em boot real: um programa C
   real (`userland_c/libc_test_program.c`, carregado via `kernel::elf`/`spawn_from_elf`)
   aloca memória, escreve no console, lê um arquivo e termina — tudo com sucesso.
+- **Suporte a ponto flutuante — entregue pela change `kernel-fpu-context-switch`**: a
+  limitação identificada acima (sem save/restore de FPU/XMM) resolvida — `kernel::fpu`
+  configura `CR0`/`CR4` explicitamente e cada thread ganha sua própria área de `FXSAVE`
+  (ver seção 1/3), e `x86_64-java_os_user.json` reabilita SSE/SSE2/SSE3/SSSE3/SSE4.x.
+  `libm`/conversão float do newlib continuam fora da build (`libc-minimal-port` as
+  excluiu explicitamente) — reconstruí-las, agora que SSE está disponível, fica para
+  quando/se necessário. Verificado em boot real: duas threads concorrentes somando
+  `double` via SSE (sementes/resultados distintos), preemptadas repetidamente pelo
+  timer, cada uma termina com o resultado correto, sem mistura de estado entre elas.
 - Esta change não implementa nenhuma primitiva nova — isso fica inteiramente para a
   change do item 8 do roadmap ("Porte inicial da JVM"), que decide a forma concreta de
   cada primitiva do inventário acima (ex.: syscalls novas vs. extensão das existentes)
@@ -690,11 +702,18 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    descoberto ao tentar escopar o passo seguinte do item 8 (um esqueleto
    `os_javaos` do HotSpot, que assumia incorretamente que uma libc já
    existia) — ver seção 6. Verificado em boot real com um programa C real
-   fazendo malloc, E/S de arquivo e término. Próximo passo do item 8: o
-   esqueleto `os_javaos` do HotSpot propriamente dito, agora com libc
-   disponível — e, antes dele ou em paralelo, o kernel passar a
-   salvar/restaurar estado de FPU/XMM na troca de contexto (sem isso, nem a
-   libc nem o HotSpot podem usar `double`/`float` — ver seção 6).
+   fazendo malloc, E/S de arquivo e término. `kernel-fpu-context-switch`
+   (concluída) entregou mais uma sub-change, a mais recente até o momento:
+   o kernel passou a salvar/restaurar estado de FPU/SSE/XMM na troca de
+   contexto (`kernel::fpu`, uma área de `FXSAVE` por thread) e reabilitou
+   SSE no target de modo usuário — gap identificado pela própria
+   `libc-minimal-port` como bloqueador para `double`/`float`. Verificado em
+   boot real: duas threads concorrentes somando `double` via SSE,
+   preemptadas repetidamente, cada uma com resultado correto e isolado —
+   ver seção 1/3/6. Próximo passo do item 8: o esqueleto `os_javaos` do
+   HotSpot propriamente dito, agora com libc e ponto flutuante disponíveis
+   (ainda sem `libm`/conversão float na libc — reconstruir essas partes
+   fica para quando/se necessário).
 9. **Modelo híbrido de execução de JVM**: runtime compartilhado vs. JVM isolada por
    aplicação.
 10. **Java OS Platform (Java)**: gerenciamento de arquivos, serviços de sistema, rede,

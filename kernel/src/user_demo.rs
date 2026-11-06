@@ -16,14 +16,18 @@ core::arch::global_asm!(
     ".global user_demo_end",
     "user_demo_start:",
     "2:",
-    "lea rdi, [rip + 3f]",     // ptr da mensagem (arg0 da syscall de escrita)
-    "mov esi, [rip + msglen]", // tamanho da mensagem (arg1)
-    "xor eax, eax",            // SYSCALL_WRITE = 0
+    "lea rdi, [rip + 3f]",       // ptr da mensagem (arg0 da syscall de escrita)
+    "mov esi, [rip + .Lud_msglen]", // tamanho da mensagem (arg1)
+    "xor eax, eax",              // SYSCALL_WRITE = 0
     "syscall",
     "mov eax, 1", // SYSCALL_GET_TICKS = 1
     "syscall",
     "jmp 2b",
-    "msglen: .long 4f - 3f", // tamanho da mensagem, como dado (não cabe como imediato direto)
+    // `.Lud_msglen` (rótulo local real, não símbolo global) — achado real: sem
+    // o prefixo `.L`, "msglen" colidia com o mesmo nome em
+    // `kernel::file_syscalls_demo`/`kernel::user_posix_demo` assim que os
+    // três `global_asm!` eram relinkados juntos — ver KNOW_ISSUES.md.
+    ".Lud_msglen: .long 4f - 3f", // tamanho da mensagem, como dado (não cabe como imediato direto)
     "3:",
     ".ascii \"ola do modo usuario, via syscall!\\n\"",
     "4:",

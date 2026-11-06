@@ -83,6 +83,12 @@ pub struct Context {
     /// na *sua* PML4. O escalonador agora troca `CR3` para este valor a
     /// cada troca de contexto — ver design.md.
     pub address_space_root: u64,
+    /// Endereço da área de `FXSAVE` desta thread (`kernel::fpu::FxSaveArea`,
+    /// 512 bytes alinhados a 16) — alocada por `kernel::fpu::new_area()`,
+    /// nunca liberada (mesma disciplina de "leak aceitável por enquanto" de
+    /// `address_space_root`/`kernel_stack_top`). Ver design.md da change
+    /// `kernel-fpu-context-switch`.
+    pub fpu_state: u64,
 }
 
 /// Uma thread: unidade de escalonamento dentro de um `Process`, com seu
@@ -211,7 +217,7 @@ pub(crate) fn create_kernel_thread<S: FrameStore>(
     let stack_top = stack::alloc_thread_stack(frame_allocator)?;
     let rsp = unsafe { init_kernel_stack(stack_top, entry) };
     let id = next_thread_id();
-    Ok(Thread { id, process, context: Context { rsp, kernel_stack_top: stack_top, address_space_root: root } })
+    Ok(Thread { id, process, context: Context { rsp, kernel_stack_top: stack_top, address_space_root: root, fpu_state: 0 } })
 }
 
 /// Aloca a stack de kernel (para troca de contexto/`syscall`) e a stack de
@@ -248,7 +254,7 @@ fn create_user_thread<S: FrameStore>(
         init_stack(kernel_stack_top, entry, USER_CODE_SELECTOR, USER_DATA_SELECTOR, user_stack_top - ABI_ALIGNMENT_PAD)
     };
     let id = next_thread_id();
-    Ok(Thread { id, process, context: Context { rsp, kernel_stack_top, address_space_root: root } })
+    Ok(Thread { id, process, context: Context { rsp, kernel_stack_top, address_space_root: root, fpu_state: 0 } })
 }
 
 impl Process {

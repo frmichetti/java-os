@@ -24,14 +24,14 @@ core::arch::global_asm!(
     "mov eax, 2", // SYSCALL_VM_RESERVE
     "syscall",
     "mov r12, rax", // r12 = endereco reservado, preservado entre syscalls (callee-saved)
-    "mov byte ptr [rip + st0], 'F'",
+    "mov byte ptr [rip + .Lupd_st0], 'F'",
     "movabs r11, 0xffffc00000000000", // VMM_WINDOW_START
     "cmp r12, r11",
     "jb 1f",
     "movabs r11, 0xffffc01000000000", // VMM_WINDOW_START + VMM_WINDOW_SIZE
     "cmp r12, r11",
     "jae 1f",
-    "mov byte ptr [rip + st0], 'P'",
+    "mov byte ptr [rip + .Lupd_st0], 'P'",
     "1:",
     // ---------- 2) SYSCALL_VM_COMMIT(addr, PAGE_SIZE, RW) ----------
     "mov rdi, r12",
@@ -39,20 +39,20 @@ core::arch::global_asm!(
     "mov edx, 1", // prot: gravavel
     "mov eax, 3", // SYSCALL_VM_COMMIT
     "syscall",
-    "mov byte ptr [rip + st1], 'F'",
+    "mov byte ptr [rip + .Lupd_st1], 'F'",
     "test rax, rax",
     "jnz 1f",
-    "mov byte ptr [rip + st1], 'P'",
+    "mov byte ptr [rip + .Lupd_st1], 'P'",
     "1:",
     // ---------- 3) escreve um padrao conhecido e confirma a leitura ----------
     "movabs rax, 0xdeadbeefcafebabe",
     "mov [r12], rax",
     "mov rax, [r12]",
-    "mov byte ptr [rip + st2], 'F'",
+    "mov byte ptr [rip + .Lupd_st2], 'F'",
     "movabs r11, 0xdeadbeefcafebabe",
     "cmp rax, r11",
     "jne 1f",
-    "mov byte ptr [rip + st2], 'P'",
+    "mov byte ptr [rip + .Lupd_st2], 'P'",
     "1:",
     // ---------- 4) SYSCALL_VM_PROTECT(addr, PAGE_SIZE, somente leitura) ----------
     "mov rdi, r12",
@@ -60,35 +60,35 @@ core::arch::global_asm!(
     "xor edx, edx", // prot: somente leitura
     "mov eax, 5", // SYSCALL_VM_PROTECT
     "syscall",
-    "mov byte ptr [rip + st3], 'F'",
+    "mov byte ptr [rip + .Lupd_st3], 'F'",
     "test rax, rax",
     "jnz 1f",
-    "mov byte ptr [rip + st3], 'P'",
+    "mov byte ptr [rip + .Lupd_st3], 'P'",
     "1:",
     // ---------- 5) SYSCALL_VM_DECOMMIT(addr, PAGE_SIZE) ----------
     "mov rdi, r12",
     "mov esi, 0x1000",
     "mov eax, 4", // SYSCALL_VM_DECOMMIT
     "syscall",
-    "mov byte ptr [rip + st4], 'F'",
+    "mov byte ptr [rip + .Lupd_st4], 'F'",
     "test rax, rax",
     "jnz 1f",
-    "mov byte ptr [rip + st4], 'P'",
+    "mov byte ptr [rip + .Lupd_st4], 'P'",
     "1:",
     // ---------- 6) SYSCALL_VM_RELEASE(addr) ----------
     "mov rdi, r12",
     "mov eax, 6", // SYSCALL_VM_RELEASE
     "syscall",
-    "mov byte ptr [rip + st5], 'F'",
+    "mov byte ptr [rip + .Lupd_st5], 'F'",
     "test rax, rax",
     "jnz 1f",
-    "mov byte ptr [rip + st5], 'P'",
+    "mov byte ptr [rip + .Lupd_st5], 'P'",
     "1:",
     // ---------- 7) mutex: criar, adquirir, liberar ----------
     "mov eax, 7", // SYSCALL_MUTEX_CREATE
     "syscall",
     "mov r13, rax", // r13 = handle do mutex
-    "mov byte ptr [rip + st6], 'F'",
+    "mov byte ptr [rip + .Lupd_st6], 'F'",
     "cmp r13, -1",
     "je 1f",
     "mov rdi, r13",
@@ -101,13 +101,13 @@ core::arch::global_asm!(
     "syscall",
     "test rax, rax",
     "jnz 1f",
-    "mov byte ptr [rip + st6], 'P'",
+    "mov byte ptr [rip + .Lupd_st6], 'P'",
     "1:",
     // ---------- 8) variavel de condicao: criar, notificar um, notificar todos ----------
     "mov eax, 10", // SYSCALL_COND_CREATE
     "syscall",
     "mov r14, rax", // r14 = handle da variavel de condicao
-    "mov byte ptr [rip + st7], 'F'",
+    "mov byte ptr [rip + .Lupd_st7], 'F'",
     "cmp r14, -1",
     "je 1f",
     "mov rdi, r14",
@@ -120,27 +120,27 @@ core::arch::global_asm!(
     "syscall",
     "test rax, rax",
     "jnz 1f",
-    "mov byte ptr [rip + st7], 'P'",
+    "mov byte ptr [rip + .Lupd_st7], 'P'",
     "1:",
     // ---------- 9) SYSCALL_CLOCK_MONOTONIC: deve ser nao-zero ----------
     "mov eax, 15", // SYSCALL_CLOCK_MONOTONIC
     "syscall",
-    "mov byte ptr [rip + st8], 'F'",
+    "mov byte ptr [rip + .Lupd_st8], 'F'",
     "test rax, rax",
     "jz 1f",
-    "mov byte ptr [rip + st8], 'P'",
+    "mov byte ptr [rip + .Lupd_st8], 'P'",
     "1:",
     // ---------- 10) SYSCALL_CLOCK_WALL: deve cair numa faixa plausivel (2024-2035) ----------
     "mov eax, 14", // SYSCALL_CLOCK_WALL
     "syscall",
-    "mov byte ptr [rip + st9], 'F'",
+    "mov byte ptr [rip + .Lupd_st9], 'F'",
     "movabs r11, 0x17a6101701650000", // 2024-01-01T00:00:00Z em nanossegundos desde a epoca
     "cmp rax, r11",
     "jb 1f",
     "movabs r11, 0x1c7767e7ab530000", // 2035-01-01T00:00:00Z em nanossegundos desde a epoca
     "cmp rax, r11",
     "ja 1f",
-    "mov byte ptr [rip + st9], 'P'",
+    "mov byte ptr [rip + .Lupd_st9], 'P'",
     "1:",
     // ---------- 11) SYSCALL_VM_COMMIT com endereco fora de qualquer reserva ----------
     "xor edi, edi", // addr = 0: nunca corresponde a nenhuma reserva viva
@@ -148,44 +148,44 @@ core::arch::global_asm!(
     "mov edx, 1",
     "mov eax, 3", // SYSCALL_VM_COMMIT
     "syscall",
-    "mov byte ptr [rip + st10], 'F'",
+    "mov byte ptr [rip + .Lupd_st10], 'F'",
     "cmp rax, -1",
     "jne 1f",
-    "mov byte ptr [rip + st10], 'P'",
+    "mov byte ptr [rip + .Lupd_st10], 'P'",
     "1:",
     // ---------- 12) SYSCALL_MUTEX_LOCK com handle inexistente ----------
     "movabs rdi, 0x7fffffffffffffff",
     "mov eax, 8", // SYSCALL_MUTEX_LOCK
     "syscall",
-    "mov byte ptr [rip + st11], 'F'",
+    "mov byte ptr [rip + .Lupd_st11], 'F'",
     "cmp rax, -1",
     "jne 1f",
-    "mov byte ptr [rip + st11], 'P'",
+    "mov byte ptr [rip + .Lupd_st11], 'P'",
     "1:",
     // ---------- reporta o resultado uma unica vez ----------
-    "lea rdi, [rip + msg]",
-    "mov esi, [rip + msglen]",
+    "lea rdi, [rip + .Lupd_msg]",
+    "mov esi, [rip + .Lupd_msglen]",
     "xor eax, eax", // SYSCALL_WRITE
     "syscall",
     "9:",
     "jmp 9b",
-    "msglen: .long msg_end - msg",
-    "msg:",
+    ".Lupd_msglen: .long .Lupd_msg_end - .Lupd_msg",
+    ".Lupd_msg:",
     ".ascii \"user_posix_demo: resultado \"",
-    "st0: .ascii \"?\"",
-    "st1: .ascii \"?\"",
-    "st2: .ascii \"?\"",
-    "st3: .ascii \"?\"",
-    "st4: .ascii \"?\"",
-    "st5: .ascii \"?\"",
-    "st6: .ascii \"?\"",
-    "st7: .ascii \"?\"",
-    "st8: .ascii \"?\"",
-    "st9: .ascii \"?\"",
-    "st10: .ascii \"?\"",
-    "st11: .ascii \"?\"",
+    ".Lupd_st0: .ascii \"?\"",
+    ".Lupd_st1: .ascii \"?\"",
+    ".Lupd_st2: .ascii \"?\"",
+    ".Lupd_st3: .ascii \"?\"",
+    ".Lupd_st4: .ascii \"?\"",
+    ".Lupd_st5: .ascii \"?\"",
+    ".Lupd_st6: .ascii \"?\"",
+    ".Lupd_st7: .ascii \"?\"",
+    ".Lupd_st8: .ascii \"?\"",
+    ".Lupd_st9: .ascii \"?\"",
+    ".Lupd_st10: .ascii \"?\"",
+    ".Lupd_st11: .ascii \"?\"",
     ".ascii \" (ordem: reserve,commit,pattern,protect,decommit,release,mutex,cond,mono,wall,commit_err,mutex_err)\\n\"",
-    "msg_end:",
+    ".Lupd_msg_end:",
     "user_posix_demo_end:",
 );
 
