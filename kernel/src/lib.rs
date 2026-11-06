@@ -8,6 +8,8 @@ pub mod dylib;
 pub mod elf;
 pub mod fat32;
 pub mod fat32_demo;
+pub mod file_handles;
+pub mod file_syscalls_demo;
 pub mod fmtbuf;
 pub mod framebuffer;
 pub mod gdt;

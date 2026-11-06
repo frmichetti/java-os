@@ -126,6 +126,15 @@ fn test_library_binary(root: &Path, name: &str) -> PathBuf {
     root.join(format!("target/x86_64-java_os_user_pic/release/lib{name}.so"))
 }
 
+/// Fixture de 16 bytes (`"ABCDEFGHIJKLMNOP"`, sem quebra de linha) usada por
+/// `kernel::file_syscalls_demo` para verificar `SYSCALL_OPEN`/`SYSCALL_READ`/
+/// `SYSCALL_CLOSE` em boot real — ver `design.md`/`tasks.md` da change
+/// `kernel-file-syscalls`, tarefa 3.1. Copiada para `::/TEST.TXT` na raiz da
+/// partição (nome curto 8.3, sem precisar de nenhum diretório novo).
+fn file_syscalls_fixture_path(root: &Path) -> PathBuf {
+    root.join("kernel/testdata/file_syscalls_fixture.txt")
+}
+
 fn find_ovmf() -> PathBuf {
     if let Ok(p) = env::var("OVMF_PATH") {
         return PathBuf::from(p);
@@ -179,6 +188,7 @@ fn build_image(root: &Path) -> PathBuf {
     let test_program_bin = test_program_binary(root);
     let test_lib_base = test_library_binary(root, "base");
     let test_lib_user = test_library_binary(root, "user");
+    let file_syscalls_fixture = file_syscalls_fixture_path(root);
 
     run(Command::new("mcopy").args([
         "-i",
@@ -215,6 +225,12 @@ fn build_image(root: &Path) -> PathBuf {
         &part,
         test_lib_user.to_str().unwrap(),
         "::/lib/libuser.so",
+    ]));
+    run(Command::new("mcopy").args([
+        "-i",
+        &part,
+        file_syscalls_fixture.to_str().unwrap(),
+        "::/TEST.TXT",
     ]));
 
     eprintln!("Imagem gerada em {}", image_path.display());

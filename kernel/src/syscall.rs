@@ -70,6 +70,19 @@ pub const SYSCALL_CLOCK_MONOTONIC: u64 = 15;
 pub const SYSCALL_DLOPEN: u64 = 16;
 pub const SYSCALL_DLSYM: u64 = 17;
 
+/// Ver design.md da change `kernel-file-syscalls`, "Numeração de syscalls".
+/// `SYSCALL_OPEN`: `arg0`/`arg1` = ponteiro/tamanho do caminho absoluto
+/// (convenção de `SYSCALL_WRITE`/`SYSCALL_DLOPEN`); retorno = `handle`
+/// opaco do arquivo aberto, ou `SYSCALL_ERROR`. `SYSCALL_READ`: `arg0` =
+/// `handle` devolvido por `SYSCALL_OPEN`; `arg1`/`arg2` = ponteiro/tamanho
+/// do buffer do chamador; retorno = quantidade de bytes efetivamente
+/// lidos (`0` no fim do arquivo, não um erro), ou `SYSCALL_ERROR` para
+/// `handle` desconhecido. `SYSCALL_CLOSE`: `arg0` = `handle`; retorno =
+/// `0`, ou `SYSCALL_ERROR` para `handle` desconhecido.
+pub const SYSCALL_OPEN: u64 = 18;
+pub const SYSCALL_READ: u64 = 19;
+pub const SYSCALL_CLOSE: u64 = 20;
+
 /// Valor devolvido em `RAX` para um número de chamada não reconhecido, em
 /// vez de executar qualquer serviço — ver spec `kernel-syscalls`, "Despacho
 /// por Número de Chamada".
@@ -354,6 +367,63 @@ unsafe fn sys_dlsym(handle: u64, name_ptr: u64, name_len: u64) -> u64 {
     crate::dylib::dlsym(root, handle, name).unwrap_or(SYSCALL_ERROR)
 }
 
+/// Abre, por caminho absoluto em `path_ptr`/`path_len`, um arquivo do
+/// sistema de arquivos montado — cobre `SYSCALL_OPEN`. Devolve o `handle`
+/// devolvido por `kernel::file_handles::register`, ou `SYSCALL_ERROR` para
+/// UTF-8 inválido, falha de montagem, ou caminho que não corresponde a um
+/// arquivo existente (inclui o caso de apontar para um diretório — mesmo
+/// sentinela de erro de `Fat32Error::NotAFile`/`NotFound`/`NotADirectory`,
+/// sem esquema granular de erro, mesma disciplina das demais *syscalls*).
+///
+/// # Safety
+/// `path_ptr`/`path_len` vêm diretamente do chamador em modo usuário, sem
+/// validação — mesmo precedente de `sys_write`/`sys_dlopen`.
+unsafe fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
+    let bytes = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
+    let Ok(path) = core::str::from_utf8(bytes) else {
+        return SYSCALL_ERROR;
+    };
+
+    let fs = match crate::fat32::mount_boot_partition() {
+        Ok(fs) => fs,
+        Err(_) => return SYSCALL_ERROR,
+    };
+
+    // Mesmo padrão de `kernel::scheduler::spawn_from_elf`/`kernel::dylib::load_library`:
+    // o arquivo inteiro é lido de uma vez para memória (ver design.md,
+    // Non-Goals: sem leitura incremental por cluster).
+    match crate::storage::with_disk(|disk| fs.read_file(disk, path)) {
+        Some(Ok(contents)) => crate::file_handles::register(contents),
+        _ => SYSCALL_ERROR,
+    }
+}
+
+/// Lê até `buf_len` bytes a partir do cursor atual do arquivo identificado
+/// por `handle`, copiando-os para `buf_ptr` (buffer do chamador, modo
+/// usuário) — cobre `SYSCALL_READ`. Devolve a quantidade de bytes
+/// efetivamente copiada (`0` ao alcançar o fim do arquivo, o que não é um
+/// erro), ou `SYSCALL_ERROR` se `handle` não corresponder a nenhum arquivo
+/// atualmente aberto.
+///
+/// # Safety
+/// `buf_ptr`/`buf_len` vêm diretamente do chamador em modo usuário, sem
+/// validação — mesmo precedente de `sys_write`.
+unsafe fn sys_read(handle: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    let Some(bytes) = crate::file_handles::read(handle, buf_len as usize) else {
+        return SYSCALL_ERROR;
+    };
+    let dest = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, bytes.len()) };
+    dest.copy_from_slice(&bytes);
+    bytes.len() as u64
+}
+
+/// Fecha o arquivo identificado por `handle`, liberando os recursos
+/// associados a ele — cobre `SYSCALL_CLOSE`. `SYSCALL_ERROR` se `handle`
+/// não corresponder a nenhum arquivo atualmente aberto.
+fn sys_close(handle: u64) -> u64 {
+    if crate::file_handles::close(handle) { 0 } else { SYSCALL_ERROR }
+}
+
 /// Despacha uma chamada de sistema pelo número (`RAX` na entrada de
 /// `syscall`), com até quatro argumentos. Devolve o valor de retorno (`RAX`
 /// na saída) — `SYSCALL_ERROR` para um número não reconhecido. `extern "C"`
@@ -384,6 +454,9 @@ unsafe extern "C" fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg
         SYSCALL_CLOCK_MONOTONIC => sys_clock_monotonic(),
         SYSCALL_DLOPEN => unsafe { sys_dlopen(arg0, arg1) },
         SYSCALL_DLSYM => unsafe { sys_dlsym(arg0, arg1, arg2) },
+        SYSCALL_OPEN => unsafe { sys_open(arg0, arg1) },
+        SYSCALL_READ => unsafe { sys_read(arg0, arg1, arg2) },
+        SYSCALL_CLOSE => sys_close(arg0),
         _ => SYSCALL_ERROR,
     }
 }
@@ -648,5 +721,26 @@ mod tests {
         // A reserva original continua viva: liberar pelo endereço base certo
         // ainda funciona depois da tentativa rejeitada.
         assert_eq!(unsafe { dispatch(SYSCALL_VM_RELEASE, addr, 0, 0, 0) }, 0);
+    }
+
+    // `SYSCALL_OPEN` não é testado aqui: `sys_open` monta o sistema de
+    // arquivos via `kernel::storage::with_disk` (disco AHCI real), mesma
+    // limitação já documentada para `SYSCALL_WRITE`/`SYSCALL_DLOPEN` —
+    // verificado em boot real na tarefa 3.3. `sys_read`/`sys_close`, por
+    // outro lado, só tocam `kernel::file_handles` (lógica pura, sem
+    // hardware) — seus caminhos de rejeição por handle desconhecido são
+    // testáveis em host independentemente de `SYSCALL_OPEN` já ter sido
+    // chamado.
+
+    #[test]
+    fn read_with_an_unknown_handle_returns_error_sentinel() {
+        let result = unsafe { dispatch(SYSCALL_READ, u64::MAX / 2, 0, 0, 0) };
+        assert_eq!(result, SYSCALL_ERROR);
+    }
+
+    #[test]
+    fn close_with_an_unknown_handle_returns_error_sentinel() {
+        let result = unsafe { dispatch(SYSCALL_CLOSE, u64::MAX / 2, 0, 0, 0) };
+        assert_eq!(result, SYSCALL_ERROR);
     }
 }

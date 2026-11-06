@@ -292,6 +292,46 @@ pub fn spawn_user_posix_demo<S: FrameStore>(frame_allocator: &mut FrameAllocator
     Ok(thread_id)
 }
 
+/// Endereço virtual, na metade inferior, onde o código do programa de teste
+/// de modo usuário `kernel::file_syscalls_demo` é copiado — distinto das
+/// demais constantes `*_CODE_VIRT` só por clareza em despejos de depuração
+/// (cada um vive no seu próprio `AddressSpace`).
+const FILE_SYSCALLS_DEMO_CODE_VIRT: u64 = 0x0000_6000_0000_0000;
+/// Endereço virtual, na metade inferior, onde a stack de usuário do
+/// programa de teste é mapeada.
+const FILE_SYSCALLS_DEMO_STACK_VIRT: u64 = 0x0000_7000_0000_0000;
+const FILE_SYSCALLS_DEMO_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
+
+/// Cria o processo de demonstração de modo usuário
+/// `kernel::file_syscalls_demo`: mesma estrutura de [`spawn_user_posix_demo`],
+/// com seu próprio `AddressSpace`, página de código e stack dedicadas — ver
+/// `design.md` da change `kernel-file-syscalls`, tarefa 3.2.
+pub fn spawn_file_syscalls_demo<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>) -> Result<ThreadId, ProcessError> {
+    let address_space = Process::begin_new_user(frame_allocator)?;
+    let root = address_space.root();
+
+    let code_frame = crate::paging::Mapper::for_root(frame_allocator, root)
+        .map_new(
+            FILE_SYSCALLS_DEMO_CODE_VIRT,
+            crate::paging::PageFlags { writable: true, user_accessible: true, executable: true },
+            false,
+        )
+        .map_err(ProcessError::AddressSpace)?;
+    let code_hhdm_addr = crate::hhdm::phys_to_virt(crate::hhdm::offset(), code_frame);
+    unsafe { crate::file_syscalls_demo::copy_into(code_hhdm_addr) };
+
+    let (process, thread) = Process::finish_new_user(
+        frame_allocator,
+        address_space,
+        FILE_SYSCALLS_DEMO_CODE_VIRT,
+        FILE_SYSCALLS_DEMO_STACK_VIRT,
+        FILE_SYSCALLS_DEMO_STACK_SIZE,
+    )?;
+    let thread_id = register_thread(thread);
+    with_interrupts_disabled(|| PROCESSES.lock().push(process));
+    Ok(thread_id)
+}
+
 /// Endereço virtual, na metade inferior, onde a stack de usuário do
 /// executável de teste do carregador ELF (`/bin/test.elf`, ver design.md da
 /// change `kernel-elf-loader`) é mapeada — o código em si vem dos endereços

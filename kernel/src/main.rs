@@ -323,6 +323,10 @@ extern "C" fn continue_boot() -> ! {
         // `kernel-jvm-posix-syscalls`, "Escopo da verificação em boot real".
         kernel::scheduler::spawn_user_posix_demo(&mut frame_allocator)
             .expect("spawn do processo de demonstracao das syscalls posix da jvm falhou");
+        // Demonstração das novas syscalls de arquivo desta change (open/read/
+        // close) — ver design.md da change `kernel-file-syscalls`, tarefa 3.2.
+        kernel::scheduler::spawn_file_syscalls_demo(&mut frame_allocator)
+            .expect("spawn do processo de demonstracao das syscalls de arquivo falhou");
         // Executavel de teste do carregador de executaveis ELF64 estaticos
         // (`kernel::elf`/`spawn_from_elf`) — ver spec `kernel-elf-loader` e
         // design.md da change `kernel-elf-loader`, "Verificacao em boot

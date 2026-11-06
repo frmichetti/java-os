@@ -11,9 +11,9 @@
 > até o momento (changes `kernel-boot-foundation`, `kernel-memory-management`,
 > `kernel-interrupts-timer`, `kernel-stack-guard-page`, `kernel-process-scheduler`,
 > `kernel-syscalls`, `kernel-posix-virtual-memory`, `kernel-wait-queue`,
-> `kernel-pthread-sync`, `kernel-wall-clock`, `kernel-elf-loader` e
-> `kernel-dynamic-linker`); as demais ficam registradas aqui para orientar changes
-> futuras.
+> `kernel-pthread-sync`, `kernel-wall-clock`, `kernel-elf-loader`,
+> `kernel-dynamic-linker`, `kernel-fat32-filesystem` e `kernel-file-syscalls`);
+> as demais ficam registradas aqui para orientar changes futuras.
 
 ## 1. Arquitetura do Kernel
 
@@ -226,6 +226,24 @@
   | 13 | `SYSCALL_COND_NOTIFY_ALL` | `handle` | `0`, ou erro |
   | 14 | `SYSCALL_CLOCK_WALL` | — | nanossegundos desde a época |
   | 15 | `SYSCALL_CLOCK_MONOTONIC` | — | nanossegundos monotônicos |
+  | 16 | `SYSCALL_DLOPEN` | `path_ptr`, `path_len` | `handle`, ou erro |
+  | 17 | `SYSCALL_DLSYM` | `handle`, `name_ptr`, `name_len` | endereço, ou erro |
+  | 18 | `SYSCALL_OPEN` | `path_ptr`, `path_len` | `handle`, ou erro |
+  | 19 | `SYSCALL_READ` | `handle`, `buf_ptr`, `buf_len` | bytes lidos, ou erro |
+  | 20 | `SYSCALL_CLOSE` | `handle` | `0`, ou erro |
+
+  **Arquivos abertos** (change `kernel-file-syscalls`): `SYSCALL_OPEN`/
+  `SYSCALL_READ`/`SYSCALL_CLOSE` expõem `kernel::fat32` a modo usuário —
+  gap deixado em aberto pela change `kernel-fat32-filesystem` e pré-requisito
+  para o HotSpot carregar classes do class path. `kernel::file_handles`
+  (mesmo padrão de tabela dinâmica de `kernel::pthread_handles`, índice do
+  `Vec` como `handle`) registra, na abertura, o conteúdo completo do arquivo
+  já lido (sem leitura incremental por cluster) junto com um cursor de
+  posição; cada leitura copia a partir do cursor e o avança; o fechamento
+  libera o `Vec<u8>` do conteúdo imediatamente — diferente de
+  `pthread_handles`, cujos objetos nunca são destruídos (não há API de
+  bloqueio exigindo referência `'static` aqui). Mesma limitação das demais
+  tabelas de handle: global ao kernel, sem isolamento entre processos.
 
   As chamadas de memória virtual (2-6) endereçam por ponteiro (convenção
   `mmap`/`munmap`/`mprotect`: `prot` é uma máscara de 2 bits, bit 0 =
@@ -354,9 +372,9 @@
   `kernel::syscall`, que precisam de `Mapper`/`CR3` reais para seus
   caminhos de sucesso). Verificado em boot real: lê `/EFI/BOOT/BOOTX64.EFI`
   da própria partição de boot (319.488 bytes, múltiplos clusters) e confirma
-  sua assinatura `MZ`. Ainda sem exposição via *syscall* (`open`/`read`) a
-  modo usuário — fica para uma sub-change futura, mesma disciplina do item 8
-  do roadmap (seção 15).
+  sua assinatura `MZ`. **Exposição via *syscall* a modo usuário entregue
+  pela change `kernel-file-syscalls`**: `SYSCALL_OPEN`/`SYSCALL_READ`/
+  `SYSCALL_CLOSE` — ver seção 4.
 - **Rede** (`kernel-network`, `kernel::network`): driver de placa Ethernet
   Intel 82540EM (`e1000`) — localizado via `kernel::pci`, com Bus Mastering
   habilitado explicitamente no registrador de comando PCI (`kernel::pci`
@@ -416,10 +434,12 @@ armazenamento e rede — todos implementados.
     `kernel::timer` já conta ticks desde o boot; falta relógio de parede real e,
     possivelmente, resolução mais fina.
   - *E/S de arquivo* (`open`/`read`, para carregar classes do *class path*):
-    **entregue pela change `kernel-fat32-filesystem`** — `kernel::fat32::Fat32Filesystem`
-    monta a partição de boot (localizada via `kernel::gpt`) e lê um arquivo
-    inteiro por caminho absoluto; falta apenas expor isso como *syscall*
-    (`open`/`read`) a modo usuário, numa sub-change futura.
+    **entregue pelas changes `kernel-fat32-filesystem` e `kernel-file-syscalls`**
+    — `kernel::fat32::Fat32Filesystem` monta a partição de boot (localizada via
+    `kernel::gpt`) e lê um arquivo inteiro por caminho absoluto;
+    `SYSCALL_OPEN`/`SYSCALL_READ`/`SYSCALL_CLOSE` expõem isso a modo usuário
+    com um handle de arquivo aberto e cursor de leitura sequencial
+    (`kernel::file_handles`) — ver seção 4.
 - **Carregamento dinâmico de bibliotecas — decidido (`jvm-dynamic-linking-strategy`)**:
   o HotSpot "de fábrica" depende de **carregamento dinâmico de bibliotecas
   compartilhadas** (`libjvm.so` carregando `libjava.so` via `dlopen`/linker dinâmico, e
@@ -618,8 +638,13 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    `DT_NEEDED` recursivas, relocações `RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`64`
    aplicadas de forma eager, estado isolado por espaço de endereçamento via
    `kernel::paging::current_root()`), exposto a modo usuário via `dlopen`/
-   `dlsym` — ver seção 4/6. Único passo restante do item 8: o próprio porte
-   do HotSpot sobre todas as primitivas já entregues.
+   `dlsym` — ver seção 4/6. `kernel-file-syscalls` (concluída) entregou mais
+   uma sub-change, a mais recente até o momento: `SYSCALL_OPEN`/`SYSCALL_READ`/
+   `SYSCALL_CLOSE` expõem `kernel::fat32` a modo usuário através de um handle
+   de arquivo aberto com cursor de leitura sequencial (`kernel::file_handles`,
+   mesmo padrão de tabela dinâmica de `kernel::pthread_handles`, mas liberando
+   a memória do conteúdo ao fechar) — ver seção 4/6. Único passo restante do
+   item 8: o próprio porte do HotSpot sobre todas as primitivas já entregues.
 9. **Modelo híbrido de execução de JVM**: runtime compartilhado vs. JVM isolada por
    aplicação.
 10. **Java OS Platform (Java)**: gerenciamento de arquivos, serviços de sistema, rede,
