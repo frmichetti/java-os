@@ -1,0 +1,8 @@
+[package]
+name = "elf_test_program"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "elf_test_program"
+path = "src/main.rs"

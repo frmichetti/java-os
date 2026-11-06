@@ -4,3 +4,7 @@ json-target-spec = true
 [alias]
 xtask = "run --package xtask --"
 kernel-build = "build -p kernel --target x86_64-java_os.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+elf-test-program-build = "build -p elf_test_program --target x86_64-java_os_user.json -Z build-std=core -Z build-std-features=compiler-builtins-mem"
+
+[target.x86_64-java_os_user]
+rustflags = ["-C", "link-arg=-Telf_test_program/linker.ld", "-C", "link-arg=-nostdlib"]

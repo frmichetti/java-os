@@ -48,7 +48,7 @@ Todos os comandos abaixo são rodados a partir da raiz do repositório.
 | Comando | O que faz |
 |---|---|
 | `cargo kernel-build` | Compila só o kernel para o target bare-metal `x86_64-java_os.json`. |
-| `cargo xtask build-image` | Compila o kernel e monta a imagem de disco bootável (GPT + partição EFI FAT32) em `boot/dist/java-os.img`. |
+| `cargo xtask build-image` | Compila o kernel e o executável de teste do carregador ELF, e monta a imagem de disco bootável (GPT + partição EFI FAT32) em `boot/dist/java-os.img`. |
 | `cargo xtask run` | Builda a imagem e abre o QEMU (UEFI via OVMF) rodando o kernel. |
 | `cargo xtask run -- <args do qemu>` | Como acima, repassando argumentos extras para o `qemu-system-x86_64` (ex.: `-- -serial stdio`). |
 | `cargo xtask test` | Smoke test de boot: builda a imagem, roda o QEMU headless com timeout, captura a saída serial e falha se o banner de boot / mapa de memória não aparecerem. |
@@ -64,6 +64,25 @@ Todos os comandos abaixo são rodados a partir da raiz do repositório.
 
 ```sh
 cargo xtask run -- -serial stdio -display none
+```
+
+## Executável de teste do carregador ELF
+
+`cargo xtask build-image` também compila `elf_test_program` (crate separada
+do workspace, `elf_test_program/`) para o target de usuário
+`x86_64-java_os_user.json` e o copia para `::/bin/test.elf` na partição FAT32
+da imagem — usado por `kernel::scheduler::spawn_from_elf` (ver spec
+`kernel-elf-loader`) para verificar o carregador de executáveis ELF64
+estáticos em boot real, lendo um binário real do disco em vez de um programa
+embutido no kernel.
+
+Para verificar manualmente que o binário foi copiado corretamente para a
+imagem (bytes idênticos ao compilado):
+
+```sh
+cargo xtask build-image
+mcopy -i boot/dist/java-os.img@@1048576 ::/bin/test.elf /tmp/test_readback.elf
+cmp target/x86_64-java_os_user/release/elf_test_program /tmp/test_readback.elf
 ```
 
 ## Depurando com GDB

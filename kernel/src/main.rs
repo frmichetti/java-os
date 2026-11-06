@@ -323,6 +323,27 @@ extern "C" fn continue_boot() -> ! {
         // `kernel-jvm-posix-syscalls`, "Escopo da verificação em boot real".
         kernel::scheduler::spawn_user_posix_demo(&mut frame_allocator)
             .expect("spawn do processo de demonstracao das syscalls posix da jvm falhou");
+        // Executavel de teste do carregador de executaveis ELF64 estaticos
+        // (`kernel::elf`/`spawn_from_elf`) — ver spec `kernel-elf-loader` e
+        // design.md da change `kernel-elf-loader`, "Verificacao em boot
+        // real". Erro tratado explicitamente (nunca panico): cobre
+        // "Falha de Carregamento Nao Compromete a Estabilidade do Kernel"
+        // da spec.
+        match kernel::fat32::mount_boot_partition() {
+            Ok(fs) => match kernel::scheduler::spawn_from_elf(
+                &mut frame_allocator,
+                &fs,
+                "/bin/test.elf",
+                kernel::scheduler::ELF_TEST_PROGRAM_STACK_VIRT,
+                kernel::scheduler::ELF_TEST_PROGRAM_STACK_SIZE,
+            ) {
+                Ok(_) => kernel::serial_println!("carregador ELF: /bin/test.elf carregado e em execucao"),
+                Err(e) => kernel::serial_println!("carregador ELF: falha ao carregar /bin/test.elf: {:?}", e),
+            },
+            Err(e) => {
+                kernel::serial_println!("carregador ELF: falha ao montar sistema de arquivos: {:?}", e)
+            }
+        }
         // Thread de demonstração do teclado (ver `design.md` da change
         // `kernel-keyboard`): compartilha o espaço de endereçamento da
         // thread de boot (não precisa de isolamento próprio), evitando uma

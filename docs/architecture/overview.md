@@ -5,13 +5,14 @@
 > `openspec/changes/kernel-boot-foundation/design.md` (seção "Arquitetura do Sistema
 > (Referência)"). Ele cobre as 15 áreas de arquitetura do Java OS. Apenas as áreas
 > 1 (Kernel, incluindo interrupções/timer e stack própria com guard page), 2 (Memória,
-> exceto huge pages), 3 (Processos e Threads), 4 (System Calls, exceto carregador de
-> executáveis e isolamento de falhas — ver a seção), e 12-14 (repositório/build/testes)
-> estão implementadas até o momento (changes `kernel-boot-foundation`,
-> `kernel-memory-management`, `kernel-interrupts-timer`, `kernel-stack-guard-page`,
-> `kernel-process-scheduler`, `kernel-syscalls`, `kernel-posix-virtual-memory`,
-> `kernel-wait-queue`, `kernel-pthread-sync` e `kernel-wall-clock`); as demais
-> ficam registradas aqui para orientar changes futuras.
+> exceto huge pages), 3 (Processos e Threads), 4 (System Calls, exceto isolamento de
+> falhas — ver a seção; o carregador de executáveis ELF64 estáticos já existe), e
+> 12-14 (repositório/build/testes) estão implementadas até o momento (changes
+> `kernel-boot-foundation`, `kernel-memory-management`, `kernel-interrupts-timer`,
+> `kernel-stack-guard-page`, `kernel-process-scheduler`, `kernel-syscalls`,
+> `kernel-posix-virtual-memory`, `kernel-wait-queue`, `kernel-pthread-sync`,
+> `kernel-wall-clock` e `kernel-elf-loader`); as demais ficam registradas aqui
+> para orientar changes futuras.
 
 ## 1. Arquitetura do Kernel
 
@@ -234,14 +235,24 @@
   alcançável por estas chamadas colapsa no mesmo sentinela `SYSCALL_ERROR` já
   usado por "número de chamada desconhecido" — nenhum esquema de erro
   granular (estilo `errno`) existe ainda.
-- **Limitação atual**: sem carregador de executáveis — o único código de
-  modo usuário existente são programas de teste gerados em compilação e
-  copiados para uma página de usuário em runtime (`kernel::user_demo`,
-  `kernel::user_posix_demo`), usados para provar o mecanismo ponta a ponta.
-  Uma exceção causada por código de modo usuário ainda halta o kernel inteiro
-  (sem isolamento de falhas por processo/thread ainda), e as tabelas de
-  handle de mutex/condvar e a janela de `kernel::vmm` continuam globais ao
-  kernel inteiro, sem isolamento entre processos diferentes.
+- **Carregador de executáveis**: `kernel::elf` (change `kernel-elf-loader`,
+  ver spec `kernel-elf-loader`) interpreta um executável ELF64 estático
+  (`ET_EXEC`, x86-64, sem relocations/PIE) lido do sistema de arquivos
+  (`kernel::fat32`), mapeia cada segmento `PT_LOAD` com as permissões
+  corretas (zerando explicitamente o BSS — achado da change: `Mapper::map_new`
+  não zera o frame que aloca) e transfere controle para o ponto de entrada
+  declarado, via `kernel::scheduler::spawn_from_elf`. Ainda sem resolução de
+  símbolo nem bibliotecas dinâmicas (`.so`, `dlopen`/`dlsym`) — fica para a
+  próxima sub-change do roadmap (item 8, linker ELF dinâmico mínimo). Os
+  programas de teste gerados em compilação e copiados para uma página de
+  usuário em runtime (`kernel::user_demo`, `kernel::user_posix_demo`)
+  continuam existindo, usados para provar o mecanismo de `syscall`/`sysret`
+  em si, independente do carregador.
+- **Limitação atual**: uma exceção causada por código de modo usuário ainda
+  halta o kernel inteiro (sem isolamento de falhas por processo/thread
+  ainda), e as tabelas de handle de mutex/condvar e a janela de
+  `kernel::vmm` continuam globais ao kernel inteiro, sem isolamento entre
+  processos diferentes.
 - Separação esperada entre syscalls "de sistema" e a superfície exposta à JVM
   fica para quando a JVM existir (roadmap itens 7-9).
 
@@ -406,14 +417,17 @@ armazenamento e rede — todos implementados.
   glibc depende de `dlopen("/proc/self/fd/" + fd)`, uma API exclusiva do Linux
   (`/proc`) que o Java OS não tem nem planeja ter. Rota adotada: implementar um
   **linker ELF dinâmico mínimo no próprio kernel**, inteiramente sob controle do
-  projeto. **Achado**: independentemente dessa escolha, o kernel hoje **não tem
-  nenhum carregador de executável ELF**, nem para um binário estaticamente linkado —
-  todo código de modo usuário atual (`kernel::user_demo`/`kernel::user_posix_demo`) é
+  projeto. **Achado**: independentemente dessa escolha, o kernel na época não tinha
+  nenhum carregador de executável ELF, nem para um binário estaticamente linkado —
+  todo código de modo usuário então (`kernel::user_demo`/`kernel::user_posix_demo`) era
   um blob de assembly copiado manualmente para uma página. Carregar um executável ELF
-  estático (segmentos `PT_LOAD`, via `kernel::vmm`/`kernel::fat32` já prontos) e fazer
-  o linker dinâmico de `.so` (símbolos, relocações, `dlopen`/`dlsym`) são problemas
-  distintos — o primeiro é pré-requisito do segundo e é a próxima sub-change concreta
-  do item 8 (ver seção 15).
+  estático e fazer o linker dinâmico de `.so` (símbolos, relocações, `dlopen`/`dlsym`)
+  são problemas distintos — o primeiro é pré-requisito do segundo. **Entregue pela
+  change `kernel-elf-loader`**: `kernel::elf` interpreta um ELF64 estático (`ET_EXEC`)
+  lido via `kernel::fat32`, mapeia seus segmentos `PT_LOAD` com as permissões corretas
+  (BSS zerado explicitamente) e transfere controle para o ponto de entrada, via
+  `kernel::scheduler::spawn_from_elf` — ver seção 4. O linker dinâmico de `.so`
+  propriamente dito é a próxima sub-change concreta do item 8 (ver seção 15).
 - Esta change não implementa nenhuma primitiva nova — isso fica inteiramente para a
   change do item 8 do roadmap ("Porte inicial da JVM"), que decide a forma concreta de
   cada primitiva do inventário acima (ex.: syscalls novas vs. extensão das existentes)
@@ -575,11 +589,13 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    carregamento dinâmico de bibliotecas, pendente desde
    `jvm-posix-compat-strategy`: build estático do JDK/Leyden rejeitado
    (dependência de `/proc/self/fd`, exclusiva do Linux); linker ELF dinâmico
-   mínimo no kernel adotado — ver seção 6. Ainda faltam, nesta ordem: um
-   **carregador de executável ELF estático** (pré-requisito identificado por
-   esta decisão, ainda inexistente — próxima sub-change concreta), o linker
-   ELF dinâmico mínimo (`.so`, `dlopen`/`dlsym`) propriamente dito, e o
-   próprio porte do HotSpot — ver seção 6 para o inventário completo.
+   mínimo no kernel adotado — ver seção 6. `kernel-elf-loader` (concluída)
+   entregou o pré-requisito identificado por essa decisão: o **carregador de
+   executável ELF64 estático** (`kernel::elf`/`kernel::scheduler::spawn_from_elf`
+   — ver seção 4), sem relocations/PIE nem bibliotecas dinâmicas. Ainda
+   faltam, nesta ordem: o linker ELF dinâmico mínimo (`.so`, `dlopen`/
+   `dlsym`) propriamente dito, e o próprio porte do HotSpot — ver seção 6
+   para o inventário completo.
 9. **Modelo híbrido de execução de JVM**: runtime compartilhado vs. JVM isolada por
    aplicação.
 10. **Java OS Platform (Java)**: gerenciamento de arquivos, serviços de sistema, rede,

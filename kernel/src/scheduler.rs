@@ -292,6 +292,55 @@ pub fn spawn_user_posix_demo<S: FrameStore>(frame_allocator: &mut FrameAllocator
     Ok(thread_id)
 }
 
+/// Endereço virtual, na metade inferior, onde a stack de usuário do
+/// executável de teste do carregador ELF (`/bin/test.elf`, ver design.md da
+/// change `kernel-elf-loader`) é mapeada — o código em si vem dos endereços
+/// que o próprio executável declara (`p_vaddr`), não de uma constante como
+/// `USER_DEMO_CODE_VIRT`.
+pub const ELF_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_5000_0000_0000;
+pub const ELF_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
+
+/// Carrega um executável ELF64 estático do sistema de arquivos `fs` em
+/// `path` e o coloca para rodar em um novo processo de modo usuário — ver
+/// spec `kernel-elf-loader` e `design.md` da change `kernel-elf-loader`,
+/// "`load_and_spawn` vive em `kernel::scheduler`" (`register_thread`/
+/// `PROCESSES` são privados/`pub(crate)` deste módulo, então a função de
+/// alto nível vive aqui, não em `kernel::elf`). Mesma estrutura de
+/// [`spawn_user_demo`], mas o código do processo vem de um arquivo real em
+/// vez de um programa embutido no binário do kernel.
+///
+/// Nenhum processo é registrado em [`PROCESSES`] nem tem thread criada
+/// (`register_thread`) antes de todos os segmentos terem sido mapeados com
+/// sucesso — qualquer falha (leitura do arquivo, validação do ELF,
+/// sobreposição de segmentos, falta de memória) retorna `Err` antes desse
+/// ponto, deixando nenhum processo "fantasma" visível ao escalonador (ver
+/// design.md, "Riscos — processo parcial").
+pub fn spawn_from_elf<S: FrameStore>(
+    frame_allocator: &mut FrameAllocator<S>,
+    fs: &crate::fat32::Fat32Filesystem,
+    path: &str,
+    user_stack_virt_base: u64,
+    user_stack_size: u64,
+) -> Result<ThreadId, crate::elf::ElfError> {
+    let file = crate::storage::with_disk(|disk| fs.read_file(disk, path))
+        .ok_or(crate::elf::ElfError::NoDisk)?
+        .map_err(crate::elf::ElfError::FileRead)?;
+
+    let header = crate::elf::ElfHeader::parse(&file)?;
+    let segments = crate::elf::load_program_headers(&file, &header)?;
+
+    let address_space = Process::begin_new_user(frame_allocator).map_err(crate::elf::ElfError::Process)?;
+    let root = address_space.root();
+    crate::elf::load_segments(frame_allocator, root, &file, &segments)?;
+
+    let (process, thread) =
+        Process::finish_new_user(frame_allocator, address_space, header.entry, user_stack_virt_base, user_stack_size)
+            .map_err(crate::elf::ElfError::Process)?;
+    let thread_id = register_thread(thread);
+    with_interrupts_disabled(|| PROCESSES.lock().push(process));
+    Ok(thread_id)
+}
+
 /// Chamada pela rotina de entrada do timer ([`timer_entry`]) com o `rsp` da
 /// thread que acabou de ser interrompida. Mantém o incremento do contador
 /// Lógica de decisão de escalonamento em si — compartilhada entre

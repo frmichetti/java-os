@@ -45,6 +45,34 @@ fn kernel_binary(root: &Path) -> PathBuf {
     root.join("target/x86_64-java_os/debug/kernel")
 }
 
+/// Compila o executável ELF64 de teste do carregador de executáveis
+/// (`kernel::elf`/`kernel::scheduler::spawn_from_elf`) — ver spec
+/// `kernel-elf-loader` e `design.md` da change `kernel-elf-loader`. Em
+/// modo release (não debug, como o kernel): este binário não precisa de
+/// símbolos de depuração, e o release é ordens de magnitude menor (poucos
+/// KiB contra quase 1 MiB em debug), mais rápido de copiar para a imagem e
+/// de ler pelo carregador em boot real.
+fn build_test_program(root: &Path) {
+    run(Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .current_dir(root)
+        .args([
+            "build",
+            "-p",
+            "elf_test_program",
+            "--target",
+            "x86_64-java_os_user.json",
+            "--release",
+            "-Z",
+            "build-std=core",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
+        ]));
+}
+
+fn test_program_binary(root: &Path) -> PathBuf {
+    root.join("target/x86_64-java_os_user/release/elf_test_program")
+}
+
 fn find_ovmf() -> PathBuf {
     if let Ok(p) = env::var("OVMF_PATH") {
         return PathBuf::from(p);
@@ -63,6 +91,7 @@ fn find_ovmf() -> PathBuf {
 
 fn build_image(root: &Path) -> PathBuf {
     build_kernel(root);
+    build_test_program(root);
 
     let dist = root.join("boot/dist");
     fs::create_dir_all(&dist).expect("falha ao criar boot/dist");
@@ -86,13 +115,14 @@ fn build_image(root: &Path) -> PathBuf {
 
     run(Command::new("mformat").args(["-i", &part, "-F", "::"]));
 
-    for dir in ["::/EFI", "::/EFI/BOOT", "::/boot"] {
+    for dir in ["::/EFI", "::/EFI/BOOT", "::/boot", "::/bin"] {
         run(Command::new("mmd").args(["-i", &part, dir]));
     }
 
     let bootx64 = root.join("boot/limine/BOOTX64.EFI");
     let limine_conf = root.join("boot/limine.conf");
     let kernel_bin = kernel_binary(root);
+    let test_program_bin = test_program_binary(root);
 
     run(Command::new("mcopy").args([
         "-i",
@@ -111,6 +141,12 @@ fn build_image(root: &Path) -> PathBuf {
         &part,
         limine_conf.to_str().unwrap(),
         "::/boot/limine.conf",
+    ]));
+    run(Command::new("mcopy").args([
+        "-i",
+        &part,
+        test_program_bin.to_str().unwrap(),
+        "::/bin/test.elf",
     ]));
 
     eprintln!("Imagem gerada em {}", image_path.display());
