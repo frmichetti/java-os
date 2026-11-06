@@ -327,6 +327,10 @@ extern "C" fn continue_boot() -> ! {
         // close) — ver design.md da change `kernel-file-syscalls`, tarefa 3.2.
         kernel::scheduler::spawn_file_syscalls_demo(&mut frame_allocator)
             .expect("spawn do processo de demonstracao das syscalls de arquivo falhou");
+        // Demonstração/verificação de SYSCALL_EXIT (change `libc-minimal-port`)
+        // — ver design.md, tarefa 1.6.
+        kernel::scheduler::spawn_exit_demo(&mut frame_allocator)
+            .expect("spawn do processo de demonstracao de SYSCALL_EXIT falhou");
         // Executavel de teste do carregador de executaveis ELF64 estaticos
         // (`kernel::elf`/`spawn_from_elf`) — ver spec `kernel-elf-loader` e
         // design.md da change `kernel-elf-loader`, "Verificacao em boot
@@ -346,6 +350,25 @@ extern "C" fn continue_boot() -> ! {
             },
             Err(e) => {
                 kernel::serial_println!("carregador ELF: falha ao montar sistema de arquivos: {:?}", e)
+            }
+        }
+        // Programa C real (newlib + glue sobre as syscalls do kernel) —
+        // verifica o port mínimo de libc em boot real. Ver design.md da
+        // change `libc-minimal-port`, tarefas 4.4/5.1-5.2. Mesma disciplina
+        // de erro explícito (nunca pânico) de `/bin/test.elf` acima.
+        match kernel::fat32::mount_boot_partition() {
+            Ok(fs) => match kernel::scheduler::spawn_from_elf(
+                &mut frame_allocator,
+                &fs,
+                "/bin/libctest.elf",
+                kernel::scheduler::LIBC_TEST_PROGRAM_STACK_VIRT,
+                kernel::scheduler::LIBC_TEST_PROGRAM_STACK_SIZE,
+            ) {
+                Ok(_) => kernel::serial_println!("libc minima: /bin/libctest.elf carregado e em execucao"),
+                Err(e) => kernel::serial_println!("libc minima: falha ao carregar /bin/libctest.elf: {:?}", e),
+            },
+            Err(e) => {
+                kernel::serial_println!("libc minima: falha ao montar sistema de arquivos: {:?}", e)
             }
         }
         // Thread de demonstração do teclado (ver `design.md` da change

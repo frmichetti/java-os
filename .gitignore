@@ -11,6 +11,11 @@
 /boot/limine/
 /third_party/limine/
 
+# Código-fonte de bibliotecas de terceiros vendorizadas localmente (ex.:
+# newlib, change `libc-minimal-port`) — baixado pelo provisionamento, mesmo
+# tratamento do Limine acima.
+/vendor/
+
 # Firmware OVMF baixado localmente (quando não provisionado via sistema)
 *.fd
 

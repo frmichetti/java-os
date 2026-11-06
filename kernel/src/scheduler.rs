@@ -65,6 +65,35 @@ static mut CURRENT_KERNEL_STACK_TOP: u64 = 0;
 /// design.md — Non-Goals).
 static CONTEXTS: Spinlock<Vec<Context>> = Spinlock::new(Vec::new());
 
+/// Marca, por `ThreadId`, se uma thread terminou via `SYSCALL_EXIT` — ver
+/// design.md da change `libc-minimal-port`, "`SYSCALL_EXIT` e remoção
+/// permanente de `ReadyQueue`". Crescida em paralelo com `CONTEXTS` (mesmos
+/// índices, nunca encolhida) por [`register_thread`]. Uma thread terminada
+/// nunca é removida desta tabela nem de `CONTEXTS` — mesma disciplina de
+/// "leak aceitável por enquanto" já aceita para `kernel::pthread_handles`/
+/// `kernel::file_handles`.
+static TERMINATED: Spinlock<Vec<bool>> = Spinlock::new(Vec::new());
+
+/// Marca a thread `id` como terminada: [`schedule_next`] nunca mais a
+/// devolve à `ReadyQueue` depois disso.
+///
+/// Deliberadamente **sem** `with_interrupts_disabled` (só um `Spinlock.lock()`
+/// puro, igual ao caminho não-contestado de `kernel::pthread::Mutex::lock`) —
+/// os dois pontos de chamada (`sys_exit`, com `IF` já mascarado por `SFMASK`
+/// durante toda a *syscall*, e dentro do fecho de `schedule_next`, já
+/// executando com interrupções desabilitadas) nunca precisam da proteção
+/// extra, e isso mantém esta função chamável diretamente em teste de host
+/// (`cli`/`sti` são instruções privilegiadas — crashariam em anel 3).
+pub(crate) fn mark_terminated(id: ThreadId) {
+    TERMINATED.lock()[id.0 as usize] = true;
+}
+
+/// `true` se a thread `id` já terminou via [`mark_terminated`]. Mesma
+/// justificativa de ausência de `with_interrupts_disabled` que lá.
+pub(crate) fn is_terminated(id: ThreadId) -> bool {
+    TERMINATED.lock()[id.0 as usize]
+}
+
 /// Processos criados via [`spawn`], retidos pelo escalonador pela mesma
 /// razão (sem encerramento/limpeza nesta change). Indexados por posição de
 /// criação, não por `ProcessId` diretamente.
@@ -116,6 +145,13 @@ fn register_thread(thread: Thread) -> ThreadId {
                 contexts.resize_with(index + 1, || Context { rsp: 0, kernel_stack_top: 0, address_space_root: 0 });
             }
             contexts[index] = thread.context;
+        }
+        {
+            let mut terminated = TERMINATED.lock();
+            let index = id.0 as usize;
+            if terminated.len() <= index {
+                terminated.resize(index + 1, false);
+            }
         }
         READY_QUEUE.lock().push_back(id);
         id
@@ -332,6 +368,56 @@ pub fn spawn_file_syscalls_demo<S: FrameStore>(frame_allocator: &mut FrameAlloca
     Ok(thread_id)
 }
 
+/// Endereço virtual, na metade inferior, onde o código do programa de teste
+/// de modo usuário `kernel::exit_demo` é copiado — distinto das demais
+/// constantes `*_CODE_VIRT` só por clareza em despejos de depuração (cada um
+/// vive no seu próprio `AddressSpace`). Ver design.md da change
+/// `libc-minimal-port`, tarefa 1.6.
+///
+/// Deliberadamente bem abaixo de `0x0000_8000_0000_0000` (índice 256 da
+/// PML4): esse valor cairia exatamente no início da metade superior
+/// compartilhada (HHDM — ver `docs/architecture/overview.md`, seção 2),
+/// já mapeada em todo `AddressSpace`, causando `AlreadyMapped` — achado
+/// real ao implementar esta tarefa (o incremento de `0x1000_0000_0000`
+/// usado pelas demais constantes `*_CODE_VIRT`/`*_STACK_VIRT` deste arquivo
+/// não pode ultrapassar 7 passos a partir de zero sem invadir esse
+/// território).
+const EXIT_DEMO_CODE_VIRT: u64 = 0x0000_0100_0000_0000;
+/// Endereço virtual, na metade inferior, onde a stack de usuário do
+/// programa de teste é mapeada.
+const EXIT_DEMO_STACK_VIRT: u64 = 0x0000_0200_0000_0000;
+const EXIT_DEMO_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
+
+/// Cria o processo de demonstração de modo usuário `kernel::exit_demo`:
+/// mesma estrutura de [`spawn_user_posix_demo`], com seu próprio
+/// `AddressSpace`, página de código e stack dedicadas — verifica
+/// `SYSCALL_EXIT` em boot real (ver design.md da change `libc-minimal-port`).
+pub fn spawn_exit_demo<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>) -> Result<ThreadId, ProcessError> {
+    let address_space = Process::begin_new_user(frame_allocator)?;
+    let root = address_space.root();
+
+    let code_frame = crate::paging::Mapper::for_root(frame_allocator, root)
+        .map_new(
+            EXIT_DEMO_CODE_VIRT,
+            crate::paging::PageFlags { writable: true, user_accessible: true, executable: true },
+            false,
+        )
+        .map_err(ProcessError::AddressSpace)?;
+    let code_hhdm_addr = crate::hhdm::phys_to_virt(crate::hhdm::offset(), code_frame);
+    unsafe { crate::exit_demo::copy_into(code_hhdm_addr) };
+
+    let (process, thread) = Process::finish_new_user(
+        frame_allocator,
+        address_space,
+        EXIT_DEMO_CODE_VIRT,
+        EXIT_DEMO_STACK_VIRT,
+        EXIT_DEMO_STACK_SIZE,
+    )?;
+    let thread_id = register_thread(thread);
+    with_interrupts_disabled(|| PROCESSES.lock().push(process));
+    Ok(thread_id)
+}
+
 /// Endereço virtual, na metade inferior, onde a stack de usuário do
 /// executável de teste do carregador ELF (`/bin/test.elf`, ver design.md da
 /// change `kernel-elf-loader`) é mapeada — o código em si vem dos endereços
@@ -339,6 +425,16 @@ pub fn spawn_file_syscalls_demo<S: FrameStore>(frame_allocator: &mut FrameAlloca
 /// `USER_DEMO_CODE_VIRT`.
 pub const ELF_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_5000_0000_0000;
 pub const ELF_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
+
+/// Endereço virtual, na metade inferior, onde a stack de usuário do
+/// executável de teste do port mínimo de libc (`/bin/libctest.elf`, change
+/// `libc-minimal-port`) é mapeada — mesmo papel de
+/// `ELF_TEST_PROGRAM_STACK_VIRT`, endereço distinto só por clareza em
+/// despejos de depuração. Deliberadamente bem abaixo de `0x0000_8000_0000_0000`
+/// (índice 256 da PML4, início da HHDM compartilhada) — ver comentário em
+/// `EXIT_DEMO_CODE_VIRT` para o achado real que motiva essa faixa.
+pub const LIBC_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_0300_0000_0000;
+pub const LIBC_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
 
 /// Carrega um executável ELF64 estático do sistema de arquivos `fs` em
 /// `path` e o coloca para rodar em um novo processo de modo usuário — ver
@@ -418,9 +514,11 @@ fn schedule_next(current_rsp: u64) -> u64 {
 
         // Ponto de decisão (ver design.md, "`ReadyQueue` ganha um ponto de
         // decisão explícito"): se há uma intenção de bloqueio pendente para
-        // `was_running`, ela é desviada para a `WaitQueue` indicada; caso
-        // contrário (qualquer chamada normal), comportamento padrão inalterado.
-        if !crate::wait_queue::take_block_intent(was_running) {
+        // `was_running`, ela é desviada para a `WaitQueue` indicada; se ela
+        // terminou via `SYSCALL_EXIT` (change `libc-minimal-port`), ela
+        // simplesmente não volta à rotação; caso contrário (qualquer chamada
+        // normal), comportamento padrão inalterado.
+        if !crate::wait_queue::take_block_intent(was_running) && !is_terminated(was_running) {
             READY_QUEUE.lock().push_back(was_running);
         }
 
@@ -654,5 +752,73 @@ mod tests {
         assert_eq!(queue.front(), Some(ThreadId(1)));
         let _ = queue.pop_front();
         assert_eq!(queue.front(), Some(ThreadId(0)));
+    }
+
+    // -------------------------------------------------------------
+    // `SYSCALL_EXIT` / remoção permanente de thread terminada
+    // (change `libc-minimal-port`) — ver design.md, "`SYSCALL_EXIT` e
+    // remoção permanente de `ReadyQueue`".
+    // -------------------------------------------------------------
+
+    #[test]
+    fn mark_terminated_then_is_terminated_reflects_the_marking() {
+        // Não usa `register_thread` (chama `with_interrupts_disabled`,
+        // inseguro em host — `cli`/`sti` são privilegiadas) — só reserva uma
+        // entrada nova em `TERMINATED` diretamente, mesmo precedente de
+        // `kernel::pthread_handles` registrando entradas globais em testes.
+        let id = {
+            let mut table = TERMINATED.lock();
+            table.push(false);
+            ThreadId((table.len() - 1) as u64)
+        };
+        assert!(!is_terminated(id), "thread recem-registrada nao deveria estar marcada como terminada");
+        mark_terminated(id);
+        assert!(is_terminated(id));
+    }
+
+    /// Mesma composição de [`advance_without_blocking`], mas decidindo via
+    /// um predicado de terminação — reproduz a lógica real de
+    /// `schedule_next` (`!take_block_intent(..) && !is_terminated(..)`) só
+    /// para o lado da terminação, sem tocar `TERMINATED`/
+    /// `with_interrupts_disabled`.
+    fn advance_unless_terminated(queue: &mut ReadyQueue, is_terminated: impl Fn(ThreadId) -> bool) -> Option<ThreadId> {
+        let was_running = queue.pop_front()?;
+        if !is_terminated(was_running) {
+            queue.push_back(was_running);
+        }
+        queue.front()
+    }
+
+    #[test]
+    fn a_terminated_thread_never_reappears_in_the_queue() {
+        let mut queue = ReadyQueue::new();
+        queue.push_back(ThreadId(0));
+        queue.push_back(ThreadId(1));
+
+        // ThreadId(0) "termina" nesta rodada.
+        let next = advance_unless_terminated(&mut queue, |id| id == ThreadId(0));
+        assert_eq!(next, Some(ThreadId(1)));
+        assert_eq!(queue.front(), Some(ThreadId(1)));
+
+        // Só ThreadId(1) continua girando — nunca mais vemos ThreadId(0).
+        let next = advance_unless_terminated(&mut queue, |_| false);
+        assert_eq!(next, Some(ThreadId(1)));
+        let next = advance_unless_terminated(&mut queue, |_| false);
+        assert_eq!(next, Some(ThreadId(1)));
+    }
+
+    #[test]
+    fn when_every_thread_terminates_the_queue_becomes_empty() {
+        // Mesmo resultado de `empty_queue_has_nothing_to_advance_to`: nenhuma
+        // thread pronta — o `schedule_next` real, integrado com hardware,
+        // ainda entra em pânico nesse caso (limitação pré-existente, fora do
+        // escopo desta change — ver comentário em `schedule_next`); este
+        // teste cobre só a lógica pura da `ReadyQueue` em si.
+        let mut queue = ReadyQueue::new();
+        queue.push_back(ThreadId(0));
+
+        let next = advance_unless_terminated(&mut queue, |_| true);
+        assert_eq!(next, None);
+        assert_eq!(queue.front(), None);
     }
 }

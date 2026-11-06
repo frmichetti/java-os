@@ -12,8 +12,8 @@
 > `kernel-interrupts-timer`, `kernel-stack-guard-page`, `kernel-process-scheduler`,
 > `kernel-syscalls`, `kernel-posix-virtual-memory`, `kernel-wait-queue`,
 > `kernel-pthread-sync`, `kernel-wall-clock`, `kernel-elf-loader`,
-> `kernel-dynamic-linker`, `kernel-fat32-filesystem` e `kernel-file-syscalls`);
-> as demais ficam registradas aqui para orientar changes futuras.
+> `kernel-dynamic-linker`, `kernel-fat32-filesystem`, `kernel-file-syscalls` e
+> `libc-minimal-port`); as demais ficam registradas aqui para orientar changes futuras.
 
 ## 1. Arquitetura do Kernel
 
@@ -135,7 +135,14 @@
 - **Threads** (`kernel::process::Thread`): a unidade de escalonamento dentro de um
   processo. Cada thread tem sua própria stack de kernel (64 KiB, protegida por guard
   page — generalização de `kernel-stack-guard-page` para um pool de stacks, uma por
-  thread) e seu próprio contexto de registradores da CPU.
+  thread) e seu próprio contexto de registradores da CPU. **Limitação conhecida**
+  (achado da change `libc-minimal-port`): `kernel::process::Context` só cobre
+  registradores de uso geral — FPU/SSE/XMM **não são salvos nem restaurados** na troca
+  de contexto. Por isso o target de modo usuário (`x86_64-java_os_user.json`) desabilita
+  SSE/AVX inteiramente (`soft-float`): usar ponto flutuante hoje corromperia
+  silenciosamente o estado na primeira preempção. Bloqueador para `double`/`float` em
+  qualquer programa de usuário (inclusive o próprio HotSpot, que usa esses tipos como
+  primitivos Java) até uma change futura implementar `FXSAVE`/`FXRSTOR` por thread.
 - **Escalonador** (`kernel::scheduler`): preemptivo, round-robin, disparado pelo timer
   periódico do Local APIC já existente (`kernel-timer`) — a cada tick, o contexto da
   thread corrente é salvo e a próxima thread pronta é retomada, sem exigir cooperação.
@@ -231,6 +238,17 @@
   | 18 | `SYSCALL_OPEN` | `path_ptr`, `path_len` | `handle`, ou erro |
   | 19 | `SYSCALL_READ` | `handle`, `buf_ptr`, `buf_len` | bytes lidos, ou erro |
   | 20 | `SYSCALL_CLOSE` | `handle` | `0`, ou erro |
+  | 21 | `SYSCALL_EXIT` | — | nunca retorna |
+
+  **Término de thread/processo** (change `libc-minimal-port`): `SYSCALL_EXIT`
+  marca a thread chamadora como terminada (`kernel::scheduler::mark_terminated`)
+  e a remove permanentemente da `ReadyQueue` — `schedule_next`, ao retirá-la
+  da rotação, consulta essa marcação antes de decidir se a recoloca no fim
+  da fila; se terminada, não recoloca. A syscall em si nunca retorna
+  (`sti`/`hlt` em laço, mesmo padrão de `kernel::idle_loop`, até a próxima
+  troca de contexto a retirar definitivamente). Recursos (stack de kernel,
+  entradas em `CONTEXTS`) não são liberados — mesma disciplina de "leak
+  aceitável por enquanto" de `kernel::pthread_handles`/`kernel::file_handles`.
 
   **Arquivos abertos** (change `kernel-file-syscalls`): `SYSCALL_OPEN`/
   `SYSCALL_READ`/`SYSCALL_CLOSE` expõem `kernel::fat32` a modo usuário —
@@ -467,6 +485,28 @@ armazenamento e rede — todos implementados.
   `dlopen`/`dlsym` como *syscalls* — ver seção 4. Sem *lazy binding*,
   *versioning*, TLS dinâmico nem `dlclose` ainda (mínimo suficiente para
   provar o mecanismo, não uma `ld.so` completa).
+- **Libc C mínima — entregue pela change `libc-minimal-port`**: gap descoberto só ao
+  tentar escopar o próximo passo concreto do porte do HotSpot — o HotSpot (C++) assume
+  uma libc/libstdc++ hospedeira completa por baixo (`malloc`, `string.h`, `pthread_*`,
+  `dlopen`, `libm`), que nunca existiu no Java OS (todo código de modo usuário até então
+  era Rust `#![no_std]` falando direto com as syscalls). **Decisão**: portar **newlib**
+  (não `musl`, que assume a ABI de syscalls do Linux) — desenhado para ser retargetado
+  via um pequeno conjunto de *syscall stubs* (`read`/`write`/`open`/`close`/`lseek`/
+  `sbrk`/`fstat`/`isatty`/`_exit`/`kill`/`getpid`, nomes sem underscore por causa de
+  `MISSING_SYSCALL_NAMES` — achado real durante a implementação). **Achado mais sério**:
+  a ABI x86_64 não tem um "soft-float" utilizável sem SSE (`-mno-sse`, exigido pela
+  ausência de save/restore de FPU/XMM na troca de contexto — ver seção 1/3) — o GCC
+  recusa compilar qualquer função com `float`/`double` por valor, então esta libc **não
+  tem suporte a ponto flutuante** (`libm` inteira e a conversão float de `libc/stdlib`
+  ficam fora da build). Nenhum cross-compilador dedicado foi construído: host e alvo são
+  ambos x86_64, então um wrapper fino (`scripts/cross/x86_64-elf-*`) sobre o GCC do host
+  basta. Nenhum `libc/sys/<alvo>` foi criado dentro da árvore do newlib (não há
+  correspondência para um triplo `x86_64-elf` desconhecido) — os stubs ficam num arquivo
+  de glue externo (`userland_c/glue.c`), linkado junto com `libc.a` em cada programa.
+  Gap adicional resolvido no caminho: nova *syscall* `SYSCALL_EXIT` (seção 4), já que
+  nenhuma forma de terminar um processo existia. Verificado em boot real: um programa C
+  real (`userland_c/libc_test_program.c`, carregado via `kernel::elf`/`spawn_from_elf`)
+  aloca memória, escreve no console, lê um arquivo e termina — tudo com sucesso.
 - Esta change não implementa nenhuma primitiva nova — isso fica inteiramente para a
   change do item 8 do roadmap ("Porte inicial da JVM"), que decide a forma concreta de
   cada primitiva do inventário acima (ex.: syscalls novas vs. extensão das existentes)
@@ -639,12 +679,22 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    aplicadas de forma eager, estado isolado por espaço de endereçamento via
    `kernel::paging::current_root()`), exposto a modo usuário via `dlopen`/
    `dlsym` — ver seção 4/6. `kernel-file-syscalls` (concluída) entregou mais
-   uma sub-change, a mais recente até o momento: `SYSCALL_OPEN`/`SYSCALL_READ`/
-   `SYSCALL_CLOSE` expõem `kernel::fat32` a modo usuário através de um handle
-   de arquivo aberto com cursor de leitura sequencial (`kernel::file_handles`,
-   mesmo padrão de tabela dinâmica de `kernel::pthread_handles`, mas liberando
-   a memória do conteúdo ao fechar) — ver seção 4/6. Único passo restante do
-   item 8: o próprio porte do HotSpot sobre todas as primitivas já entregues.
+   uma sub-change: `SYSCALL_OPEN`/`SYSCALL_READ`/`SYSCALL_CLOSE` expõem
+   `kernel::fat32` a modo usuário através de um handle de arquivo aberto com
+   cursor de leitura sequencial (`kernel::file_handles`, mesmo padrão de
+   tabela dinâmica de `kernel::pthread_handles`, mas liberando a memória do
+   conteúdo ao fechar) — ver seção 4/6. `libc-minimal-port` (concluída)
+   entregou mais uma sub-change, a mais recente até o momento: uma libc C
+   mínima (newlib retargetado sem ponto flutuante, sobre um arquivo de glue
+   externo e as syscalls já existentes) e a nova `SYSCALL_EXIT` — gap
+   descoberto ao tentar escopar o passo seguinte do item 8 (um esqueleto
+   `os_javaos` do HotSpot, que assumia incorretamente que uma libc já
+   existia) — ver seção 6. Verificado em boot real com um programa C real
+   fazendo malloc, E/S de arquivo e término. Próximo passo do item 8: o
+   esqueleto `os_javaos` do HotSpot propriamente dito, agora com libc
+   disponível — e, antes dele ou em paralelo, o kernel passar a
+   salvar/restaurar estado de FPU/XMM na troca de contexto (sem isso, nem a
+   libc nem o HotSpot podem usar `double`/`float` — ver seção 6).
 9. **Modelo híbrido de execução de JVM**: runtime compartilhado vs. JVM isolada por
    aplicação.
 10. **Java OS Platform (Java)**: gerenciamento de arquivos, serviços de sistema, rede,

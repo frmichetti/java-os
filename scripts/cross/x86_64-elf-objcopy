@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Wrapper trivial sobre o objcopy do host — ver x86_64-elf-gcc para o racional.
+exec objcopy "$@"

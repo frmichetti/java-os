@@ -41,6 +41,24 @@ use o WSL2; em Linux nativo, os mesmos passos se aplicam diretamente.
    A versão pinada (branch `v11.x-binary`, commit `5be26a73d7b7b4d4477d18be94e1d16e615adf56`)
    está documentada em `openspec/changes/kernel-boot-foundation/design.md` (Open Questions).
 
+4. **Newlib** (libc C mínima para programas de usuário), vendorizado localmente — não é
+   versionado no Git (ver `.gitignore`), então precisa ser baixado e compilado uma vez.
+   Nenhum cross-compilador dedicado é necessário: host e alvo são ambos x86_64, então o
+   GCC do host (já instalado pelo passo 2 — `build-essential`) é usado através de um
+   wrapper fino (`scripts/cross/x86_64-elf-*`), sem suporte a ponto flutuante — ver
+   `docs/architecture/overview.md`, seção 6 ("Libc C mínima"), para o racional completo.
+
+   ```sh
+   mkdir -p vendor
+   curl -o /tmp/newlib.tar.gz https://sourceware.org/pub/newlib/newlib-4.6.0.20260123.tar.gz
+   tar xzf /tmp/newlib.tar.gz -C vendor
+   ./scripts/cross/build-newlib.sh
+   ```
+
+   A versão pinada (`newlib-4.6.0.20260123`, a mais recente estável disponível no
+   momento da implementação) está documentada em `openspec/changes/archive/` (change
+   `libc-minimal-port`, `design.md`).
+
 ## Build, execução e teste
 
 Todos os comandos abaixo são rodados a partir da raiz do repositório.

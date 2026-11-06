@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Wrapper trivial sobre o `ar` do host — ver scripts/cross/x86_64-elf-gcc
+# para o racional completo (mesma arquitetura host/alvo, só a convenção de
+# nome de triplo que o newlib exige).
+exec ar "$@"

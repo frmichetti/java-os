@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Wrapper trivial sobre o `ranlib` do host — ver scripts/cross/x86_64-elf-gcc
+# para o racional completo.
+exec ranlib "$@"

@@ -83,6 +83,11 @@ pub const SYSCALL_OPEN: u64 = 18;
 pub const SYSCALL_READ: u64 = 19;
 pub const SYSCALL_CLOSE: u64 = 20;
 
+/// Ver design.md da change `libc-minimal-port`, "`SYSCALL_EXIT` e remoção
+/// permanente de `ReadyQueue`". Sem argumentos, nunca retorna — a thread
+/// chamadora é removida permanentemente da rotação do escalonador.
+pub const SYSCALL_EXIT: u64 = 21;
+
 /// Valor devolvido em `RAX` para um número de chamada não reconhecido, em
 /// vez de executar qualquer serviço — ver spec `kernel-syscalls`, "Despacho
 /// por Número de Chamada".
@@ -424,6 +429,19 @@ fn sys_close(handle: u64) -> u64 {
     if crate::file_handles::close(handle) { 0 } else { SYSCALL_ERROR }
 }
 
+/// Termina a thread chamadora — cobre `SYSCALL_EXIT`. Marca a thread como
+/// terminada (`kernel::scheduler::mark_terminated`, consultada por
+/// `schedule_next` para nunca mais devolvê-la à `ReadyQueue`) e então
+/// aguarda ociosamente (`sti`/`hlt`, mesmo padrão de `kernel::idle_loop`) a
+/// próxima troca de contexto — que, por construção, nunca mais retoma esta
+/// chamada: a thread chamadora nunca volta a executar depois disto.
+fn sys_exit() -> ! {
+    crate::scheduler::mark_terminated(crate::scheduler::current_thread_id());
+    loop {
+        unsafe { core::arch::asm!("sti", "hlt", options(preserves_flags)) };
+    }
+}
+
 /// Despacha uma chamada de sistema pelo número (`RAX` na entrada de
 /// `syscall`), com até quatro argumentos. Devolve o valor de retorno (`RAX`
 /// na saída) — `SYSCALL_ERROR` para um número não reconhecido. `extern "C"`
@@ -457,6 +475,7 @@ unsafe extern "C" fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg
         SYSCALL_OPEN => unsafe { sys_open(arg0, arg1) },
         SYSCALL_READ => unsafe { sys_read(arg0, arg1, arg2) },
         SYSCALL_CLOSE => sys_close(arg0),
+        SYSCALL_EXIT => sys_exit(),
         _ => SYSCALL_ERROR,
     }
 }

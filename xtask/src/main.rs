@@ -135,6 +135,109 @@ fn file_syscalls_fixture_path(root: &Path) -> PathBuf {
     root.join("kernel/testdata/file_syscalls_fixture.txt")
 }
 
+/// Localiza o diretório do código-fonte do newlib vendorizado
+/// (`vendor/newlib-<versão>/`, não versionado no Git — ver change
+/// `libc-minimal-port`) — o nome exato inclui a versão, então procurado
+/// dinamicamente em vez de fixado.
+fn vendored_newlib_src_dir(root: &Path) -> PathBuf {
+    let vendor_dir = root.join("vendor");
+    fs::read_dir(&vendor_dir)
+        .unwrap_or_else(|e| panic!("falha ao listar {}: {e}", vendor_dir.display()))
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.is_dir()
+                && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("newlib-"))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "nenhum vendor/newlib-<versao> encontrado — rode scripts/cross/build-newlib.sh primeiro (ver README, change `libc-minimal-port`)"
+            )
+        })
+}
+
+/// Compila o programa C de verificação do port mínimo de libc
+/// (`userland_c/libc_test_program.c`, change `libc-minimal-port`): o glue
+/// de retarget do newlib (`glue.c`), o `crt0` mínimo (`crt0.S`) e o próprio
+/// programa, linkados estaticamente contra o `libc.a` do newlib vendorizado
+/// via o wrapper `scripts/cross/x86_64-elf-gcc` (host e alvo são ambos
+/// x86_64 — ver design.md da change, "Wrapper fino sobre o GCC do host").
+/// Assume que `scripts/cross/build-newlib.sh` já rodou pelo menos uma vez
+/// (`vendor/newlib-build/x86_64-elf/newlib/libc.a` já existe) — não
+/// reconstrói o newlib em si a cada `build-image` (build lenta, só muda se
+/// a versão vendorizada mudar).
+fn build_libc_test_program(root: &Path) -> PathBuf {
+    let cross_gcc = root.join("scripts/cross/x86_64-elf-gcc");
+    let newlib_build = root.join("vendor/newlib-build/x86_64-elf/newlib");
+    let newlib_libc_a = newlib_build.join("libc.a");
+    if !newlib_libc_a.exists() {
+        panic!(
+            "newlib nao encontrado em {} — rode scripts/cross/build-newlib.sh primeiro (ver README, change `libc-minimal-port`)",
+            newlib_libc_a.display()
+        );
+    }
+    let newlib_src = vendored_newlib_src_dir(root);
+    let targ_include = newlib_build.join("targ-include");
+    let public_include = newlib_src.join("newlib/libc/include");
+
+    let userland_c = root.join("userland_c");
+    let out_dir = root.join("target/userland_c");
+    fs::create_dir_all(&out_dir).expect("falha ao criar target/userland_c");
+
+    let compile = |src: &str, obj_name: &str| {
+        let src_path = userland_c.join(src);
+        let obj_path = out_dir.join(obj_name);
+        run(Command::new(&cross_gcc).args([
+            "-ffreestanding",
+            "-nostdlib",
+            "-isystem",
+            targ_include.to_str().unwrap(),
+            "-isystem",
+            public_include.to_str().unwrap(),
+            "-c",
+            src_path.to_str().unwrap(),
+            "-o",
+            obj_path.to_str().unwrap(),
+        ]));
+        obj_path
+    };
+
+    let crt0_obj = {
+        let obj_path = out_dir.join("crt0.o");
+        run(Command::new(&cross_gcc).args([
+            "-ffreestanding",
+            "-nostdlib",
+            "-c",
+            userland_c.join("crt0.S").to_str().unwrap(),
+            "-o",
+            obj_path.to_str().unwrap(),
+        ]));
+        obj_path
+    };
+    let glue_obj = compile("glue.c", "glue.o");
+    let program_obj = compile("libc_test_program.c", "libc_test_program.o");
+
+    let elf_path = out_dir.join("libc_test_program.elf");
+    run(Command::new(&cross_gcc).args([
+        "-ffreestanding",
+        "-nostdlib",
+        "-static",
+        "-no-pie",
+        "-T",
+        userland_c.join("linker.ld").to_str().unwrap(),
+        crt0_obj.to_str().unwrap(),
+        program_obj.to_str().unwrap(),
+        glue_obj.to_str().unwrap(),
+        "-L",
+        newlib_build.to_str().unwrap(),
+        "-lc",
+        "-o",
+        elf_path.to_str().unwrap(),
+    ]));
+
+    elf_path
+}
+
 fn find_ovmf() -> PathBuf {
     if let Ok(p) = env::var("OVMF_PATH") {
         return PathBuf::from(p);
@@ -189,6 +292,7 @@ fn build_image(root: &Path) -> PathBuf {
     let test_lib_base = test_library_binary(root, "base");
     let test_lib_user = test_library_binary(root, "user");
     let file_syscalls_fixture = file_syscalls_fixture_path(root);
+    let libc_test_program = build_libc_test_program(root);
 
     run(Command::new("mcopy").args([
         "-i",
@@ -231,6 +335,12 @@ fn build_image(root: &Path) -> PathBuf {
         &part,
         file_syscalls_fixture.to_str().unwrap(),
         "::/TEST.TXT",
+    ]));
+    run(Command::new("mcopy").args([
+        "-i",
+        &part,
+        libc_test_program.to_str().unwrap(),
+        "::/bin/libctest.elf",
     ]));
 
     eprintln!("Imagem gerada em {}", image_path.display());

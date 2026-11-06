@@ -43,6 +43,7 @@ você deve registrar a issue em um arquivo KNOW_ISSUES.md e registrar todo o con
 ## Diretrizes Gerais
 
 * Sempre consulte `SPECIFICATION.md` antes de iniciar qualquer implementação.
+* Sempre documente e registre novas funcionalidades obedecendo os padrões do arquivo `SPECIFICATION.md`.
 * Nunca altere regras de negócio sem uma solicitação explícita.
 * Caso exista conflito entre código e especificação, considere `SPECIFICATION.md` como a referência principal e informe qualquer inconsistência encontrada.
 * Sempre procure manter equivalência funcional entre a implementação legada e a nova aplicação.
