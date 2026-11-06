@@ -1,0 +1,10 @@
+[package]
+name = "elf_test_library_user"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# Mesmo racional de `elf_test_library_base/Cargo.toml`: nome curto para
+# caber em 8.3 no FAT32.
+name = "user"
+crate-type = ["cdylib"]

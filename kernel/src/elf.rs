@@ -27,9 +27,19 @@ const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 /// `EI_DATA` (byte 5 do cabeçalho) para little-endian — único suportado.
 const ELFDATA2LSB: u8 = 1;
-/// `e_type` para um executável estático — único suportado (sem PIE/`ET_DYN`,
-/// ver design.md, Non-Goals).
-const ET_EXEC: u16 = 2;
+/// `e_type` para um executável estático — usado por
+/// `kernel::scheduler::spawn_from_elf` para rejeitar qualquer outro tipo
+/// (incluindo `ET_DYN`), já que `ElfHeader::parse` sozinho aceita ambos.
+pub(crate) const ET_EXEC: u16 = 2;
+/// `e_type` para uma biblioteca compartilhada (objeto position-independent)
+/// — aceito por `ElfHeader::parse` desde a change `kernel-dynamic-linker`,
+/// que reaproveita este parser para carregar bibliotecas `.so`. A
+/// distinção "isto deve ser especificamente `ET_EXEC`" (usada por
+/// `kernel::scheduler::spawn_from_elf`) ou "isto deve ser especificamente
+/// `ET_DYN`" (usada por `kernel::dylib`) é responsabilidade de cada
+/// chamador, não deste parser — ver design.md da change
+/// `kernel-dynamic-linker`, "Reaproveitar `kernel::elf`...".
+pub(crate) const ET_DYN: u16 = 3;
 /// `e_machine` para x86-64 — única arquitetura suportada.
 const EM_X86_64: u16 = 62;
 
@@ -83,6 +93,11 @@ pub enum ElfError {
 /// estático. Lógica pura, sem nenhum acesso a memória do processo destino.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct ElfHeader {
+    /// `ET_EXEC` (executável estático) ou `ET_DYN` (biblioteca
+    /// compartilhada) — único campo que distingue os dois usos deste
+    /// parser compartilhado; cada chamador decide qual exigir (ver
+    /// `kernel::scheduler::spawn_from_elf` vs. `kernel::dylib`).
+    pub e_type: u16,
     pub entry: u64,
     pub phoff: u64,
     pub phentsize: u16,
@@ -91,9 +106,12 @@ pub struct ElfHeader {
 
 impl ElfHeader {
     /// Interpreta `buf` (o conteúdo completo do arquivo) como um cabeçalho
-    /// ELF64 de executável estático — cobre "Validação do Cabeçalho e da
-    /// Arquitetura do Executável" da spec `kernel-elf-loader`. Nunca indexa
-    /// `buf` fora dos limites: um buffer curto demais é `ElfError::NotElf`.
+    /// ELF64 de executável estático (`ET_EXEC`) ou biblioteca compartilhada
+    /// (`ET_DYN`) — cobre "Validação do Cabeçalho e da Arquitetura do
+    /// Executável" da spec `kernel-elf-loader`. Nunca indexa `buf` fora dos
+    /// limites: um buffer curto demais é `ElfError::NotElf`. Não distingue
+    /// `ET_EXEC` de `ET_DYN` além de aceitar ambos — ver `e_type` e
+    /// design.md da change `kernel-dynamic-linker`.
     pub fn parse(buf: &[u8]) -> Result<Self, ElfError> {
         let header = buf.get(0..EHDR_SIZE).ok_or(ElfError::NotElf)?;
 
@@ -106,7 +124,7 @@ impl ElfHeader {
 
         let e_type = u16::from_le_bytes(header[16..18].try_into().unwrap());
         let e_machine = u16::from_le_bytes(header[18..20].try_into().unwrap());
-        if e_type != ET_EXEC || e_machine != EM_X86_64 {
+        if (e_type != ET_EXEC && e_type != ET_DYN) || e_machine != EM_X86_64 {
             return Err(ElfError::UnsupportedExecutable);
         }
 
@@ -115,7 +133,7 @@ impl ElfHeader {
         let phentsize = u16::from_le_bytes(header[54..56].try_into().unwrap());
         let phnum = u16::from_le_bytes(header[56..58].try_into().unwrap());
 
-        Ok(Self { entry, phoff, phentsize, phnum })
+        Ok(Self { e_type, entry, phoff, phentsize, phnum })
     }
 }
 
@@ -171,6 +189,15 @@ pub fn load_program_headers(buf: &[u8], header: &ElfHeader) -> Result<Vec<Progra
         result.push(ProgramHeader { flags: p_flags, offset: p_offset, vaddr: p_vaddr, filesz: p_filesz, memsz: p_memsz });
     }
     Ok(result)
+}
+
+/// Soma `base` ao `vaddr` de cada segmento, preservando os demais campos —
+/// usado por `kernel::dylib` para transformar os endereços relativos a 0 de
+/// um objeto `ET_DYN` nos endereços absolutos que [`load_segments`] espera
+/// (que já funciona com endereços absolutos desde `kernel-elf-loader`, sem
+/// nenhuma mudança). Função pura, testável sem hardware.
+pub fn rebase_segments(segments: &[ProgramHeader], base: u64) -> Vec<ProgramHeader> {
+    segments.iter().map(|s| ProgramHeader { vaddr: s.vaddr + base, ..*s }).collect()
 }
 
 /// Primeira página e página-limite (exclusiva) cobertas por um segmento com
@@ -367,8 +394,20 @@ mod tests {
     #[test]
     fn wrong_type_is_rejected() {
         let mut buf = build_header(0, 0, 0, 0, EHDR_SIZE);
-        buf[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        buf[16..18].copy_from_slice(&1u16.to_le_bytes()); // ET_REL
         assert_eq!(ElfHeader::parse(&buf), Err(ElfError::UnsupportedExecutable));
+    }
+
+    #[test]
+    fn et_dyn_is_accepted_by_the_shared_parser() {
+        // `ElfHeader::parse` sozinho aceita `ET_EXEC` e `ET_DYN` — a
+        // distinção de qual exigir é responsabilidade do chamador
+        // (`spawn_from_elf` vs. `kernel::dylib`), não deste parser — ver
+        // design.md da change `kernel-dynamic-linker`.
+        let mut buf = build_header(0, 0, 0, 0, EHDR_SIZE);
+        buf[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
+        let header = ElfHeader::parse(&buf).expect("ET_DYN deveria ser aceito pelo parser compartilhado");
+        assert_eq!(header.e_type, ET_DYN);
     }
 
     // -------------------------------------------------------------
@@ -427,6 +466,27 @@ mod tests {
     }
 
     const PF_R_FLAG: u32 = 4;
+
+    // -------------------------------------------------------------
+    // rebase_segments (tarefa 1.3 da change kernel-dynamic-linker)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn rebase_segments_adds_base_to_vaddr_only() {
+        let original = [
+            ProgramHeader { flags: PF_X, offset: 0, vaddr: 0, filesz: 16, memsz: 16 },
+            ProgramHeader { flags: PF_W, offset: 16, vaddr: 0x1000, filesz: 8, memsz: 32 },
+        ];
+        let rebased = rebase_segments(&original, 0x5_0000);
+        assert_eq!(rebased[0].vaddr, 0x5_0000);
+        assert_eq!(rebased[1].vaddr, 0x5_1000);
+        // demais campos preservados
+        assert_eq!(rebased[0].offset, original[0].offset);
+        assert_eq!(rebased[0].filesz, original[0].filesz);
+        assert_eq!(rebased[0].memsz, original[0].memsz);
+        assert_eq!(rebased[0].flags, original[0].flags);
+        assert_eq!(rebased[1].offset, original[1].offset);
+    }
 
     // -------------------------------------------------------------
     // segment_page_range / segment_page_flags / page_ranges_overlap (tarefa 2.1)

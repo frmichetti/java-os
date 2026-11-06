@@ -73,6 +73,59 @@ fn test_program_binary(root: &Path) -> PathBuf {
     root.join("target/x86_64-java_os_user/release/elf_test_program")
 }
 
+/// Compila as duas bibliotecas compartilhadas de teste do linker dinâmico
+/// (`kernel::dylib`) — ver spec `kernel-dynamic-linker` e `design.md` da
+/// change `kernel-dynamic-linker`. `elf_test_library_base` primeiro (sem
+/// dependências); `elf_test_library_user` depois, linkada contra o `.so` da
+/// primeira via `-L`/`-l` (produz o `DT_NEEDED` e as relocações
+/// `R_X86_64_JUMP_SLOT` resolvidas entre bibliotecas, exercitados em boot
+/// real). Ambas com `--hash-style=sysv`: o carregador do kernel só
+/// interpreta `DT_HASH` clássico (ver design.md, "Contagem de símbolos via
+/// `DT_HASH`") — passado via `RUSTFLAGS` (não via `.cargo/config.toml`,
+/// que esse target nem declara) para não precisar de flags fixas que
+/// atrapalhariam variar `-L`/`-l` entre as duas bibliotecas.
+fn build_test_libraries(root: &Path) {
+    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let lib_dir = root.join("target/x86_64-java_os_user_pic/release");
+
+    run(Command::new(&cargo)
+        .current_dir(root)
+        .env("RUSTFLAGS", "-C link-arg=--hash-style=sysv")
+        .args([
+            "build",
+            "-p",
+            "elf_test_library_base",
+            "--target",
+            "x86_64-java_os_user_pic.json",
+            "--release",
+            "-Z",
+            "build-std=core",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
+        ]));
+
+    let rustflags = format!("-C link-arg=--hash-style=sysv -L {} -l base", lib_dir.display());
+    run(Command::new(&cargo)
+        .current_dir(root)
+        .env("RUSTFLAGS", rustflags)
+        .args([
+            "build",
+            "-p",
+            "elf_test_library_user",
+            "--target",
+            "x86_64-java_os_user_pic.json",
+            "--release",
+            "-Z",
+            "build-std=core",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
+        ]));
+}
+
+fn test_library_binary(root: &Path, name: &str) -> PathBuf {
+    root.join(format!("target/x86_64-java_os_user_pic/release/lib{name}.so"))
+}
+
 fn find_ovmf() -> PathBuf {
     if let Ok(p) = env::var("OVMF_PATH") {
         return PathBuf::from(p);
@@ -92,6 +145,7 @@ fn find_ovmf() -> PathBuf {
 fn build_image(root: &Path) -> PathBuf {
     build_kernel(root);
     build_test_program(root);
+    build_test_libraries(root);
 
     let dist = root.join("boot/dist");
     fs::create_dir_all(&dist).expect("falha ao criar boot/dist");
@@ -115,7 +169,7 @@ fn build_image(root: &Path) -> PathBuf {
 
     run(Command::new("mformat").args(["-i", &part, "-F", "::"]));
 
-    for dir in ["::/EFI", "::/EFI/BOOT", "::/boot", "::/bin"] {
+    for dir in ["::/EFI", "::/EFI/BOOT", "::/boot", "::/bin", "::/lib"] {
         run(Command::new("mmd").args(["-i", &part, dir]));
     }
 
@@ -123,6 +177,8 @@ fn build_image(root: &Path) -> PathBuf {
     let limine_conf = root.join("boot/limine.conf");
     let kernel_bin = kernel_binary(root);
     let test_program_bin = test_program_binary(root);
+    let test_lib_base = test_library_binary(root, "base");
+    let test_lib_user = test_library_binary(root, "user");
 
     run(Command::new("mcopy").args([
         "-i",
@@ -147,6 +203,18 @@ fn build_image(root: &Path) -> PathBuf {
         &part,
         test_program_bin.to_str().unwrap(),
         "::/bin/test.elf",
+    ]));
+    run(Command::new("mcopy").args([
+        "-i",
+        &part,
+        test_lib_base.to_str().unwrap(),
+        "::/lib/libbase.so",
+    ]));
+    run(Command::new("mcopy").args([
+        "-i",
+        &part,
+        test_lib_user.to_str().unwrap(),
+        "::/lib/libuser.so",
     ]));
 
     eprintln!("Imagem gerada em {}", image_path.display());

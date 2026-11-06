@@ -6,13 +6,14 @@
 > (Referência)"). Ele cobre as 15 áreas de arquitetura do Java OS. Apenas as áreas
 > 1 (Kernel, incluindo interrupções/timer e stack própria com guard page), 2 (Memória,
 > exceto huge pages), 3 (Processos e Threads), 4 (System Calls, exceto isolamento de
-> falhas — ver a seção; o carregador de executáveis ELF64 estáticos já existe), e
-> 12-14 (repositório/build/testes) estão implementadas até o momento (changes
-> `kernel-boot-foundation`, `kernel-memory-management`, `kernel-interrupts-timer`,
-> `kernel-stack-guard-page`, `kernel-process-scheduler`, `kernel-syscalls`,
-> `kernel-posix-virtual-memory`, `kernel-wait-queue`, `kernel-pthread-sync`,
-> `kernel-wall-clock` e `kernel-elf-loader`); as demais ficam registradas aqui
-> para orientar changes futuras.
+> falhas — ver a seção; o carregador de executáveis ELF64 estáticos e o linker
+> dinâmico mínimo já existem), e 12-14 (repositório/build/testes) estão implementadas
+> até o momento (changes `kernel-boot-foundation`, `kernel-memory-management`,
+> `kernel-interrupts-timer`, `kernel-stack-guard-page`, `kernel-process-scheduler`,
+> `kernel-syscalls`, `kernel-posix-virtual-memory`, `kernel-wait-queue`,
+> `kernel-pthread-sync`, `kernel-wall-clock`, `kernel-elf-loader` e
+> `kernel-dynamic-linker`); as demais ficam registradas aqui para orientar changes
+> futuras.
 
 ## 1. Arquitetura do Kernel
 
@@ -241,10 +242,22 @@
   (`kernel::fat32`), mapeia cada segmento `PT_LOAD` com as permissões
   corretas (zerando explicitamente o BSS — achado da change: `Mapper::map_new`
   não zera o frame que aloca) e transfere controle para o ponto de entrada
-  declarado, via `kernel::scheduler::spawn_from_elf`. Ainda sem resolução de
-  símbolo nem bibliotecas dinâmicas (`.so`, `dlopen`/`dlsym`) — fica para a
-  próxima sub-change do roadmap (item 8, linker ELF dinâmico mínimo). Os
-  programas de teste gerados em compilação e copiados para uma página de
+  declarado, via `kernel::scheduler::spawn_from_elf`.
+  **Linker dinâmico**: `kernel::dylib` (change `kernel-dynamic-linker`, ver
+  spec `kernel-dynamic-linker`) carrega bibliotecas compartilhadas ELF64
+  (`ET_DYN`) dentro de um processo já em execução — reaproveita o parsing de
+  `kernel::elf` (que passou a aceitar `ET_DYN` além de `ET_EXEC`), carrega
+  dependências `DT_NEEDED` recursivamente (resolvidas em `/lib/<nome>`),
+  aplica relocações x86-64 (`R_X86_64_RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`64`)
+  de forma eager, e expõe `dlopen`/`dlsym` como *syscalls*. Estado de
+  bibliotecas carregadas é isolado por espaço de endereçamento, chaveado
+  pelo CR3 físico ativo no momento da *syscall*
+  (`kernel::paging::current_root()`) em vez de por um novo rastreamento no
+  escalonador. Ainda sem *lazy binding*, *symbol versioning*, TLS dinâmico,
+  `dlclose`, nem resolução de símbolo contra o executável principal — fica
+  para quando/se necessário durante o porte do HotSpot (próxima sub-change
+  concreta do roadmap, item 8). Os programas de teste gerados em compilação
+  e copiados para uma página de
   usuário em runtime (`kernel::user_demo`, `kernel::user_posix_demo`)
   continuam existindo, usados para provar o mecanismo de `syscall`/`sysret`
   em si, independente do carregador.
@@ -426,8 +439,14 @@ armazenamento e rede — todos implementados.
   change `kernel-elf-loader`**: `kernel::elf` interpreta um ELF64 estático (`ET_EXEC`)
   lido via `kernel::fat32`, mapeia seus segmentos `PT_LOAD` com as permissões corretas
   (BSS zerado explicitamente) e transfere controle para o ponto de entrada, via
-  `kernel::scheduler::spawn_from_elf` — ver seção 4. O linker dinâmico de `.so`
-  propriamente dito é a próxima sub-change concreta do item 8 (ver seção 15).
+  `kernel::scheduler::spawn_from_elf` — ver seção 4. **Entregue pela change
+  `kernel-dynamic-linker`**: o linker dinâmico de `.so` propriamente dito —
+  `kernel::dylib` carrega bibliotecas compartilhadas `ET_DYN` dentro de um
+  processo já em execução, resolve dependências `DT_NEEDED` recursivamente e
+  relocações x86-64 (`RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`64`), e expõe
+  `dlopen`/`dlsym` como *syscalls* — ver seção 4. Sem *lazy binding*,
+  *versioning*, TLS dinâmico nem `dlclose` ainda (mínimo suficiente para
+  provar o mecanismo, não uma `ld.so` completa).
 - Esta change não implementa nenhuma primitiva nova — isso fica inteiramente para a
   change do item 8 do roadmap ("Porte inicial da JVM"), que decide a forma concreta de
   cada primitiva do inventário acima (ex.: syscalls novas vs. extensão das existentes)
@@ -592,10 +611,15 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    mínimo no kernel adotado — ver seção 6. `kernel-elf-loader` (concluída)
    entregou o pré-requisito identificado por essa decisão: o **carregador de
    executável ELF64 estático** (`kernel::elf`/`kernel::scheduler::spawn_from_elf`
-   — ver seção 4), sem relocations/PIE nem bibliotecas dinâmicas. Ainda
-   faltam, nesta ordem: o linker ELF dinâmico mínimo (`.so`, `dlopen`/
-   `dlsym`) propriamente dito, e o próprio porte do HotSpot — ver seção 6
-   para o inventário completo.
+   — ver seção 4), sem relocations/PIE nem bibliotecas dinâmicas.
+   `kernel-dynamic-linker` (concluída) entregou o **linker ELF dinâmico
+   mínimo** propriamente dito: `kernel::dylib` carrega bibliotecas
+   compartilhadas `ET_DYN` dentro de um processo em execução (dependências
+   `DT_NEEDED` recursivas, relocações `RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`64`
+   aplicadas de forma eager, estado isolado por espaço de endereçamento via
+   `kernel::paging::current_root()`), exposto a modo usuário via `dlopen`/
+   `dlsym` — ver seção 4/6. Único passo restante do item 8: o próprio porte
+   do HotSpot sobre todas as primitivas já entregues.
 9. **Modelo híbrido de execução de JVM**: runtime compartilhado vs. JVM isolada por
    aplicação.
 10. **Java OS Platform (Java)**: gerenciamento de arquivos, serviços de sistema, rede,

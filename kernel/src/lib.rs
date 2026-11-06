@@ -4,6 +4,7 @@
 pub mod apic;
 pub mod clock;
 pub mod clock_demo;
+pub mod dylib;
 pub mod elf;
 pub mod fat32;
 pub mod fat32_demo;

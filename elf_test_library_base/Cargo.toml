@@ -1,0 +1,13 @@
+[package]
+name = "elf_test_library_base"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# Nome curto deliberado: o kernel só lê nomes de arquivo 8.3 no FAT32 (ver
+# design.md da change `kernel-dynamic-linker`, achado sobre FAT32 8.3) — o
+# nome da biblioteca (e, portanto, a entrada `DT_NEEDED` que a dependente
+# grava) precisa caber em 8 caracteres + extensão para ser gravado sem
+# truncamento na imagem de disco. O nome do pacote continua descritivo.
+name = "base"
+crate-type = ["cdylib"]

@@ -327,6 +327,14 @@ pub fn spawn_from_elf<S: FrameStore>(
         .map_err(crate::elf::ElfError::FileRead)?;
 
     let header = crate::elf::ElfHeader::parse(&file)?;
+    // `ElfHeader::parse` sozinho aceita `ET_EXEC` e `ET_DYN` (desde a change
+    // `kernel-dynamic-linker`, que reaproveita o parser para bibliotecas
+    // `.so`) — esta capability só carrega executáveis estáticos, então
+    // rejeita `ET_DYN` aqui explicitamente, preservando o comportamento já
+    // coberto pela spec `kernel-elf-loader`.
+    if header.e_type != crate::elf::ET_EXEC {
+        return Err(crate::elf::ElfError::UnsupportedExecutable);
+    }
     let segments = crate::elf::load_program_headers(&file, &header)?;
 
     let address_space = Process::begin_new_user(frame_allocator).map_err(crate::elf::ElfError::Process)?;

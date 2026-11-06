@@ -1,6 +1,8 @@
 //! Interface `syscall`/`sysret` do kernel — ver `design.md` da change
 //! `kernel-syscalls`.
 
+extern crate alloc;
+
 use crate::apic::{rdmsr, wrmsr};
 use crate::gdt::KERNEL_CODE_SELECTOR;
 use crate::paging::PageFlags;
@@ -57,6 +59,16 @@ pub const SYSCALL_COND_NOTIFY_ONE: u64 = 12;
 pub const SYSCALL_COND_NOTIFY_ALL: u64 = 13;
 pub const SYSCALL_CLOCK_WALL: u64 = 14;
 pub const SYSCALL_CLOCK_MONOTONIC: u64 = 15;
+
+/// Ver design.md da change `kernel-dynamic-linker`. `SYSCALL_DLOPEN`:
+/// `arg0`/`arg1` = ponteiro/tamanho do caminho (convenção de
+/// `SYSCALL_WRITE`); retorno = `handle` opaco da biblioteca carregada no
+/// espaço de endereçamento do chamador, ou `SYSCALL_ERROR`.
+/// `SYSCALL_DLSYM`: `arg0` = `handle` devolvido por `SYSCALL_DLOPEN`;
+/// `arg1`/`arg2` = ponteiro/tamanho do nome do símbolo; retorno = endereço
+/// resolvido, ou `SYSCALL_ERROR`.
+pub const SYSCALL_DLOPEN: u64 = 16;
+pub const SYSCALL_DLSYM: u64 = 17;
 
 /// Valor devolvido em `RAX` para um número de chamada não reconhecido, em
 /// vez de executar qualquer serviço — ver spec `kernel-syscalls`, "Despacho
@@ -287,6 +299,61 @@ fn sys_clock_monotonic() -> u64 {
     crate::clock::monotonic_nanos()
 }
 
+/// Carrega a biblioteca compartilhada ELF64 (`ET_DYN`) cujo caminho está em
+/// `ptr`/`len` no espaço de endereçamento do chamador — cobre
+/// `SYSCALL_DLOPEN`. Monta o sistema de arquivos a cada chamada (mesmo
+/// padrão de custo já aceito por `kernel::fat32_demo`/`kernel_main`).
+///
+/// # Safety
+/// `ptr`/`len` vêm diretamente do chamador em modo usuário, sem validação —
+/// mesmo precedente de `sys_write`; UTF-8 inválido é `SYSCALL_ERROR`, não um
+/// pânico.
+unsafe fn sys_dlopen(ptr: u64, len: u64) -> u64 {
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    let Ok(path) = core::str::from_utf8(bytes) else {
+        return SYSCALL_ERROR;
+    };
+
+    let fs = match crate::fat32::mount_boot_partition() {
+        Ok(fs) => fs,
+        Err(_) => return SYSCALL_ERROR,
+    };
+
+    let root = crate::paging::current_root();
+    let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
+    let mut loading_stack = alloc::vec::Vec::new();
+    match crate::dylib::load_library(&mut frame_allocator, root, &fs, path, &mut loading_stack) {
+        Ok(handle) => handle as u64,
+        Err(e) => {
+            // Mesmo padrão de log de erro de outros subsistemas opcionais
+            // (`kernel::storage::init`, `kernel::network::init`): reporta o
+            // motivo exato no console serial para depuração, mas a
+            // *syscall* em si sempre devolve só o sentinela `SYSCALL_ERROR`
+            // — cobre "Falha de Carregamento ou Resolução Não Compromete a
+            // Estabilidade do Kernel" da spec `kernel-dynamic-linker`.
+            crate::serial_println!("dlopen: falha ao carregar {:?}: {:?}", path, e);
+            SYSCALL_ERROR
+        }
+    }
+}
+
+/// Resolve o endereço do símbolo `name_ptr`/`name_len` na biblioteca
+/// identificada por `handle` (devolvido por `SYSCALL_DLOPEN`) no espaço de
+/// endereçamento do chamador — cobre `SYSCALL_DLSYM`.
+///
+/// # Safety
+/// `name_ptr`/`name_len` vêm diretamente do chamador em modo usuário, sem
+/// validação — mesmo precedente de `sys_write`.
+unsafe fn sys_dlsym(handle: u64, name_ptr: u64, name_len: u64) -> u64 {
+    let bytes = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
+    let Ok(name) = core::str::from_utf8(bytes) else {
+        return SYSCALL_ERROR;
+    };
+
+    let root = crate::paging::current_root();
+    crate::dylib::dlsym(root, handle, name).unwrap_or(SYSCALL_ERROR)
+}
+
 /// Despacha uma chamada de sistema pelo número (`RAX` na entrada de
 /// `syscall`), com até quatro argumentos. Devolve o valor de retorno (`RAX`
 /// na saída) — `SYSCALL_ERROR` para um número não reconhecido. `extern "C"`
@@ -315,6 +382,8 @@ unsafe extern "C" fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg
         SYSCALL_COND_NOTIFY_ALL => sys_cond_notify_all(arg0),
         SYSCALL_CLOCK_WALL => sys_clock_wall(),
         SYSCALL_CLOCK_MONOTONIC => sys_clock_monotonic(),
+        SYSCALL_DLOPEN => unsafe { sys_dlopen(arg0, arg1) },
+        SYSCALL_DLSYM => unsafe { sys_dlsym(arg0, arg1, arg2) },
         _ => SYSCALL_ERROR,
     }
 }
