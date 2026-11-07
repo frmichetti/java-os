@@ -11,8 +11,8 @@ prazo — rodar uma JVM e ter uma interface gráfica. Para profundidade técnica
 - `openspec/changes/archive/` — o histórico completo de planejamento (proposta, design,
   tarefas) de cada entrega, uma pasta por change.
 
-Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
-`kernel-fpu-context-switch` e `cxx-minimal-runtime`.
+Atualizado em 2026-11-06, após `kernel-file-syscalls`, `libc-minimal-port`,
+`kernel-fpu-context-switch`, `cxx-minimal-runtime` e `os-javaos-skeleton`.
 
 ## O que já está implementado (verificado em boot real)
 
@@ -95,12 +95,30 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
   classe-base executa a implementação derivada, e um objeto alocado via `new` é
   liberado via `delete` sem corromper nada.
 
+### Esqueleto `os_javaos`/`os_cpu/javaos_zero` do HotSpot
+- Primeiro contato direto com o código-fonte real do HotSpot: 19 arquivos novos em
+  `os/javaos`/`os_cpu/javaos_zero` (variante **Zero** — interpretador puro em C++, sem
+  geração de código de máquina, reaproveitada sem modificação), com assinatura
+  conforme a interface real (`share/runtime/os.hpp`, ~18 métodos `pd_*`) e corpos
+  majoritariamente stub (`fatal()`) (`os-javaos-skeleton`).
+- Todos os 19 arquivos **compilam** contra a árvore real vendorizada (sparse-checkout
+  de `src/hotspot` na tag `jdk-27-ga`, sem o `configure`/`make` do OpenJDK). Nenhuma
+  linha de comportamento real do HotSpot foi implementada — ver destaque abaixo.
+- Achados reais ao longo do caminho: `classfile_constants.h`/`jni_md.h` não são
+  código-fonte de `src/hotspot` (vêm de `src/java.base`, vendorizados pontualmente); o
+  HotSpot não é `-ffreestanding` (aplicação hosted, ao contrário do kernel); a
+  variante Zero depende de `libffi-dev`; e um porte novo de verdade eventualmente
+  precisará editar um arquivo compartilhado do HotSpot (`os.hpp`) para ganhar uma
+  classe auxiliar `os::Javaos` — evitado por ora.
+
 ## O que está previsto
 
 ### Próximo passo imediato
-- **Esqueleto `os_javaos` do HotSpot** (C++): o próprio porte da JVM sobre a libc C, o
-  suporte a ponto flutuante e o runtime C++ já entregues — primeira sub-change do item 8 do
-  roadmap que de fato toca código do HotSpot.
+- Implementar de verdade (não mais stub) os `pd_*` de memória do esqueleto
+  `os_javaos` (`pd_reserve_memory`/`pd_commit_memory`/etc.) sobre as syscalls
+  `SYSCALL_VM_RESERVE`/`COMMIT`/`DECOMMIT`/`PROTECT`/`RELEASE` já existentes — ou
+  vendorizar/instalar um JDK de bootstrap e tentar o `configure` real do OpenJDK
+  apontando para este porte, para descobrir o próximo nível de dependências reais.
 
 ### Médio prazo
 - Reconstruir `libm`/conversão float (`strtod`/`atof`) da libc agora que SSE está
@@ -129,23 +147,31 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
 A base de primitivas de kernel que o HotSpot precisa (inventariada por
 `jvm-posix-compat-strategy`) está **completa**: memória virtual anônima, `pthread_mutex`/
 `pthread_cond`, relógio, sinal de safepoint, carregamento de executável/biblioteca
-dinâmica, E/S de arquivo, uma libc C mínima, ponto flutuante via SSE, e agora um
-runtime C++ mínimo (`new`/`delete`, despacho virtual). O que ainda falta, em ordem de
-dependência:
+dinâmica, E/S de arquivo, uma libc C mínima, ponto flutuante via SSE, um runtime C++
+mínimo (`new`/`delete`, despacho virtual), e agora um esqueleto `os_javaos`/
+`os_cpu/javaos_zero` que compila contra a interface real do HotSpot. O que ainda
+falta, em ordem de dependência:
 
-1. **O esqueleto `os_javaos` em si** — nenhuma linha de código do HotSpot foi integrada
-   ainda; esta é a próxima sub-change do roadmap.
-2. **`libm`/conversão float completa na libc** — o HotSpot usa `double`/`float`
+1. **Implementação de verdade dos `pd_*` do esqueleto `os_javaos`** — hoje são todos
+   `fatal()`/stub (memória, start de thread, etc.); o esqueleto só prova que o porte
+   compila contra o contrato real, não que uma JVM rodaria sobre ele.
+2. **`PlatformMutex`/`PlatformMonitor`/`PlatformEvent`/`PlatformParker` de verdade** —
+   os headers (`mutex_javaos.hpp`/`park_javaos.hpp`) compilam usando os tipos
+   `pthread_mutex_t`/`pthread_cond_t` que o newlib já declara, mas as funções
+   `pthread_mutex_*`/`pthread_cond_*` em si ainda não têm implementação ligada às
+   syscalls de mutex/condvar que o kernel já expõe (sem wrapper em `userland_c/glue.c`).
+3. **`libm`/conversão float completa na libc** — o HotSpot usa `double`/`float`
    extensivamente (são tipos primitivos Java); a libc atual não tem `sin`/`cos`/`sqrt`/
    `strtod` reais (excluídos deliberadamente, não um bug).
-3. **Exceções C++, RTTI e `libstdc++`/STL** — desligados deliberadamente no runtime C++
-   mínimo (`-fno-exceptions -fno-rtti`); se o HotSpot precisar de algum desses (ainda
-   não verificado, já que o código-fonte do HotSpot nem foi vendorizado), vira o escopo
-   de uma sub-change própria.
-4. **Isolamento de falha por processo** — hoje uma JVM que crashasse derrubaria o kernel
+4. **Exceções C++, RTTI e `libstdc++`/STL** — desligados deliberadamente no runtime C++
+   mínimo (`-fno-exceptions -fno-rtti`); o esqueleto `os_javaos` em si não precisou de
+   nenhum dos três, mas isso cobre só a camada `os`/`os_cpu` — o restante do HotSpot
+   (GC, JIT, interpretador) ainda não foi examinado, então se algum deles precisar
+   disso continua sendo o escopo de uma sub-change própria.
+5. **Isolamento de falha por processo** — hoje uma JVM que crashasse derrubaria o kernel
    inteiro junto; aceitável para um "hello world" de prova de conceito, não para um
    sistema de verdade.
-5. Só depois disso: o próprio código-fonte do HotSpot (GC, JIT, interpretador,
+6. Só depois disso: o próprio código-fonte do HotSpot (GC, JIT, interpretador,
    carregamento de classes via o `ClassLoader`) — ainda não escopado em nenhuma change.
 
 ## Destaque: o que falta para uma interface gráfica

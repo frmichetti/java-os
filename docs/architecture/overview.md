@@ -13,8 +13,9 @@
 > `kernel-syscalls`, `kernel-posix-virtual-memory`, `kernel-wait-queue`,
 > `kernel-pthread-sync`, `kernel-wall-clock`, `kernel-elf-loader`,
 > `kernel-dynamic-linker`, `kernel-fat32-filesystem`, `kernel-file-syscalls`,
-> `libc-minimal-port`, `kernel-fpu-context-switch` e `cxx-minimal-runtime`); as demais
-> ficam registradas aqui para orientar changes futuras.
+> `libc-minimal-port`, `kernel-fpu-context-switch`, `cxx-minimal-runtime` e
+> `os-javaos-skeleton`); as demais ficam registradas aqui para orientar changes
+> futuras.
 
 ## 1. Arquitetura do Kernel
 
@@ -533,6 +534,36 @@ armazenamento e rede — todos implementados.
   Verificado em boot real: despacho de método virtual puro através de ponteiro de
   classe-base executa a implementação derivada corretamente, e um objeto alocado via
   `new` através desse ponteiro é liberado via `delete` sem corromper nada.
+- **Esqueleto `os_javaos`/`os_cpu/javaos_zero` — entregue pela change
+  `os-javaos-skeleton`**: primeiro contato direto com o código-fonte real do HotSpot
+  (vendorizado via sparse-checkout de `src/hotspot` na tag `jdk-27-ga`, ~361 MiB,
+  `vendor/jdk-27-ga/`, não versionado no Git). Escopo: 19 arquivos novos em
+  `os/javaos` e `os_cpu/javaos_zero` (a variante Zero — interpretador puro em C++,
+  sem geração de código de máquina, reaproveitada sem modificação de `cpu/zero`),
+  com assinatura conforme a interface real de `share/runtime/os.hpp`/`osThreadBase.hpp`
+  e corpos majoritariamente stub (`fatal()`). Todos os 19 arquivos **compilam**
+  (`-fsyntax-only` contra a árvore real, sem o `configure`/`make` do OpenJDK — ver
+  tabela completa em `design.md` da change arquivada). **Achados reais que exigiram
+  desviar do plano original** (nenhum deles previsto na pesquisa inicial): (1)
+  `classfile_constants.h` não é código-fonte committed — é gerado por `configure`/`make`
+  a partir de um template em `src/java.base/share/native/include/` (fora de
+  `src/hotspot`), resolvido vendorizando esse diretório pontualmente (3 arquivos) e
+  substituindo os placeholders pelos valores reais do JDK 27 (major 71, minor 0); (2)
+  `jni_md.h` idem, vive em `src/java.base/<so>/native/include/`; (3) o HotSpot não é
+  `-ffreestanding` — é uma aplicação hosted, o wrapper de cross-compilação feito para
+  `userland_c/` não serve para compilá-lo; (4) uma lista de macros de build que o
+  `configure` real passaria (família de SO, `ZERO`/`CC_INTERP`, `INCLUDE_ZGC=0`,
+  `INCLUDE_JFR=0`) e a dependência real de `libffi-dev` da variante Zero; (5)
+  `os/bsd/os_bsd.hpp` não reimplementa a interface `os::` inteira, só adiciona uma
+  classe auxiliar — os ~18 métodos `pd_*` já são membros de `os::` compartilhada,
+  definidos fora de linha em `os_javaos.cpp`; (6) `share/runtime/os.hpp`
+  (compartilhado) só prevê uma classe `os::<SO>` para AIX/BSD/LINUX/Windows — um porte
+  novo de verdade precisaria editar esse arquivo compartilhado, evitado por ora porque
+  nada neste esqueleto precisa dela; (7) `javaThread.hpp` exigiu, transitivamente,
+  `mutex_javaos.hpp`/`park_javaos.hpp`/`semaphore_javaos.hpp`/`osThread_javaos.hpp` —
+  os grupos de tarefas "os_cpu" e "os" não são tão independentes quanto o plano
+  assumia. **Não implementado**: nenhuma das primitivas de verdade (memória, threads) —
+  ver próximo item abaixo, que continua pendente.
 - Esta change não implementa nenhuma primitiva nova — isso fica inteiramente para a
   change do item 8 do roadmap ("Porte inicial da JVM"), que decide a forma concreta de
   cada primitiva do inventário acima (ex.: syscalls novas vs. extensão das existentes)
