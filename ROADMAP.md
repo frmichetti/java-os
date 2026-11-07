@@ -12,8 +12,8 @@ prazo — rodar uma JVM e ter uma interface gráfica. Para profundidade técnica
   tarefas) de cada entrega, uma pasta por change.
 
 Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
-`kernel-fpu-context-switch`, `cxx-minimal-runtime`, `os-javaos-skeleton` e
-`os-javaos-memory-pd`.
+`kernel-fpu-context-switch`, `cxx-minimal-runtime`, `os-javaos-skeleton`,
+`os-javaos-memory-pd` e `os-javaos-platform-sync`.
 
 ## O que já está implementado (verificado em boot real)
 
@@ -55,7 +55,9 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
   mecanismo de safepoint de uma JVM) (`kernel-safepoint-signal`).
 - **E/S de arquivo via syscall** (`SYSCALL_OPEN`/`READ`/CLOSE`, handle com cursor de
   leitura sequencial) (`kernel-file-syscalls`).
-- 22 chamadas de sistema no total hoje — todo erro ainda colapsa num único sentinela
+- **Tentativa de aquisição não-bloqueante de mutex nomeado** (`SYSCALL_MUTEX_TRYLOCK`,
+  expõe `kernel::pthread::Mutex::try_acquire`) (`os-javaos-platform-sync`).
+- 23 chamadas de sistema no total hoje — todo erro ainda colapsa num único sentinela
   (`SYSCALL_ERROR`), sem esquema granular estilo `errno`.
 
 ### HAL e drivers (completo desde o item 6 do roadmap)
@@ -133,22 +135,45 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
   (mapeamento de arquivo), `pd_reserve_memory_special` (páginas grandes),
   `pd_realign_memory` (realinhamento).
 
+### `PlatformMutex`/`PlatformMonitor` reais do porte `os_javaos`
+- **`pthread_mutex_init`/`destroy`/`lock`/`unlock`/`trylock` e `pthread_cond_init`/
+  `destroy`/`signal`/`broadcast`/`wait` têm comportamento real** em
+  `userland_c/glue.c`, sobre as syscalls de mutex/condvar que o kernel já expõe —
+  incluindo uma nova syscall (`SYSCALL_MUTEX_TRYLOCK`) para a tentativa de aquisição
+  não-bloqueante, que não tinha primitiva equivalente antes. `destroy` devolve
+  sucesso sem liberar o objeto no kernel (tabelas de handle já não suportam remoção,
+  decisão anterior). Inicialização estática preguiçosa (`PTHREAD_MUTEX_INITIALIZER`/
+  `PTHREAD_COND_INITIALIZER`) suportada, deliberadamente sem proteção contra corrida
+  (seguro hoje — nenhuma syscall de criação de thread existe ainda)
+  (`os-javaos-platform-sync`).
+- **`PlatformMutex`/`PlatformMonitor` (`os/javaos/mutex_javaos.cpp`, novo arquivo —
+  antes nem existia, nem como stub) têm comportamento real** sobre as funções acima:
+  construção/destruição/`lock`/`unlock`/`try_lock` reais, `notify`/`notify_all`
+  reais, e `wait(millis)` real só para `millis == 0` (sem timeout) — `millis != 0`
+  continua `fatal()` explícito, já que nenhuma primitiva de espera com prazo existe
+  no kernel. `PlatformEvent`/`PlatformParker` (`park_javaos.hpp`) continuam fora de
+  escopo, pela mesma razão.
+- Verificado em boot real por um programa C dedicado
+  (`userland_c/javaos_pthread_test_program.c`, carregado como `/bin/jpthread.elf`):
+  round-trip real de mutex (init/lock/trylock/unlock/destroy) e de condvar sem
+  esperador (init/signal/broadcast/destroy). **Não verificado em boot real**:
+  bloqueio real + despertar de `pthread_cond_wait` entre execuções distintas — não
+  existe hoje nenhuma syscall de criação de thread em modo usuário para provar isso
+  com segurança (chamar `cond_wait` sem ninguém para notificar de volta travaria o
+  processo de teste para sempre).
+
 ## O que está previsto
 
 ### Próximo passo imediato
-- **`PlatformMutex`/`PlatformMonitor`/`PlatformEvent`/`PlatformParker` de verdade** —
-  os headers (`mutex_javaos.hpp`/`park_javaos.hpp`) compilam usando os tipos
-  `pthread_mutex_t`/`pthread_cond_t` que o newlib já declara, mas as funções
-  `pthread_mutex_*`/`pthread_cond_*` em si ainda não têm implementação ligada às
-  syscalls de mutex/condvar que o kernel já expõe (sem wrapper em
-  `userland_c/glue.c`) — mesmo padrão de `javaos_vm.h`/`glue.c` recém-criado para as
-  syscalls de VM (`os-javaos-memory-pd`). Alternativa continua valendo:
-  vendorizar/instalar um JDK de bootstrap e tentar o `configure` real do OpenJDK
-  apontando para este porte, para descobrir o próximo nível de dependências reais.
+- **Reconstruir `libm`/conversão float (`strtod`/`atof`) da libc agora que SSE está
+  disponível** (deliberadamente adiado por `libc-minimal-port`) — o HotSpot usa
+  `double`/`float` extensivamente (tipos primitivos Java).
 
 ### Médio prazo
-- Reconstruir `libm`/conversão float (`strtod`/`atof`) da libc agora que SSE está
-  disponível (deliberadamente adiado por `libc-minimal-port`).
+- Primitiva de espera com prazo em `kernel::wait_queue` (temporizador + despertar) —
+  hoje toda espera bloqueante é indefinida, sem parâmetro de tempo; bloqueia
+  `PlatformMonitor::wait(millis != 0)`/`PlatformEvent::park(millis)`/`park_nanos`
+  (`os-javaos-platform-sync`) e qualquer `pthread_cond_timedwait`-like futuro.
 - Isolamento de falha por processo — hoje uma exceção em modo usuário ainda derruba o
   kernel inteiro; depende de um modelo real de término/encerramento de processo.
 - Isolar as tabelas de handle hoje globais (`pthread_handles`, `file_handles`, janela de
@@ -175,9 +200,10 @@ A base de primitivas de kernel que o HotSpot precisa (inventariada por
 `pthread_cond`, relógio, sinal de safepoint, carregamento de executável/biblioteca
 dinâmica, E/S de arquivo, uma libc C mínima, ponto flutuante via SSE, um runtime C++
 mínimo (`new`/`delete`, despacho virtual), um esqueleto `os_javaos`/`os_cpu/javaos_zero`
-que compila contra a interface real do HotSpot, e agora os `pd_*` de memória desse
-esqueleto com comportamento real (`os-javaos-memory-pd`). O que ainda falta, em ordem
-de dependência:
+que compila contra a interface real do HotSpot, os `pd_*` de memória desse esqueleto
+com comportamento real (`os-javaos-memory-pd`), e agora `PlatformMutex`/
+`PlatformMonitor` reais (`os-javaos-platform-sync`). O que ainda falta, em ordem de
+dependência:
 
 1. ~~Implementação de verdade dos `pd_*` do esqueleto `os_javaos`~~ — **concluído
    para memória** (`pd_reserve_memory`/`pd_commit_memory`/`pd_uncommit_memory`/
@@ -185,11 +211,13 @@ de dependência:
    `os-javaos-memory-pd`). Os `pd_*` fora de memória (`pd_start_thread`,
    `pd_create_stack_guard_pages`, `pd_dll_unload`) continuam `fatal()`/stub — cobertos
    pelos itens 2 e seguintes.
-2. **`PlatformMutex`/`PlatformMonitor`/`PlatformEvent`/`PlatformParker` de verdade** —
-   os headers (`mutex_javaos.hpp`/`park_javaos.hpp`) compilam usando os tipos
-   `pthread_mutex_t`/`pthread_cond_t` que o newlib já declara, mas as funções
-   `pthread_mutex_*`/`pthread_cond_*` em si ainda não têm implementação ligada às
-   syscalls de mutex/condvar que o kernel já expõe (sem wrapper em `userland_c/glue.c`).
+2. ~~`PlatformMutex`/`PlatformMonitor`/`PlatformEvent`/`PlatformParker` de verdade~~ —
+   **concluído para `PlatformMutex`/`PlatformMonitor`** (`os-javaos-platform-sync`),
+   incluindo as funções `pthread_mutex_*`/`pthread_cond_*` reais por trás deles e uma
+   nova syscall (`SYSCALL_MUTEX_TRYLOCK`). `PlatformEvent`/`PlatformParker`
+   (`park_javaos.hpp`) continuam fora de escopo — dependem de espera com prazo, que
+   nenhuma primitiva do kernel oferece ainda (ver roadmap médio prazo, "Primitiva de
+   espera com prazo").
 3. **`libm`/conversão float completa na libc** — o HotSpot usa `double`/`float`
    extensivamente (são tipos primitivos Java); a libc atual não tem `sin`/`cos`/`sqrt`/
    `strtod` reais (excluídos deliberadamente, não um bug).

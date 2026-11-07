@@ -418,6 +418,26 @@ extern "C" fn continue_boot() -> ! {
                 kernel::serial_println!("javaos_vm: falha ao montar sistema de arquivos: {:?}", e)
             }
         }
+        // pthread_mutex_*/pthread_cond_* reais de glue.c (change
+        // `os-javaos-platform-sync`) — verifica em boot real a base sobre a
+        // qual os corpos reais de PlatformMutex/PlatformMonitor
+        // (mutex_javaos.cpp) passam a se apoiar. Mesma disciplina de erro
+        // explícito (nunca pânico) dos carregamentos ELF acima.
+        match kernel::fat32::mount_boot_partition() {
+            Ok(fs) => match kernel::scheduler::spawn_from_elf(
+                &mut frame_allocator,
+                &fs,
+                "/bin/jpthread.elf",
+                kernel::scheduler::JAVAOS_PTHREAD_TEST_PROGRAM_STACK_VIRT,
+                kernel::scheduler::JAVAOS_PTHREAD_TEST_PROGRAM_STACK_SIZE,
+            ) {
+                Ok(_) => kernel::serial_println!("javaos_pthread: /bin/jpthread.elf carregado e em execucao"),
+                Err(e) => kernel::serial_println!("javaos_pthread: falha ao carregar /bin/jpthread.elf: {:?}", e),
+            },
+            Err(e) => {
+                kernel::serial_println!("javaos_pthread: falha ao montar sistema de arquivos: {:?}", e)
+            }
+        }
         // Thread de demonstração do teclado (ver `design.md` da change
         // `kernel-keyboard`): compartilha o espaço de endereçamento da
         // thread de boot (não precisa de isolamento próprio), evitando uma

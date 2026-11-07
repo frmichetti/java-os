@@ -88,6 +88,12 @@ pub const SYSCALL_CLOSE: u64 = 20;
 /// chamadora é removida permanentemente da rotação do escalonador.
 pub const SYSCALL_EXIT: u64 = 21;
 
+/// Ver design.md da change `os-javaos-platform-sync`. `arg0` = `handle` de
+/// mutex devolvido por `SYSCALL_MUTEX_CREATE`; retorno = `0` se adquirido
+/// agora, `SYSCALL_ERROR` se já estava tomado ou `handle` desconhecido —
+/// nunca bloqueia a thread chamadora, ao contrário de `SYSCALL_MUTEX_LOCK`.
+pub const SYSCALL_MUTEX_TRYLOCK: u64 = 22;
+
 /// Valor devolvido em `RAX` para um número de chamada não reconhecido, em
 /// vez de executar qualquer serviço — ver spec `kernel-syscalls`, "Despacho
 /// por Número de Chamada".
@@ -238,6 +244,23 @@ fn sys_mutex_lock(handle: u64) -> u64 {
         Some(mutex) => {
             mutex.lock();
             0
+        }
+        None => SYSCALL_ERROR,
+    }
+}
+
+/// Tenta adquirir o mutex identificado por `handle` sem bloquear a thread
+/// chamadora — cobre `SYSCALL_MUTEX_TRYLOCK`. `0` se adquirido agora,
+/// `SYSCALL_ERROR` se já estava tomado (por esta ou por outra thread) ou se
+/// `handle` não corresponder a nenhum mutex criado.
+fn sys_mutex_trylock(handle: u64) -> u64 {
+    match crate::pthread_handles::mutex(handle) {
+        Some(mutex) => {
+            if mutex.try_acquire() {
+                0
+            } else {
+                SYSCALL_ERROR
+            }
         }
         None => SYSCALL_ERROR,
     }
@@ -476,6 +499,7 @@ unsafe extern "C" fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg
         SYSCALL_READ => unsafe { sys_read(arg0, arg1, arg2) },
         SYSCALL_CLOSE => sys_close(arg0),
         SYSCALL_EXIT => sys_exit(),
+        SYSCALL_MUTEX_TRYLOCK => sys_mutex_trylock(arg0),
         _ => SYSCALL_ERROR,
     }
 }
@@ -695,6 +719,31 @@ mod tests {
         // chama `scheduler::with_interrupts_disabled` — ver design.md,
         // "Escopo de testes em host".
         assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_UNLOCK, u64::MAX / 2, 0, 0, 0) }, SYSCALL_ERROR);
+    }
+
+    #[test]
+    fn mutex_trylock_on_a_free_mutex_succeeds_without_touching_the_scheduler() {
+        // Mesma observação de `mutex_create_then_lock_on_a_free_mutex_...`:
+        // `try_acquire` é uma CAS atômica pura, seguro em host.
+        let handle = unsafe { dispatch(SYSCALL_MUTEX_CREATE, 0, 0, 0, 0) };
+        assert_ne!(handle, SYSCALL_ERROR);
+        assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_TRYLOCK, handle, 0, 0, 0) }, 0);
+    }
+
+    #[test]
+    fn mutex_trylock_on_an_already_taken_mutex_fails_without_blocking() {
+        let handle = unsafe { dispatch(SYSCALL_MUTEX_CREATE, 0, 0, 0, 0) };
+        assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_TRYLOCK, handle, 0, 0, 0) }, 0);
+        // Segunda tentativa sobre o mesmo mutex, já tomado pela "thread"
+        // deste teste — deve falhar imediatamente, nunca bloquear (bloquear
+        // travaria o processo de teste em host, sem nenhum escalonador para
+        // acordá-lo).
+        assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_TRYLOCK, handle, 0, 0, 0) }, SYSCALL_ERROR);
+    }
+
+    #[test]
+    fn mutex_trylock_with_an_unknown_handle_returns_error_sentinel() {
+        assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_TRYLOCK, u64::MAX / 2, 0, 0, 0) }, SYSCALL_ERROR);
     }
 
     #[test]

@@ -17,6 +17,24 @@
  * final de cada programa.
  */
 
+/* Achado real durante a implementação (change `os-javaos-platform-sync`):
+ * `pthread.h` do newlib vendorizado envolve TODO o seu conteúdo (protótipos
+ * de função e macros como `PTHREAD_MUTEX_INITIALIZER`) num único
+ * `#if defined(_POSIX_THREADS)` (ver `sys/features.h`) — e esse macro só é
+ * definido automaticamente dentro de blocos específicos de SO
+ * (`__rtems__`/`__XMK__`/`__CYGWIN__`/etc.) que não se aplicam ao alvo
+ * genérico `x86_64-elf` deste projeto (mesma categoria de achado de
+ * `libc-minimal-port` sobre flags de build do newlib). Sem isto, nenhuma
+ * declaração nem macro de `pthread.h` fica visível — definido aqui, não via
+ * flag de build, porque só este arquivo e `javaos_pthread_test_program.c`
+ * precisam de verdade do conteúdo completo de `pthread.h` nesta change.
+ * Seguro: `libc.a` não foi buildado com `--enable-newlib-multithread`
+ * (`scripts/cross/build-newlib.sh`), então não define nenhum símbolo
+ * `pthread_mutex_*`/`pthread_cond_*` próprio que colidiria com os definidos
+ * abaixo. */
+#define _POSIX_THREADS 1
+
+#include <pthread.h>
 #include <stddef.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -43,10 +61,18 @@ extern int errno;
 #define SYS_VM_DECOMMIT 4
 #define SYS_VM_PROTECT 5
 #define SYS_VM_RELEASE 6
+#define SYS_MUTEX_CREATE 7
+#define SYS_MUTEX_LOCK 8
+#define SYS_MUTEX_UNLOCK 9
+#define SYS_COND_CREATE 10
+#define SYS_COND_WAIT 11
+#define SYS_COND_NOTIFY_ONE 12
+#define SYS_COND_NOTIFY_ALL 13
 #define SYS_OPEN 18
 #define SYS_READ 19
 #define SYS_CLOSE 20
 #define SYS_EXIT 21
+#define SYS_MUTEX_TRYLOCK 22
 
 /* SYSCALL_ERROR do kernel é `u64::MAX`, que como `long` assinado de 64 bits
  * é exatamente -1. */
@@ -229,4 +255,129 @@ int javaos_vm_protect(void *addr, size_t bytes, int prot) {
 int javaos_vm_release(void *addr) {
     long r = javaos_syscall(SYS_VM_RELEASE, (long)addr, 0, 0, 0);
     return (r == SYSCALL_ERROR) ? -1 : 0;
+}
+
+/* pthread_mutex_* e pthread_cond_* reais sobre as syscalls de mutex/condvar
+ * do kernel - ver change os-javaos-platform-sync, design.md. Convencao POSIX:
+ * devolvem 0 em sucesso, ou um numero de erro positivo (nunca -1/errno, ao
+ * contrario das funcoes POSIX "tipo syscall" acima). `pthread_mutex_t`/
+ * `pthread_cond_t` ja sao so `uint32_t` opacos no newlib vendorizado -
+ * guardam o handle do kernel diretamente, sem indirecao.
+ *
+ * Inicializacao preguicosa, deliberadamente sem protecao contra corrida:
+ * PTHREAD_MUTEX_INITIALIZER/PTHREAD_COND_INITIALIZER (0xFFFFFFFF) sao
+ * resolvidos para um handle real na primeira chamada. Seguro hoje porque
+ * nenhum processo de usuario pode ter mais de uma thread (nenhuma syscall de
+ * criacao de thread existe ainda) - uma mudanca futura que adicione uma
+ * precisa revisar isto antes de ser considerada completa (ver design.md,
+ * Risks/Trade-offs). */
+
+static int pthread_mutex_resolve(pthread_mutex_t *mutex) {
+    if (*mutex == (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER) {
+        long h = javaos_syscall(SYS_MUTEX_CREATE, 0, 0, 0, 0);
+        if (h == SYSCALL_ERROR) {
+            return EAGAIN;
+        }
+        *mutex = (pthread_mutex_t)h;
+    }
+    return 0;
+}
+
+int pthread_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *attr) {
+    (void)attr; /* sem suporte a atributos (recursivo, compartilhado entre processos, etc.) */
+    long h = javaos_syscall(SYS_MUTEX_CREATE, 0, 0, 0, 0);
+    if (h == SYSCALL_ERROR) {
+        return EAGAIN;
+    }
+    *mutex = (pthread_mutex_t)h;
+    return 0;
+}
+
+int pthread_mutex_destroy(pthread_mutex_t *mutex) {
+    /* Sucesso sem liberar o objeto no kernel - nao existe
+     * SYSCALL_MUTEX_DESTROY, e a tabela de handles do kernel ja nao suporta
+     * remocao (decisao anterior a esta change) - ver design.md. */
+    (void)mutex;
+    return 0;
+}
+
+int pthread_mutex_lock(pthread_mutex_t *mutex) {
+    int err = pthread_mutex_resolve(mutex);
+    if (err != 0) {
+        return err;
+    }
+    long r = javaos_syscall(SYS_MUTEX_LOCK, (long)*mutex, 0, 0, 0);
+    return (r == SYSCALL_ERROR) ? EINVAL : 0;
+}
+
+int pthread_mutex_trylock(pthread_mutex_t *mutex) {
+    int err = pthread_mutex_resolve(mutex);
+    if (err != 0) {
+        return err;
+    }
+    long r = javaos_syscall(SYS_MUTEX_TRYLOCK, (long)*mutex, 0, 0, 0);
+    return (r == SYSCALL_ERROR) ? EBUSY : 0;
+}
+
+int pthread_mutex_unlock(pthread_mutex_t *mutex) {
+    long r = javaos_syscall(SYS_MUTEX_UNLOCK, (long)*mutex, 0, 0, 0);
+    return (r == SYSCALL_ERROR) ? EINVAL : 0;
+}
+
+static int pthread_cond_resolve(pthread_cond_t *cond) {
+    if (*cond == (pthread_cond_t)PTHREAD_COND_INITIALIZER) {
+        long h = javaos_syscall(SYS_COND_CREATE, 0, 0, 0, 0);
+        if (h == SYSCALL_ERROR) {
+            return EAGAIN;
+        }
+        *cond = (pthread_cond_t)h;
+    }
+    return 0;
+}
+
+int pthread_cond_init(pthread_cond_t *cond, const pthread_condattr_t *attr) {
+    (void)attr; /* sem suporte a atributos (clock, compartilhado entre processos) */
+    long h = javaos_syscall(SYS_COND_CREATE, 0, 0, 0, 0);
+    if (h == SYSCALL_ERROR) {
+        return EAGAIN;
+    }
+    *cond = (pthread_cond_t)h;
+    return 0;
+}
+
+int pthread_cond_destroy(pthread_cond_t *cond) {
+    /* Mesma decisao de pthread_mutex_destroy - ver design.md. */
+    (void)cond;
+    return 0;
+}
+
+int pthread_cond_signal(pthread_cond_t *cond) {
+    int err = pthread_cond_resolve(cond);
+    if (err != 0) {
+        return err;
+    }
+    long r = javaos_syscall(SYS_COND_NOTIFY_ONE, (long)*cond, 0, 0, 0);
+    return (r == SYSCALL_ERROR) ? EINVAL : 0;
+}
+
+int pthread_cond_broadcast(pthread_cond_t *cond) {
+    int err = pthread_cond_resolve(cond);
+    if (err != 0) {
+        return err;
+    }
+    long r = javaos_syscall(SYS_COND_NOTIFY_ALL, (long)*cond, 0, 0, 0);
+    return (r == SYSCALL_ERROR) ? EINVAL : 0;
+}
+
+int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
+    int err = pthread_cond_resolve(cond);
+    if (err != 0) {
+        return err;
+    }
+    err = pthread_mutex_resolve(mutex);
+    if (err != 0) {
+        return err;
+    }
+    long r = javaos_syscall(SYS_COND_WAIT, (long)*cond, (long)*mutex, 0, 0);
+    return (r == SYSCALL_ERROR) ? EINVAL : 0;
 }

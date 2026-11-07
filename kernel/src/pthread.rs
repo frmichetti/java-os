@@ -33,8 +33,11 @@ impl Mutex {
     /// Tenta adquirir o mutex sem bloquear — `true` se adquirido agora,
     /// `false` se já estava tomado (sem nenhum efeito colateral nesse
     /// caso). Lógica pura, sem nenhum acesso a `WaitQueue`/escalonador —
-    /// testável em host.
-    fn try_acquire(&self) -> bool {
+    /// testável em host. Exposta a `kernel::syscall::sys_mutex_trylock`
+    /// (change `os-javaos-platform-sync`), que precisa de uma tentativa de
+    /// aquisição que nunca bloqueia — `lock()` (abaixo) é o caminho normal
+    /// para qualquer chamador que aceita bloquear.
+    pub(crate) fn try_acquire(&self) -> bool {
         self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
     }
 
