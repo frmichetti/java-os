@@ -438,6 +438,26 @@ extern "C" fn continue_boot() -> ! {
                 kernel::serial_println!("javaos_pthread: falha ao montar sistema de arquivos: {:?}", e)
             }
         }
+        // libm/conversão float reais (change `libc-float-math`) — verifica
+        // em boot real aritmética double, uma função de libm e
+        // strtod/atof, agora que o toolchain C/C++ habilita SSE. Mesma
+        // disciplina de erro explícito (nunca pânico) dos carregamentos
+        // ELF acima.
+        match kernel::fat32::mount_boot_partition() {
+            Ok(fs) => match kernel::scheduler::spawn_from_elf(
+                &mut frame_allocator,
+                &fs,
+                "/bin/libm.elf",
+                kernel::scheduler::LIBM_TEST_PROGRAM_STACK_VIRT,
+                kernel::scheduler::LIBM_TEST_PROGRAM_STACK_SIZE,
+            ) {
+                Ok(_) => kernel::serial_println!("libm: /bin/libm.elf carregado e em execucao"),
+                Err(e) => kernel::serial_println!("libm: falha ao carregar /bin/libm.elf: {:?}", e),
+            },
+            Err(e) => {
+                kernel::serial_println!("libm: falha ao montar sistema de arquivos: {:?}", e)
+            }
+        }
         // Thread de demonstração do teclado (ver `design.md` da change
         // `kernel-keyboard`): compartilha o espaço de endereçamento da
         // thread de boot (não precisa de isolamento próprio), evitando uma

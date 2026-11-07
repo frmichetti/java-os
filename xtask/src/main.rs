@@ -141,13 +141,23 @@ fn file_syscalls_fixture_path(root: &Path) -> PathBuf {
 /// dinamicamente em vez de fixado.
 fn vendored_newlib_src_dir(root: &Path) -> PathBuf {
     let vendor_dir = root.join("vendor");
+    // Acha só o diretório de <versao> (ex. `newlib-4.6.0.20260123`), nunca
+    // `vendor/newlib-build`/`vendor/newlib-install` (criados por
+    // `scripts/cross/build-newlib.sh`, nunca populados por um checkout real) —
+    // achado real da change `libc-float-math`: `starts_with("newlib-")` sozinho
+    // casava com os três, e `Iterator::find` sobre `fs::read_dir` não tem ordem
+    // garantida, então o diretório errado podia ser escolhido de forma
+    // imprevisível. Exigir um dígito logo após o hífen restringe à árvore de
+    // versão baixada.
     fs::read_dir(&vendor_dir)
         .unwrap_or_else(|e| panic!("falha ao listar {}: {e}", vendor_dir.display()))
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
         .find(|path| {
             path.is_dir()
-                && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("newlib-"))
+                && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.strip_prefix("newlib-").is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+                })
         })
         .unwrap_or_else(|| {
             panic!(
@@ -395,6 +405,84 @@ fn build_javaos_pthread_test_program(root: &Path) -> PathBuf {
     elf_path
 }
 
+/// Compila o programa C de verificação de `libm`/conversão float
+/// (`userland_c/libm_test_program.c`, change `libc-float-math`, design.md):
+/// mesmo mecanismo exato de [`build_javaos_pthread_test_program`]. Sem
+/// `-lm` separada: `scripts/cross/build-newlib.sh` arquiva os objetos de
+/// `newlib/libm` dentro do mesmo `libc.a` (achado real dessa change — ver
+/// seu design.md).
+fn build_libm_test_program(root: &Path) -> PathBuf {
+    let cross_gcc = root.join("scripts/cross/x86_64-elf-gcc");
+    let newlib_build = root.join("vendor/newlib-build/x86_64-elf/newlib");
+    let newlib_libc_a = newlib_build.join("libc.a");
+    if !newlib_libc_a.exists() {
+        panic!(
+            "newlib nao encontrado em {} — rode scripts/cross/build-newlib.sh primeiro (ver README, change `libc-minimal-port`)",
+            newlib_libc_a.display()
+        );
+    }
+    let newlib_src = vendored_newlib_src_dir(root);
+    let targ_include = newlib_build.join("targ-include");
+    let public_include = newlib_src.join("newlib/libc/include");
+
+    let userland_c = root.join("userland_c");
+    let out_dir = root.join("target/userland_c");
+    fs::create_dir_all(&out_dir).expect("falha ao criar target/userland_c");
+
+    let compile = |src: &str, obj_name: &str| {
+        let src_path = userland_c.join(src);
+        let obj_path = out_dir.join(obj_name);
+        run(Command::new(&cross_gcc).args([
+            "-ffreestanding",
+            "-nostdlib",
+            "-isystem",
+            targ_include.to_str().unwrap(),
+            "-isystem",
+            public_include.to_str().unwrap(),
+            "-c",
+            src_path.to_str().unwrap(),
+            "-o",
+            obj_path.to_str().unwrap(),
+        ]));
+        obj_path
+    };
+
+    let crt0_obj = {
+        let obj_path = out_dir.join("crt0.o");
+        run(Command::new(&cross_gcc).args([
+            "-ffreestanding",
+            "-nostdlib",
+            "-c",
+            userland_c.join("crt0.S").to_str().unwrap(),
+            "-o",
+            obj_path.to_str().unwrap(),
+        ]));
+        obj_path
+    };
+    let glue_obj = compile("glue.c", "libm_glue.o");
+    let program_obj = compile("libm_test_program.c", "libm_test_program.o");
+
+    let elf_path = out_dir.join("libm_test_program.elf");
+    run(Command::new(&cross_gcc).args([
+        "-ffreestanding",
+        "-nostdlib",
+        "-static",
+        "-no-pie",
+        "-T",
+        userland_c.join("linker.ld").to_str().unwrap(),
+        crt0_obj.to_str().unwrap(),
+        program_obj.to_str().unwrap(),
+        glue_obj.to_str().unwrap(),
+        "-L",
+        newlib_build.to_str().unwrap(),
+        "-lc",
+        "-o",
+        elf_path.to_str().unwrap(),
+    ]));
+
+    elf_path
+}
+
 /// Compila o programa C++ de verificação do runtime C++ mínimo
 /// (`userland_c/cxx_test_program.cpp`, change `cxx-minimal-runtime`): o
 /// runtime C++ (`cxx_runtime.cpp` — `operator new`/`delete`,
@@ -548,6 +636,7 @@ fn build_image(root: &Path) -> PathBuf {
     let cxx_test_program = build_cxx_test_program(root);
     let javaos_vm_test_program = build_javaos_vm_test_program(root);
     let javaos_pthread_test_program = build_javaos_pthread_test_program(root);
+    let libm_test_program = build_libm_test_program(root);
 
     run(Command::new("mcopy").args([
         "-i",
@@ -614,6 +703,12 @@ fn build_image(root: &Path) -> PathBuf {
         &part,
         javaos_pthread_test_program.to_str().unwrap(),
         "::/bin/jpthread.elf",
+    ]));
+    run(Command::new("mcopy").args([
+        "-i",
+        &part,
+        libm_test_program.to_str().unwrap(),
+        "::/bin/libm.elf",
     ]));
 
     eprintln!("Imagem gerada em {}", image_path.display());

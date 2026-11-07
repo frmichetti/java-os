@@ -13,7 +13,7 @@ prazo — rodar uma JVM e ter uma interface gráfica. Para profundidade técnica
 
 Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
 `kernel-fpu-context-switch`, `cxx-minimal-runtime`, `os-javaos-skeleton`,
-`os-javaos-memory-pd` e `os-javaos-platform-sync`.
+`os-javaos-memory-pd`, `os-javaos-platform-sync` e `libc-float-math`.
 
 ## O que já está implementado (verificado em boot real)
 
@@ -80,12 +80,41 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
 ### Libc C mínima para programas de usuário
 - **newlib retargetado** (sem `libc/sys` próprio — build genérica `x86_64-elf` com um
   arquivo de glue externo sobre as syscalls já existentes), cobrindo `stdio`/`string`/
-  `reent`/`malloc` (via `sbrk`)/E-S de arquivo/término de processo. **Sem ponto
-  flutuante** (`libm` inteira e a conversão `float`/`strtod` ficaram de fora — a ABI
-  x86_64 não compila função alguma com `float`/`double` por valor sob SSE desabilitado,
-  achado real durante a implementação) (`libc-minimal-port`).
+  `reent`/`malloc` (via `sbrk`)/E-S de arquivo/término de processo (`libc-minimal-port`).
 - Verificado em boot real com um programa C de verdade: aloca memória, escreve no
   console, lê um arquivo do disco e termina — tudo via a libc portada.
+
+### `libm`/conversão float reais na libc C
+- **Ponto flutuante real** (`float`/`double` por valor, `libm` inteira —
+  `sin`/`cos`/`sqrt`/`pow`/etc. —, e conversão string↔float — `strtod`/`atof`/`dtoa`)
+  — excluído deliberadamente por `libc-minimal-port` (SSE desabilitado no toolchain
+  C/C++ até então), reconstruído agora que `kernel-fpu-context-switch` tornou SSE
+  seguro em modo usuário. Bastou remover as flags `-mno-sse*` dos wrappers de
+  cross-compilação (`scripts/cross/x86_64-elf-gcc`/`g++`) e rodar o build do newlib
+  de novo — validado empiricamente que o GCC do host em x86_64 já habilita
+  SSE/SSE2 por padrão, sem precisar de nenhuma flag positiva adicional
+  (`libc-float-math`).
+- **Printf/scanf com `%f`/`%e`/`%g` continua deliberadamente fora de escopo** — o
+  HotSpot não depende disso para formatação numérica Java; fica como possível
+  trabalho futuro.
+- **Dois achados reais no próprio `scripts/cross/build-newlib.sh`**, anteriores a
+  esta change mas só descobertos por ela: (1) o script nunca arquivava objetos de
+  `newlib/libm` no `libc.a` final (só olhava `newlib/libc`), então `libm` nunca
+  esteve disponível mesmo quando compilava; (2) a detecção do diretório-fonte do
+  newlib (`NEWLIB_SRC`) também casava com os diretórios de build/instalação
+  (`vendor/newlib-build`/`vendor/newlib-install`, nunca populados), escondido até
+  uma build do zero ser tentada. Ambos corrigidos.
+- **Achado crítico não relacionado a SSE/newlib, em `userland_c/crt0.S`**: `_start`
+  herdava do kernel um `RSP` ajustado para a convenção de "função chamada" da ABI
+  System V, mas `_start` é o ponto de entrada do processo, que a ABI exige começar
+  alinhado a 16 bytes — o descompasso deixava `main` com `RSP` desalinhado em 8
+  bytes, invisível em qualquer programa anterior (nenhum usava SSE) até o primeiro
+  `movaps` real do projeto (`libm_test_program`) causar um `#GP` imediato.
+  Corrigido com `and $-16, %rsp` em `_start`, mesma convenção de `crt0` real
+  (glibc/musl) — sem nenhuma mudança no kernel.
+- Verificado em boot real com um programa C de verdade: aritmética `double`,
+  `sqrt`/`sin`, `strtod`/`atof` — todos com resultado correto; confirmado que os 6
+  programas de teste C/C++ pré-existentes continuam passando sem regressão.
 
 ### Runtime C++ mínimo para programas de usuário
 - **`new`/`delete`, despacho de método virtual** — `operator new`/`operator delete`
@@ -165,15 +194,13 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
 ## O que está previsto
 
 ### Próximo passo imediato
-- **Reconstruir `libm`/conversão float (`strtod`/`atof`) da libc agora que SSE está
-  disponível** (deliberadamente adiado por `libc-minimal-port`) — o HotSpot usa
-  `double`/`float` extensivamente (tipos primitivos Java).
+- **Primitiva de espera com prazo em `kernel::wait_queue`** (temporizador +
+  despertar) — hoje toda espera bloqueante é indefinida, sem parâmetro de tempo;
+  bloqueia `PlatformMonitor::wait(millis != 0)`/`PlatformEvent::park(millis)`/
+  `park_nanos` (`os-javaos-platform-sync`) e qualquer `pthread_cond_timedwait`-like
+  futuro.
 
 ### Médio prazo
-- Primitiva de espera com prazo em `kernel::wait_queue` (temporizador + despertar) —
-  hoje toda espera bloqueante é indefinida, sem parâmetro de tempo; bloqueia
-  `PlatformMonitor::wait(millis != 0)`/`PlatformEvent::park(millis)`/`park_nanos`
-  (`os-javaos-platform-sync`) e qualquer `pthread_cond_timedwait`-like futuro.
 - Isolamento de falha por processo — hoje uma exceção em modo usuário ainda derruba o
   kernel inteiro; depende de um modelo real de término/encerramento de processo.
 - Isolar as tabelas de handle hoje globais (`pthread_handles`, `file_handles`, janela de
@@ -198,12 +225,12 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
 A base de primitivas de kernel que o HotSpot precisa (inventariada por
 `jvm-posix-compat-strategy`) está **completa**: memória virtual anônima, `pthread_mutex`/
 `pthread_cond`, relógio, sinal de safepoint, carregamento de executável/biblioteca
-dinâmica, E/S de arquivo, uma libc C mínima, ponto flutuante via SSE, um runtime C++
-mínimo (`new`/`delete`, despacho virtual), um esqueleto `os_javaos`/`os_cpu/javaos_zero`
-que compila contra a interface real do HotSpot, os `pd_*` de memória desse esqueleto
-com comportamento real (`os-javaos-memory-pd`), e agora `PlatformMutex`/
-`PlatformMonitor` reais (`os-javaos-platform-sync`). O que ainda falta, em ordem de
-dependência:
+dinâmica, E/S de arquivo, uma libc C mínima com ponto flutuante real (`libm`+
+conversão float, `libc-float-math`), um runtime C++ mínimo (`new`/`delete`,
+despacho virtual), um esqueleto `os_javaos`/`os_cpu/javaos_zero` que compila contra
+a interface real do HotSpot, os `pd_*` de memória desse esqueleto com comportamento
+real (`os-javaos-memory-pd`), e `PlatformMutex`/`PlatformMonitor` reais
+(`os-javaos-platform-sync`). O que ainda falta, em ordem de dependência:
 
 1. ~~Implementação de verdade dos `pd_*` do esqueleto `os_javaos`~~ — **concluído
    para memória** (`pd_reserve_memory`/`pd_commit_memory`/`pd_uncommit_memory`/
@@ -216,11 +243,12 @@ dependência:
    incluindo as funções `pthread_mutex_*`/`pthread_cond_*` reais por trás deles e uma
    nova syscall (`SYSCALL_MUTEX_TRYLOCK`). `PlatformEvent`/`PlatformParker`
    (`park_javaos.hpp`) continuam fora de escopo — dependem de espera com prazo, que
-   nenhuma primitiva do kernel oferece ainda (ver roadmap médio prazo, "Primitiva de
-   espera com prazo").
-3. **`libm`/conversão float completa na libc** — o HotSpot usa `double`/`float`
-   extensivamente (são tipos primitivos Java); a libc atual não tem `sin`/`cos`/`sqrt`/
-   `strtod` reais (excluídos deliberadamente, não um bug).
+   nenhuma primitiva do kernel oferece ainda (ver roadmap, "Próximo passo imediato").
+3. ~~`libm`/conversão float completa na libc~~ — **concluído**
+   (`libc-float-math`): `sin`/`cos`/`sqrt`/`pow`/etc. e `strtod`/`atof`/`dtoa` reais,
+   sobre SSE habilitado no toolchain C/C++. `printf`/`scanf` com `%f`/`%e`/`%g`
+   continua deliberadamente fora de escopo (ver roadmap, seção "`libm`/conversão
+   float reais na libc C").
 4. **Exceções C++, RTTI e `libstdc++`/STL** — desligados deliberadamente no runtime C++
    mínimo (`-fno-exceptions -fno-rtti`); o esqueleto `os_javaos` em si não precisou de
    nenhum dos três, mas isso cobre só a camada `os`/`os_cpu` — o restante do HotSpot

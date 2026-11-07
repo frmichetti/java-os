@@ -4,25 +4,27 @@
 # "Wrapper fino sobre o GCC do host sobre um binutils+GCC cross-compilado do
 # zero": host e alvo (Java OS) são ambos x86_64, então um cross-compilador
 # dedicado não é necessário — só suprimir as suposições "hospedadas" do GCC
-# do host via flags, e desabilitar SSE para bater com a ausência de
-# save/restore de FPU/XMM na troca de contexto do kernel (mesmas features do
-# target Rust x86_64-java_os_user.json).
+# do host via flags.
 #
 # Nomeado `x86_64-elf-gcc` (não `x86_64-javaos-gcc`) porque é a convenção de
 # triplo "bare metal genérico" que o sistema de build do newlib já reconhece
 # — ver design.md.
 #
-# Deliberadamente SEM `-msoft-float`: achado confirmado durante a
-# implementação — essa flag não tem nenhum efeito combinada com `-mno-sse`
-# (continua falhando com "SSE register return with SSE disabled" para
-# qualquer função com `float`/`double` por valor; x86_64 não tem uma ABI de
-# soft-float utilizável como ARM tem). Incluí-la sugeriria uma proteção que
-# não existe. `float`/`double` são, portanto, inteiramente fora de escopo
-# desta libc — ver design.md, Non-Goals.
+# SSE/SSE2/SSE3/MMX/x87 HABILITADOS (mudança da change `libc-float-math`):
+# até então este wrapper forçava `-mno-sse -mno-sse2 -mno-sse3 -mno-mmx
+# -mno-80387`, porque o kernel não salvava/restaurava FPU/XMM na troca de
+# contexto — qualquer função com `float`/`double` por valor falhava a
+# compilação ("SSE register return with SSE disabled"; x86_64 não tem uma
+# ABI de soft-float utilizável como ARM tem, então nem `-msoft-float`
+# ajudava). A change `kernel-fpu-context-switch` resolveu a causa raiz
+# (`FXSAVE`/`FXRSTOR` por thread), e `x86_64-java_os_user.json` (o target
+# Rust de modo usuário) já habilita SSE desde então. Esta mudança só alinha
+# o toolchain C/C++ com isso: removidas as flags `-mno-*`, sem adicionar
+# nenhuma flag positiva — o GCC do host em x86_64 já habilita SSE/SSE2 por
+# padrão (confirmado empiricamente, ver design.md de `libc-float-math`).
 exec gcc \
   -ffreestanding \
   -nostdlib \
   -fno-pie -no-pie \
   -fno-stack-protector \
-  -mno-sse -mno-sse2 -mno-sse3 -mno-mmx -mno-80387 \
   "$@"

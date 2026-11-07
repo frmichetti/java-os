@@ -3,16 +3,16 @@
 # alvo são ambos x86_64, nenhum cross-compilador dedicado é necessário) — ver
 # openspec/changes/archive/*-cxx-minimal-runtime/design.md.
 #
-# SSE continua desabilitado aqui de propósito, mesmo depois da change
-# kernel-fpu-context-switch já ter ensinado o kernel a salvar/restaurar
-# FPU/XMM por thread (o que tornaria SSE tecnicamente seguro de usar): esta
-# change entrega só o runtime de linguagem C++ (new/delete, despacho
-# virtual), não decide reabilitar ponto flutuante em todo o toolchain C/C++
-# — isso fica rastreado separadamente em ROADMAP.md ("Reconstruir
-# libm/conversão float da libc agora que SSE está disponível"), já que
-# reabilitar aqui também reabriria a build do newlib (libm excluída
-# deliberadamente por libc-minimal-port). Mesmas flags de sem-SSE do wrapper
-# de C, para o C++ compilado aqui permanecer ABI-compatível com ele.
+# SSE/SSE2/SSE3/MMX/x87 HABILITADOS (mudança da change `libc-float-math`):
+# até então este wrapper forçava as mesmas flags `-mno-sse*` de
+# `x86_64-elf-gcc`, rastreadas desde a própria `cxx-minimal-runtime` como
+# pendentes em ROADMAP.md ("Reconstruir libm/conversão float da libc agora
+# que SSE está disponível"). `kernel-fpu-context-switch` já ensinou o kernel
+# a salvar/restaurar FPU/XMM por thread, e `libc-float-math` reconstruiu o
+# newlib vendorizado (libm + conversão float) sobre isso — removidas aqui as
+# mesmas flags `-mno-*` do wrapper de C, pelo mesmo motivo e sem adicionar
+# nenhuma flag positiva (ver `x86_64-elf-gcc` e design.md de
+# `libc-float-math`).
 #
 # -fno-exceptions -fno-rtti -fno-use-cxa-atexit: achado confirmado
 # empiricamente (ver design.md) — um .cpp com herança/virtual compila e
@@ -24,6 +24,5 @@ exec g++ \
   -nostdlib \
   -fno-pie -no-pie \
   -fno-stack-protector \
-  -mno-sse -mno-sse2 -mno-sse3 -mno-mmx -mno-80387 \
   -fno-exceptions -fno-rtti -fno-use-cxa-atexit \
   "$@"
