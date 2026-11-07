@@ -398,6 +398,26 @@ extern "C" fn continue_boot() -> ! {
                 kernel::serial_println!("runtime c++ minimo: falha ao montar sistema de arquivos: {:?}", e)
             }
         }
+        // API javaos_vm.h/glue.c sobre as syscalls de VM (change
+        // `os-javaos-memory-pd`) — verifica em boot real a base sobre a qual
+        // os pd_* reais de os_javaos.cpp passam a se apoiar. Mesma
+        // disciplina de erro explícito (nunca pânico) dos carregamentos ELF
+        // acima.
+        match kernel::fat32::mount_boot_partition() {
+            Ok(fs) => match kernel::scheduler::spawn_from_elf(
+                &mut frame_allocator,
+                &fs,
+                "/bin/javaosvm.elf",
+                kernel::scheduler::JAVAOS_VM_TEST_PROGRAM_STACK_VIRT,
+                kernel::scheduler::JAVAOS_VM_TEST_PROGRAM_STACK_SIZE,
+            ) {
+                Ok(_) => kernel::serial_println!("javaos_vm: /bin/javaosvm.elf carregado e em execucao"),
+                Err(e) => kernel::serial_println!("javaos_vm: falha ao carregar /bin/javaosvm.elf: {:?}", e),
+            },
+            Err(e) => {
+                kernel::serial_println!("javaos_vm: falha ao montar sistema de arquivos: {:?}", e)
+            }
+        }
         // Thread de demonstração do teclado (ver `design.md` da change
         // `kernel-keyboard`): compartilha o espaço de endereçamento da
         // thread de boot (não precisa de isolamento próprio), evitando uma

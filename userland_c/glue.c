@@ -22,6 +22,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "include/javaos_vm.h"
+
 /* `newlib/libc/reent/*.c` (ex. readr.c) declara `errno` como um `extern
  * int` simples, nao via a macro reentrante de <errno.h> - precisamos
  * atualizar exatamente esse simbolo simples, nao `*__errno()`, para que o
@@ -38,6 +40,9 @@ extern int errno;
 #define SYS_WRITE 0
 #define SYS_VM_RESERVE 2
 #define SYS_VM_COMMIT 3
+#define SYS_VM_DECOMMIT 4
+#define SYS_VM_PROTECT 5
+#define SYS_VM_RELEASE 6
 #define SYS_OPEN 18
 #define SYS_READ 19
 #define SYS_CLOSE 20
@@ -191,4 +196,37 @@ int kill(int pid, int sig) {
 
 int getpid(void) {
     return 1; /* sem PIDs reais ainda — único "processo" do ponto de vista desta libc */
+}
+
+/* Implementação das cinco operações de VM declaradas em include/javaos_vm.h
+ * — ver change os-javaos-memory-pd, design.md. `prot` já chega na mesma
+ * convenção que kernel::syscall::prot_to_page_flags espera (bit 0 =
+ * gravável, bit 1 = executável), repassado sem tradução. */
+
+void *javaos_vm_reserve(size_t bytes) {
+    long base = javaos_syscall(SYS_VM_RESERVE, (long)bytes, 0, 0, 0);
+    if (base == SYSCALL_ERROR) {
+        return NULL;
+    }
+    return (void *)base;
+}
+
+int javaos_vm_commit(void *addr, size_t bytes, int prot) {
+    long r = javaos_syscall(SYS_VM_COMMIT, (long)addr, (long)bytes, prot, 0);
+    return (r == SYSCALL_ERROR) ? -1 : 0;
+}
+
+int javaos_vm_decommit(void *addr, size_t bytes) {
+    long r = javaos_syscall(SYS_VM_DECOMMIT, (long)addr, (long)bytes, 0, 0);
+    return (r == SYSCALL_ERROR) ? -1 : 0;
+}
+
+int javaos_vm_protect(void *addr, size_t bytes, int prot) {
+    long r = javaos_syscall(SYS_VM_PROTECT, (long)addr, (long)bytes, prot, 0);
+    return (r == SYSCALL_ERROR) ? -1 : 0;
+}
+
+int javaos_vm_release(void *addr) {
+    long r = javaos_syscall(SYS_VM_RELEASE, (long)addr, 0, 0, 0);
+    return (r == SYSCALL_ERROR) ? -1 : 0;
 }

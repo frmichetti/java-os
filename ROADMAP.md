@@ -11,8 +11,9 @@ prazo — rodar uma JVM e ter uma interface gráfica. Para profundidade técnica
 - `openspec/changes/archive/` — o histórico completo de planejamento (proposta, design,
   tarefas) de cada entrega, uma pasta por change.
 
-Atualizado em 2026-11-06, após `kernel-file-syscalls`, `libc-minimal-port`,
-`kernel-fpu-context-switch`, `cxx-minimal-runtime` e `os-javaos-skeleton`.
+Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
+`kernel-fpu-context-switch`, `cxx-minimal-runtime`, `os-javaos-skeleton` e
+`os-javaos-memory-pd`.
 
 ## O que já está implementado (verificado em boot real)
 
@@ -102,8 +103,7 @@ Atualizado em 2026-11-06, após `kernel-file-syscalls`, `libc-minimal-port`,
   conforme a interface real (`share/runtime/os.hpp`, ~18 métodos `pd_*`) e corpos
   majoritariamente stub (`fatal()`) (`os-javaos-skeleton`).
 - Todos os 19 arquivos **compilam** contra a árvore real vendorizada (sparse-checkout
-  de `src/hotspot` na tag `jdk-27-ga`, sem o `configure`/`make` do OpenJDK). Nenhuma
-  linha de comportamento real do HotSpot foi implementada — ver destaque abaixo.
+  de `src/hotspot` na tag `jdk-27-ga`, sem o `configure`/`make` do OpenJDK).
 - Achados reais ao longo do caminho: `classfile_constants.h`/`jni_md.h` não são
   código-fonte de `src/hotspot` (vêm de `src/java.base`, vendorizados pontualmente); o
   HotSpot não é `-ffreestanding` (aplicação hosted, ao contrário do kernel); a
@@ -111,12 +111,38 @@ Atualizado em 2026-11-06, após `kernel-file-syscalls`, `libc-minimal-port`,
   precisará editar um arquivo compartilhado do HotSpot (`os.hpp`) para ganhar uma
   classe auxiliar `os::Javaos` — evitado por ora.
 
+### `pd_*` de memória reais do esqueleto `os_javaos`
+- **Os seis hooks de memória com primitiva de kernel equivalente têm comportamento
+  real** (não mais `fatal()`): `pd_reserve_memory`, `pd_commit_memory` (2
+  sobrecargas), `pd_commit_memory_or_exit` (2 sobrecargas), `pd_uncommit_memory`,
+  `pd_release_memory`, e `os::protect_memory` (achado real: esta função nem existia
+  no esqueleto original, não era "só" stub) — todos sobre uma nova API em C
+  (`userland_c/include/javaos_vm.h`/`glue.c`) que encapsula as cinco syscalls de VM
+  já existentes (`SYSCALL_VM_RESERVE`/`COMMIT`/`DECOMMIT`/`PROTECT`/`RELEASE`)
+  (`os-javaos-memory-pd`).
+- Verificado em boot real por um programa C dedicado (`userland_c/javaos_vm_test_program.c`,
+  carregado como `/bin/javaosvm.elf` via o carregador ELF já existente): reservar,
+  comprometer, escrever/reler, proteger como somente leitura, descomprometer, liberar,
+  e dois casos de erro — tudo confirmado via a mesma API em C que os corpos reais de
+  `os_javaos.cpp` usam. A tradução C++ de `os_javaos.cpp` em si continua verificada só
+  por compilação (`-fsyntax-only` contra os headers reais do HotSpot) — linkar/rodar o
+  arquivo real do HotSpot continua fora de escopo (ver destaque abaixo).
+- `pd_*` de memória sem primitiva de kernel equivalente continuam `fatal()`
+  explícito, comportamento inalterado: `pd_attempt_reserve_memory_at` (endereço
+  fixo), `pd_attempt_map_memory_to_file_at`/`pd_map_memory`/`pd_unmap_memory`
+  (mapeamento de arquivo), `pd_reserve_memory_special` (páginas grandes),
+  `pd_realign_memory` (realinhamento).
+
 ## O que está previsto
 
 ### Próximo passo imediato
-- Implementar de verdade (não mais stub) os `pd_*` de memória do esqueleto
-  `os_javaos` (`pd_reserve_memory`/`pd_commit_memory`/etc.) sobre as syscalls
-  `SYSCALL_VM_RESERVE`/`COMMIT`/`DECOMMIT`/`PROTECT`/`RELEASE` já existentes — ou
+- **`PlatformMutex`/`PlatformMonitor`/`PlatformEvent`/`PlatformParker` de verdade** —
+  os headers (`mutex_javaos.hpp`/`park_javaos.hpp`) compilam usando os tipos
+  `pthread_mutex_t`/`pthread_cond_t` que o newlib já declara, mas as funções
+  `pthread_mutex_*`/`pthread_cond_*` em si ainda não têm implementação ligada às
+  syscalls de mutex/condvar que o kernel já expõe (sem wrapper em
+  `userland_c/glue.c`) — mesmo padrão de `javaos_vm.h`/`glue.c` recém-criado para as
+  syscalls de VM (`os-javaos-memory-pd`). Alternativa continua valendo:
   vendorizar/instalar um JDK de bootstrap e tentar o `configure` real do OpenJDK
   apontando para este porte, para descobrir o próximo nível de dependências reais.
 
@@ -148,13 +174,17 @@ A base de primitivas de kernel que o HotSpot precisa (inventariada por
 `jvm-posix-compat-strategy`) está **completa**: memória virtual anônima, `pthread_mutex`/
 `pthread_cond`, relógio, sinal de safepoint, carregamento de executável/biblioteca
 dinâmica, E/S de arquivo, uma libc C mínima, ponto flutuante via SSE, um runtime C++
-mínimo (`new`/`delete`, despacho virtual), e agora um esqueleto `os_javaos`/
-`os_cpu/javaos_zero` que compila contra a interface real do HotSpot. O que ainda
-falta, em ordem de dependência:
+mínimo (`new`/`delete`, despacho virtual), um esqueleto `os_javaos`/`os_cpu/javaos_zero`
+que compila contra a interface real do HotSpot, e agora os `pd_*` de memória desse
+esqueleto com comportamento real (`os-javaos-memory-pd`). O que ainda falta, em ordem
+de dependência:
 
-1. **Implementação de verdade dos `pd_*` do esqueleto `os_javaos`** — hoje são todos
-   `fatal()`/stub (memória, start de thread, etc.); o esqueleto só prova que o porte
-   compila contra o contrato real, não que uma JVM rodaria sobre ele.
+1. ~~Implementação de verdade dos `pd_*` do esqueleto `os_javaos`~~ — **concluído
+   para memória** (`pd_reserve_memory`/`pd_commit_memory`/`pd_uncommit_memory`/
+   `pd_release_memory`/`os::protect_memory` sobre as syscalls de VM já existentes,
+   `os-javaos-memory-pd`). Os `pd_*` fora de memória (`pd_start_thread`,
+   `pd_create_stack_guard_pages`, `pd_dll_unload`) continuam `fatal()`/stub — cobertos
+   pelos itens 2 e seguintes.
 2. **`PlatformMutex`/`PlatformMonitor`/`PlatformEvent`/`PlatformParker` de verdade** —
    os headers (`mutex_javaos.hpp`/`park_javaos.hpp`) compilam usando os tipos
    `pthread_mutex_t`/`pthread_cond_t` que o newlib já declara, mas as funções
