@@ -49,3 +49,22 @@ Uma notificação enviada a uma variável de condição enquanto o chamador det�
 #### Scenario: Notificação concorrente com o início da espera não se perde
 - **WHEN** uma thread notifica a variável de condição exatamente enquanto detém o mutex associado, e outra thread está no processo de começar a esperar na mesma condição (tendo liberado o mesmo mutex como parte dessa chamada)
 - **THEN** a notificação SHALL alcançar essa thread (ela desperta), em vez de ser perdida por ela ainda não estar oficialmente registrada como em espera
+
+### Requirement: Variável de Condição com Espera Limitada por Prazo
+O kernel SHALL fornecer uma variante da espera em variável de condição que aceita um
+prazo máximo, liberando e reaquirindo o mutex associado com a mesma atomicidade da
+espera sem prazo, e retornando quando notificada ou quando o prazo expirar, o que
+ocorrer primeiro.
+
+#### Scenario: Espera com prazo notificada antes de expirar reaquire o mutex normalmente
+- **WHEN** uma thread chama a espera com prazo, detendo um mutex no momento da
+  chamada, e é notificada antes do prazo expirar
+- **THEN** a chamada SHALL retornar indicando que foi notificada, com o mesmo mutex
+  associado novamente detido pela thread chamadora
+
+#### Scenario: Espera com prazo que expira sem notificação também reaquire o mutex
+- **WHEN** uma thread chama a espera com prazo, detendo um mutex no momento da
+  chamada, e nenhuma notificação a alcança antes do prazo expirar
+- **THEN** a chamada SHALL retornar indicando que o prazo expirou, com o mesmo mutex
+  associado novamente detido pela thread chamadora (mesma garantia de reaquisição da
+  espera sem prazo)

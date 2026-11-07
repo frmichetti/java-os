@@ -99,6 +99,12 @@ pub const SYSCALL_MUTEX_TRYLOCK: u64 = 22;
 /// por Número de Chamada".
 pub const SYSCALL_ERROR: u64 = u64::MAX;
 
+/// Valor devolvido em `RAX` por `SYSCALL_COND_WAIT` quando o prazo pedido
+/// (terceiro argumento, `timeout_nanos`) expira antes de qualquer
+/// notificação — distinto de `SYSCALL_ERROR` (handle desconhecido) e de `0`
+/// (notificada) — ver design.md da change `kernel-timed-wait`.
+pub const SYSCALL_TIMEOUT: u64 = u64::MAX - 1;
+
 /// Escreve `len` bytes a partir de `ptr` (endereço do chamador, modo
 /// usuário) no console serial do kernel. Devolve a quantidade de bytes
 /// escritos.
@@ -286,19 +292,28 @@ fn sys_cond_create() -> u64 {
 }
 
 /// Libera `mutex_handle` e bloqueia a thread chamadora em `cond_handle`,
-/// reaquirindo o mesmo mutex antes de retornar quando notificada — cobre
-/// `SYSCALL_COND_WAIT`. `SYSCALL_ERROR` se `cond_handle` ou `mutex_handle`
-/// não corresponderem a objetos criados, sem bloquear a thread chamadora nem
-/// alterar o estado do mutex nesse caso.
-fn sys_cond_wait(cond_handle: u64, mutex_handle: u64) -> u64 {
+/// reaquirindo o mesmo mutex antes de retornar quando notificada ou quando
+/// `timeout_nanos` expirar — cobre `SYSCALL_COND_WAIT`. `timeout_nanos == 0`
+/// preserva exatamente o comportamento original (espera indefinida, mesmo
+/// valor que todo chamador já existente desta syscall sempre passou aqui) —
+/// ver design.md da change `kernel-timed-wait`. `SYSCALL_ERROR` se
+/// `cond_handle` ou `mutex_handle` não corresponderem a objetos criados, sem
+/// bloquear a thread chamadora nem alterar o estado do mutex nesse caso;
+/// `SYSCALL_TIMEOUT` se `timeout_nanos > 0` e o prazo expirar antes de
+/// qualquer notificação.
+fn sys_cond_wait(cond_handle: u64, mutex_handle: u64, timeout_nanos: u64) -> u64 {
     let Some(cond) = crate::pthread_handles::cond(cond_handle) else {
         return SYSCALL_ERROR;
     };
     let Some(mutex) = crate::pthread_handles::mutex(mutex_handle) else {
         return SYSCALL_ERROR;
     };
-    cond.wait(mutex);
-    0
+    if timeout_nanos == 0 {
+        cond.wait(mutex);
+        return 0;
+    }
+    let deadline = crate::clock::monotonic_nanos() + timeout_nanos;
+    if cond.wait_timeout(mutex, deadline) { 0 } else { SYSCALL_TIMEOUT }
 }
 
 /// Acorda a thread esperando há mais tempo na variável de condição
@@ -488,7 +503,7 @@ unsafe extern "C" fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg
         SYSCALL_MUTEX_LOCK => sys_mutex_lock(arg0),
         SYSCALL_MUTEX_UNLOCK => sys_mutex_unlock(arg0),
         SYSCALL_COND_CREATE => sys_cond_create(),
-        SYSCALL_COND_WAIT => sys_cond_wait(arg0, arg1),
+        SYSCALL_COND_WAIT => sys_cond_wait(arg0, arg1, arg2),
         SYSCALL_COND_NOTIFY_ONE => sys_cond_notify_one(arg0),
         SYSCALL_COND_NOTIFY_ALL => sys_cond_notify_all(arg0),
         SYSCALL_CLOCK_WALL => sys_clock_wall(),
@@ -504,22 +519,28 @@ unsafe extern "C" fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg
     }
 }
 
-/// Escrita (pela rotina de entrada em assembly) e leitura (nunca, por
-/// enquanto) de um único valor: o `RSP` de modo usuário da chamada em
-/// andamento, salvo antes de trocar para a stack de kernel confiável e
-/// restaurado logo antes de `sysretq`. Seguro como `static mut` simples
-/// (sem lock): o kernel é single-core e `SFMASK` mascara `IF` durante toda
-/// a janela em que este valor está "emprestado" (ver design.md — "Stack de
-/// kernel confiável"), então não há reentrância possível.
-#[unsafe(no_mangle)]
-static mut SYSCALL_USER_RSP_SCRATCH: u64 = 0;
-
 core::arch::global_asm!(
     ".global syscall_entry",
     "syscall_entry:",
     // RCX = RIP de retorno, R11 = RFLAGS do chamador (hardware). RSP ainda
     // é o do usuário (não confiável) — salva antes de qualquer outra coisa.
-    "mov [SYSCALL_USER_RSP_SCRATCH], rsp",
+    //
+    // Guardado no slot *por-thread* apontado por `CURRENT_SYSCALL_RSP_SLOT`
+    // (`kernel::scheduler`) — nunca numa única `static` global: uma syscall
+    // bloqueante (`WaitQueue::commit_block`, ex. `SYSCALL_COND_WAIT`) cede a
+    // CPU para uma thread completamente diferente, que também pode fazer
+    // suas próprias syscalls antes desta ser despertada de novo. Uma única
+    // global seria sobrescrita nesse meio tempo, devolvendo a esta thread o
+    // `RSP` de usuário de outra — achado real em boot durante a change
+    // `kernel-timed-wait`, registrado em `KNOW_ISSUES.md`.
+    //
+    // R10 (A3 do chamador) é copiado para R8 primeiro, liberando R10 como
+    // registrador temporário para guardar o endereço do slot. RAX (número da
+    // syscall) ainda precisa sobreviver até `mov rdi, rax`, mais abaixo —
+    // nunca usado como temporário aqui.
+    "mov r8, r10", // a3 (5o parametro de dispatch) — adiantado para liberar R10
+    "mov r10, [CURRENT_SYSCALL_RSP_SLOT]",
+    "mov [r10], rsp",
     "mov rsp, [CURRENT_KERNEL_STACK_TOP]",
     // RSP acabou de ser realinhado a partir de um topo de stack (múltiplo
     // de 16); dois `push` de 8 bytes mantêm o alinhamento exigido pela ABI
@@ -529,10 +550,10 @@ core::arch::global_asm!(
     "push rcx", // RIP do usuário
     "push r11", // RFLAGS do usuário
     // Reorganiza os argumentos da convenção desta syscall (número em RAX,
-    // argumentos em RDI/RSI/RDX/R10) para a convenção System V de
-    // `dispatch` (RDI/RSI/RDX/RCX/R8) — do último parâmetro para o
-    // primeiro, para nunca sobrescrever uma fonte antes de lê-la.
-    "mov r8, r10",
+    // argumentos em RDI/RSI/RDX, R10 já copiado para R8 acima) para a
+    // convenção System V de `dispatch` (RDI/RSI/RDX/RCX/R8) — do último
+    // parâmetro para o primeiro, para nunca sobrescrever uma fonte antes de
+    // lê-la.
     "mov rcx, rdx",
     "mov rdx, rsi",
     "mov rsi, rdi",
@@ -540,7 +561,15 @@ core::arch::global_asm!(
     "call dispatch",
     "pop r11",
     "pop rcx",
-    "mov rsp, [SYSCALL_USER_RSP_SCRATCH]",
+    // Mesmo slot por-thread de cima — `CURRENT_SYSCALL_RSP_SLOT` já aponta
+    // para o slot desta própria thread neste ponto, mesmo que `dispatch`
+    // tenha bloqueado e cedido a CPU para outras threads no meio do caminho
+    // (`schedule_next` sempre a atualiza para a thread que está de fato
+    // retomando). R10 está livre aqui (indefinido depois de `call dispatch`,
+    // mesmo raciocínio de R8/R9/RDI/RSI/RDX/RAX — nenhum valor de usuário
+    // depende de sobreviver neles através de uma syscall).
+    "mov r10, [CURRENT_SYSCALL_RSP_SLOT]",
+    "mov rsp, [r10]",
     "sysretq",
 );
 
@@ -763,6 +792,23 @@ mod tests {
     fn cond_wait_with_an_unknown_mutex_handle_returns_error_sentinel() {
         let cond_handle = unsafe { dispatch(SYSCALL_COND_CREATE, 0, 0, 0, 0) };
         let result = unsafe { dispatch(SYSCALL_COND_WAIT, cond_handle, u64::MAX / 2, 0, 0) };
+        assert_eq!(result, SYSCALL_ERROR);
+    }
+
+    #[test]
+    fn cond_wait_with_an_unknown_cond_handle_returns_error_sentinel_regardless_of_timeout() {
+        // Mesmo teste de `..._without_touching_the_mutex` acima, mas com um
+        // prazo > 0 — o handle desconhecido deve ser rejeitado antes de
+        // qualquer lógica de prazo entrar em jogo (change `kernel-timed-wait`).
+        let mutex_handle = unsafe { dispatch(SYSCALL_MUTEX_CREATE, 0, 0, 0, 0) };
+        let result = unsafe { dispatch(SYSCALL_COND_WAIT, u64::MAX / 2, mutex_handle, 1_000_000, 0) };
+        assert_eq!(result, SYSCALL_ERROR);
+    }
+
+    #[test]
+    fn cond_wait_with_an_unknown_mutex_handle_returns_error_sentinel_regardless_of_timeout() {
+        let cond_handle = unsafe { dispatch(SYSCALL_COND_CREATE, 0, 0, 0, 0) };
+        let result = unsafe { dispatch(SYSCALL_COND_WAIT, cond_handle, u64::MAX / 2, 1_000_000, 0) };
         assert_eq!(result, SYSCALL_ERROR);
     }
 

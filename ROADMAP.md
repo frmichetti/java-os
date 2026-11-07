@@ -178,27 +178,34 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
 - **`PlatformMutex`/`PlatformMonitor` (`os/javaos/mutex_javaos.cpp`, novo arquivo —
   antes nem existia, nem como stub) têm comportamento real** sobre as funções acima:
   construção/destruição/`lock`/`unlock`/`try_lock` reais, `notify`/`notify_all`
-  reais, e `wait(millis)` real só para `millis == 0` (sem timeout) — `millis != 0`
-  continua `fatal()` explícito, já que nenhuma primitiva de espera com prazo existe
-  no kernel. `PlatformEvent`/`PlatformParker` (`park_javaos.hpp`) continuam fora de
-  escopo, pela mesma razão.
-- Verificado em boot real por um programa C dedicado
-  (`userland_c/javaos_pthread_test_program.c`, carregado como `/bin/jpthread.elf`):
-  round-trip real de mutex (init/lock/trylock/unlock/destroy) e de condvar sem
-  esperador (init/signal/broadcast/destroy). **Não verificado em boot real**:
-  bloqueio real + despertar de `pthread_cond_wait` entre execuções distintas — não
-  existe hoje nenhuma syscall de criação de thread em modo usuário para provar isso
-  com segurança (chamar `cond_wait` sem ninguém para notificar de volta travaria o
-  processo de teste para sempre).
+  reais, e **`wait(millis)` real tanto para `millis == 0` (sem prazo) quanto para
+  `millis != 0`** (com prazo, sobre a primitiva de espera com prazo do kernel —
+  `kernel-timed-wait`) — devolve `OS_OK`/`OS_TIMEOUT` conforme o caso.
+  `PlatformEvent`/`PlatformParker` (`park_javaos.hpp`) continuam fora de escopo:
+  dependem de um protocolo mais complexo (`REL_INDEX`/`ABS_INDEX`, dois condvars,
+  `_counter`), consumidor separado da primitiva de prazo já entregue.
+- Verificado em boot real por dois programas C dedicados
+  (`userland_c/javaos_pthread_test_program.c`, carregado como `/bin/jpthread.elf`;
+  `userland_c/timedwait_test_program.c`, carregado como `/bin/timedw.elf`):
+  round-trip real de mutex (init/lock/trylock/unlock/destroy), de condvar sem
+  esperador (init/signal/broadcast/destroy), e do **caminho de expiração** de
+  `pthread_cond_timedwait` (prazo de 50 ms sem notificador, confirmando `ETIMEDOUT`
+  e tempo decorrido compatível). **Não verificado em boot real**: bloqueio real +
+  despertar por notificação (`pthread_cond_wait`/`pthread_cond_timedwait` antes do
+  prazo) entre execuções distintas — não existe hoje nenhuma syscall de criação de
+  thread em modo usuário para provar isso com segurança (chamar `cond_wait` sem
+  ninguém para notificar de volta travaria o processo de teste para sempre).
 
 ## O que está previsto
 
 ### Próximo passo imediato
-- **Primitiva de espera com prazo em `kernel::wait_queue`** (temporizador +
-  despertar) — hoje toda espera bloqueante é indefinida, sem parâmetro de tempo;
-  bloqueia `PlatformMonitor::wait(millis != 0)`/`PlatformEvent::park(millis)`/
-  `park_nanos` (`os-javaos-platform-sync`) e qualquer `pthread_cond_timedwait`-like
-  futuro.
+- **`PlatformEvent`/`PlatformParker` reais do porte `os_javaos`** (`park_javaos.hpp`)
+  — agora que a primitiva de espera com prazo existe de verdade no kernel
+  (`kernel-timed-wait`), esta é a última peça pendente da sincronização de baixo
+  nível que o HotSpot precisa. Protocolo mais complexo que `PlatformMonitor::wait`:
+  `REL_INDEX`/`ABS_INDEX`, dois condvars, um contador (`_counter`) com semântica
+  própria de "unpark antes do park não se perde" — merece sua própria change,
+  consumidora direta de `CondVar::wait_timeout`/`SYSCALL_COND_WAIT` já entregues.
 
 ### Médio prazo
 - Isolamento de falha por processo — hoje uma exceção em modo usuário ainda derruba o
@@ -239,11 +246,14 @@ real (`os-javaos-memory-pd`), e `PlatformMutex`/`PlatformMonitor` reais
    `pd_create_stack_guard_pages`, `pd_dll_unload`) continuam `fatal()`/stub — cobertos
    pelos itens 2 e seguintes.
 2. ~~`PlatformMutex`/`PlatformMonitor`/`PlatformEvent`/`PlatformParker` de verdade~~ —
-   **concluído para `PlatformMutex`/`PlatformMonitor`** (`os-javaos-platform-sync`),
-   incluindo as funções `pthread_mutex_*`/`pthread_cond_*` reais por trás deles e uma
-   nova syscall (`SYSCALL_MUTEX_TRYLOCK`). `PlatformEvent`/`PlatformParker`
-   (`park_javaos.hpp`) continuam fora de escopo — dependem de espera com prazo, que
-   nenhuma primitiva do kernel oferece ainda (ver roadmap, "Próximo passo imediato").
+   **concluído para `PlatformMutex`/`PlatformMonitor`**, incluindo `wait(millis)` com
+   e sem prazo (`os-javaos-platform-sync` + `kernel-timed-wait`), as funções
+   `pthread_mutex_*`/`pthread_cond_*`/`pthread_cond_timedwait`/`clock_gettime` reais
+   por trás deles, e duas novas syscalls (`SYSCALL_MUTEX_TRYLOCK`,
+   `SYSCALL_COND_WAIT` estendida com prazo). `PlatformEvent`/`PlatformParker`
+   (`park_javaos.hpp`) continuam fora de escopo — agora só pelo protocolo próprio
+   deles (não mais por falta de primitiva de prazo no kernel, ver roadmap, "Próximo
+   passo imediato").
 3. ~~`libm`/conversão float completa na libc~~ — **concluído**
    (`libc-float-math`): `sin`/`cos`/`sqrt`/`pow`/etc. e `strtod`/`atof`/`dtoa` reais,
    sobre SSE habilitado no toolchain C/C++. `printf`/`scanf` com `%f`/`%e`/`%g`

@@ -34,10 +34,21 @@
  * abaixo. */
 #define _POSIX_THREADS 1
 
+/* Mesmo achado/correção de _POSIX_THREADS acima, agora para <time.h>: o
+ * newlib vendorizado declara clock_gettime/CLOCK_REALTIME sob
+ * `#if defined(_POSIX_TIMERS)` (sys/features.h), mesma família de macro de
+ * feature-test não definida automaticamente para o alvo genérico x86_64-elf
+ * deste projeto — ver design.md da change `kernel-timed-wait`. `CLOCK_MONOTONIC`
+ * exige adicionalmente `_POSIX_MONOTONIC_CLOCK` (achado só confirmado ao
+ * compilar — guarda separada de `_POSIX_TIMERS`, mesma família). */
+#define _POSIX_TIMERS 1
+#define _POSIX_MONOTONIC_CLOCK 1
+
 #include <pthread.h>
 #include <stddef.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "include/javaos_vm.h"
@@ -68,6 +79,8 @@ extern int errno;
 #define SYS_COND_WAIT 11
 #define SYS_COND_NOTIFY_ONE 12
 #define SYS_COND_NOTIFY_ALL 13
+#define SYS_CLOCK_WALL 14
+#define SYS_CLOCK_MONOTONIC 15
 #define SYS_OPEN 18
 #define SYS_READ 19
 #define SYS_CLOSE 20
@@ -77,6 +90,11 @@ extern int errno;
 /* SYSCALL_ERROR do kernel é `u64::MAX`, que como `long` assinado de 64 bits
  * é exatamente -1. */
 #define SYSCALL_ERROR (-1L)
+
+/* SYSCALL_TIMEOUT do kernel é `u64::MAX - 1`, que como `long` assinado de 64
+ * bits é exatamente -2 - devolvido por SYSCALL_COND_WAIT quando um prazo
+ * pedido expira antes de qualquer notificação (change `kernel-timed-wait`). */
+#define SYSCALL_TIMEOUT (-2L)
 
 static inline long javaos_syscall(long num, long a0, long a1, long a2, long a3) {
     long ret;
@@ -379,5 +397,62 @@ int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
         return err;
     }
     long r = javaos_syscall(SYS_COND_WAIT, (long)*cond, (long)*mutex, 0, 0);
+    return (r == SYSCALL_ERROR) ? EINVAL : 0;
+}
+
+/* clock_gettime real sobre as syscalls de relogio ja existentes (change
+ * kernel-timed-wait) - nunca implementada antes, apesar de
+ * SYSCALL_CLOCK_WALL/SYSCALL_CLOCK_MONOTONIC existirem desde
+ * kernel-jvm-posix-syscalls/kernel-wall-clock (achado real, ver design.md):
+ * nenhum consumidor real precisou dela ate PlatformMonitor::wait precisar
+ * construir um prazo absoluto. CLOCK_REALTIME/CLOCK_MONOTONIC apenas -
+ * qualquer outro clockid_t e EINVAL, sem syscall nenhuma. */
+int clock_gettime(clockid_t clk_id, struct timespec *tp) {
+    long nanos;
+    switch (clk_id) {
+        case CLOCK_REALTIME:
+            nanos = javaos_syscall(SYS_CLOCK_WALL, 0, 0, 0, 0);
+            break;
+        case CLOCK_MONOTONIC:
+            nanos = javaos_syscall(SYS_CLOCK_MONOTONIC, 0, 0, 0, 0);
+            break;
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+    tp->tv_sec = nanos / 1000000000L;
+    tp->tv_nsec = nanos % 1000000000L;
+    return 0;
+}
+
+/* pthread_cond_timedwait real (change kernel-timed-wait) - POSIX exige
+ * abstime ABSOLUTO (medido contra CLOCK_REALTIME, ja que esta libc nao
+ * implementa pthread_condattr_setclock), mas SYS_COND_WAIT espera um prazo
+ * RELATIVO (nanossegundos a partir de agora, mais simples de checar a cada
+ * tick do kernel sem depender de relogio de parede interno) - ver design.md.
+ * delta <= 0 (prazo ja no passado) devolve ETIMEDOUT direto, sem emitir
+ * syscall nenhuma. */
+int pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex,
+                           const struct timespec *abstime) {
+    int err = pthread_cond_resolve(cond);
+    if (err != 0) {
+        return err;
+    }
+    err = pthread_mutex_resolve(mutex);
+    if (err != 0) {
+        return err;
+    }
+
+    long now_nanos = javaos_syscall(SYS_CLOCK_WALL, 0, 0, 0, 0);
+    long abstime_nanos = (long)abstime->tv_sec * 1000000000L + (long)abstime->tv_nsec;
+    long delta = abstime_nanos - now_nanos;
+    if (delta <= 0) {
+        return ETIMEDOUT;
+    }
+
+    long r = javaos_syscall(SYS_COND_WAIT, (long)*cond, (long)*mutex, delta, 0);
+    if (r == SYSCALL_TIMEOUT) {
+        return ETIMEDOUT;
+    }
     return (r == SYSCALL_ERROR) ? EINVAL : 0;
 }

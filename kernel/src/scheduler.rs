@@ -68,6 +68,29 @@ static mut CURRENT_KERNEL_STACK_TOP: u64 = 0;
 #[unsafe(no_mangle)]
 static mut CURRENT_FPU_AREA: u64 = 0;
 
+/// Endereço do "slot" (um `u64` alocado via `Box::leak`, mesma disciplina de
+/// `kernel::fpu::new_area`) onde a rotina assembly `syscall_entry`
+/// (`kernel::syscall`) guarda/restaura o `RSP` de modo usuário da thread
+/// corrente ao redor de `syscall`/`sysret` — consultada diretamente por nome
+/// por aquela rotina, atualizada por `schedule_next` no mesmo trecho que já
+/// atualiza `CURRENT_FPU_AREA`. **Por-thread, não uma única variável global**
+/// — ver `KNOW_ISSUES.md`, "`SYSCALL_USER_RSP_SCRATCH` é uma variável global
+/// única...": uma syscall bloqueante (`WaitQueue::commit_block`) cede a CPU
+/// para uma thread totalmente diferente, que também pode fazer suas próprias
+/// syscalls antes da primeira ser despertada — uma única `static` global
+/// usada por ambas seria sobrescrita, devolvendo à primeira o `RSP` de
+/// usuário de outra thread ao final de sua chamada.
+#[unsafe(no_mangle)]
+static mut CURRENT_SYSCALL_RSP_SLOT: u64 = 0;
+
+/// Aloca o "slot" por-thread descrito em [`CURRENT_SYSCALL_RSP_SLOT`] — uma
+/// única célula `u64`, nunca liberada (mesma disciplina de "leak aceitável
+/// por enquanto" de `kernel::fpu::new_area`/`kernel::pthread_handles`).
+fn new_syscall_rsp_slot() -> u64 {
+    let leaked: &'static mut u64 = alloc::boxed::Box::leak(alloc::boxed::Box::new(0u64));
+    leaked as *mut u64 as u64
+}
+
 /// Contextos de todas as threads registradas, indexados por `ThreadId`. Sem
 /// remoção — esta change não implementa encerramento de thread (ver
 /// design.md — Non-Goals).
@@ -150,7 +173,7 @@ fn register_thread(thread: Thread) -> ThreadId {
             let mut contexts = CONTEXTS.lock();
             let index = id.0 as usize;
             if contexts.len() <= index {
-                contexts.resize_with(index + 1, || Context { rsp: 0, kernel_stack_top: 0, address_space_root: 0, fpu_state: 0 });
+                contexts.resize_with(index + 1, || Context { rsp: 0, kernel_stack_top: 0, address_space_root: 0, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false });
             }
             contexts[index] = thread.context;
             // Área de FXSAVE própria desta thread, alocada aqui (único ponto
@@ -158,6 +181,10 @@ fn register_thread(thread: Thread) -> ThreadId {
             // constrói um `Context` — ver design.md da change
             // `kernel-fpu-context-switch`, "Área de FXSAVE por thread".
             contexts[index].fpu_state = crate::fpu::new_area();
+            // Mesma disciplina acima, para o slot de `CURRENT_SYSCALL_RSP_SLOT`
+            // (change `kernel-timed-wait`, correção registrada em
+            // `KNOW_ISSUES.md`) — por-thread, nunca uma única `static` global.
+            contexts[index].syscall_rsp_slot = new_syscall_rsp_slot();
         }
         {
             let mut terminated = TERMINATED.lock();
@@ -192,6 +219,28 @@ pub(crate) fn make_ready(id: ThreadId) {
     with_interrupts_disabled(|| READY_QUEUE.lock().push_back(id));
 }
 
+/// Marca `CONTEXTS[id].timed_out = true` — usada por
+/// `kernel::wait_queue::wake_expired_deadlines` para registrar que `id` está
+/// sendo despertada por expiração de prazo, não por notificação normal (ver
+/// design.md da change `kernel-timed-wait`). Chamador deve já ter chamado
+/// `make_ready(id)` nesta mesma operação (ou chamar logo em seguida) —
+/// `CONTEXTS` por si só não afeta o escalonamento.
+pub(crate) fn mark_timed_out(id: ThreadId) {
+    with_interrupts_disabled(|| CONTEXTS.lock()[id.0 as usize].timed_out = true);
+}
+
+/// Lê e limpa (volta a `false`) `CONTEXTS[id].timed_out` — chamada pela
+/// própria thread logo após `WaitQueue::commit_block()` retornar, para saber
+/// se foi despertada por notificação ou por expiração de prazo. Sempre
+/// `false` para uma thread que nunca teve `mark_timed_out` chamada para ela.
+pub(crate) fn take_timed_out(id: ThreadId) -> bool {
+    with_interrupts_disabled(|| {
+        let mut contexts = CONTEXTS.lock();
+        let flag = &mut contexts[id.0 as usize].timed_out;
+        core::mem::replace(flag, false)
+    })
+}
+
 /// Registra a thread que já está em execução (`continue_boot`, rodando
 /// sobre a stack dedicada de `kernel-stack-guard-page`) como a primeira
 /// thread do escalonador. Deve ser chamada uma única vez, antes de `sti`.
@@ -209,7 +258,7 @@ pub fn register_boot_thread() -> ThreadId {
     let boot_process = process::next_process_id_for_scheduler();
     let kernel_stack_top = crate::stack::KERNEL_STACK_BASE + crate::stack::KERNEL_STACK_SIZE;
     let address_space_root = crate::paging::current_root();
-    let thread = Thread { id, process: boot_process, context: Context { rsp: 0, kernel_stack_top, address_space_root, fpu_state: 0 } };
+    let thread = Thread { id, process: boot_process, context: Context { rsp: 0, kernel_stack_top, address_space_root, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false } };
     // A stack de kernel confiável precisa estar correta desde já — não dá
     // para esperar o primeiro tick do timer, já que uma troca de privilégio
     // pode, em tese, acontecer antes dele (ver design.md da change
@@ -224,6 +273,10 @@ pub fn register_boot_thread() -> ThreadId {
     // um page fault. Achado real em boot: confirmado via
     // `EXCECAO #PF (page fault): endereco=0x0` antes desta correção.
     unsafe { CURRENT_FPU_AREA = CONTEXTS.lock()[thread_id.0 as usize].fpu_state };
+    // Mesmo racional acima, agora para `CURRENT_SYSCALL_RSP_SLOT` (change
+    // `kernel-timed-wait`) — sem isto, a primeira `syscall` desta thread
+    // guardaria/restauraria seu `RSP` de usuário no slot nulo (endereço 0).
+    unsafe { CURRENT_SYSCALL_RSP_SLOT = CONTEXTS.lock()[thread_id.0 as usize].syscall_rsp_slot };
     thread_id
 }
 
@@ -490,6 +543,14 @@ pub const JAVAOS_PTHREAD_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE
 pub const LIBM_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_0b00_0000_0000;
 pub const LIBM_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
 
+/// Endereço virtual, na metade inferior, onde a stack de usuário do
+/// executável de teste de espera com prazo real (`/bin/timedw.elf`, change
+/// `kernel-timed-wait`) é mapeada — mesmo papel de
+/// `LIBM_TEST_PROGRAM_STACK_VIRT`, endereço distinto só por clareza em
+/// despejos de depuração.
+pub const TIMEDWAIT_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_0c00_0000_0000;
+pub const TIMEDWAIT_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
+
 /// Endereços virtuais das duas variantes de `kernel::fpu_demo` (change
 /// `kernel-fpu-context-switch`) — mesma faixa baixa e mesmo racional de
 /// `EXIT_DEMO_CODE_VIRT`/`LIBC_TEST_PROGRAM_STACK_VIRT` (bem abaixo do
@@ -636,6 +697,12 @@ fn schedule_next(current_rsp: u64) -> u64 {
         // então esta global precisa já estar correta antes de `schedule_next`
         // retornar.
         unsafe { CURRENT_FPU_AREA = contexts[next.0 as usize].fpu_state };
+        // Mesmo racional acima, para `CURRENT_SYSCALL_RSP_SLOT` (change
+        // `kernel-timed-wait`, correção registrada em `KNOW_ISSUES.md`):
+        // precisa já apontar para o slot de `next` antes de `schedule_next`
+        // retornar, já que `next` pode retomar em qualquer ponto dentro de
+        // `syscall_entry` (ex.: logo após ser despertada de um bloqueio).
+        unsafe { CURRENT_SYSCALL_RSP_SLOT = contexts[next.0 as usize].syscall_rsp_slot };
         contexts[next.0 as usize].rsp
     })
 }
@@ -648,6 +715,7 @@ fn schedule_next(current_rsp: u64) -> u64 {
 #[unsafe(no_mangle)]
 extern "C" fn on_timer_tick(current_rsp: u64) -> u64 {
     crate::timer::on_tick();
+    crate::wait_queue::wake_expired_deadlines(crate::clock::monotonic_nanos());
     schedule_next(current_rsp)
 }
 

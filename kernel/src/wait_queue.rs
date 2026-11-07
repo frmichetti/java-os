@@ -8,6 +8,7 @@
 extern crate alloc;
 
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 
 use crate::process::ThreadId;
 use crate::scheduler;
@@ -32,6 +33,19 @@ impl BlockedQueue {
     /// houver nenhuma.
     fn pop(&mut self) -> Option<ThreadId> {
         self.order.pop_front()
+    }
+
+    /// Remove `id` desta fila, em qualquer posição — devolve se encontrou e
+    /// removeu. Usada por [`WaitQueue::cancel_if_blocked`] (change
+    /// `kernel-timed-wait`): uma thread com prazo expirado pode não estar
+    /// mais na cabeça da fila.
+    fn remove(&mut self, id: ThreadId) -> bool {
+        if let Some(pos) = self.order.iter().position(|&blocked| blocked == id) {
+            self.order.remove(pos);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -63,6 +77,17 @@ impl WaitQueue {
         let current = scheduler::current_thread_id();
         scheduler::with_interrupts_disabled(|| set_block_intent(current, self));
         self.commit_block();
+    }
+
+    /// Remove `id` desta fila se ela ainda estiver bloqueada aqui — devolve
+    /// se removeu. Usada só por [`wake_expired_deadlines`], sempre dentro da
+    /// seção crítica de `on_timer_tick` (interrupções já desabilitadas, mesmo
+    /// precedente de [`park`](Self::park)/[`take_block_intent`]): se `id` já
+    /// não está mais bloqueada aqui, já foi despertada normalmente antes do
+    /// prazo expirar, e esta chamada não deve ter nenhum efeito. Lógica pura
+    /// — testável em host sem tocar hardware.
+    fn cancel_if_blocked(&self, id: ThreadId) -> bool {
+        self.blocked.lock().remove(id)
     }
 
     /// Bloqueia a thread corrente nesta fila **somente se** `predicate`
@@ -109,6 +134,17 @@ impl WaitQueue {
     /// [`Self::commit_block`] para efetivar o bloqueio de fato.
     pub(crate) fn register_intent_for(&'static self, current: ThreadId) {
         set_block_intent(current, self);
+    }
+
+    /// Mesmo papel de [`Self::register_intent_for`], mas também registra um
+    /// prazo em [`TIMED_WAITERS`] — usada por
+    /// `kernel::pthread::CondVar::wait_timeout`, que precisa da mesma
+    /// atomicidade de liberar o mutex associado junto com o registro da
+    /// intenção (ver design.md da change `kernel-pthread-sync`), agora
+    /// também com um prazo.
+    pub(crate) fn register_timed_intent_for(&'static self, current: ThreadId, deadline_nanos: u64) {
+        set_block_intent(current, self);
+        TIMED_WAITERS.lock().push((current, deadline_nanos, self));
     }
 
     /// Dispara a interrupção de software dedicada a pedidos de bloqueio
@@ -170,8 +206,58 @@ impl WaitQueue {
 /// `kernel::keyboard::poll_event`).
 static BLOCK_INTENT: Spinlock<Option<(ThreadId, &'static WaitQueue)>> = Spinlock::new(None);
 
+/// Prazos pendentes: `(thread, prazo em nanossegundos monotônicos, fila de
+/// onde despertar)` — varrida inteiramente por [`wake_expired_deadlines`] a
+/// cada tick. Lista simples, sem ordenação (ver design.md da change
+/// `kernel-timed-wait`, "Lista de prazos pendentes"): o número de esperas
+/// com prazo concorrentes é pequeno, mesma escala de `ReadyQueue`.
+static TIMED_WAITERS: Spinlock<Vec<(ThreadId, u64, &'static WaitQueue)>> = Spinlock::new(Vec::new());
+
 fn set_block_intent(id: ThreadId, queue: &'static WaitQueue) {
+    // Acha real (change kernel-timed-wait): descarta qualquer prazo pendente
+    // desta mesma thread antes de registrar qualquer nova intenção de
+    // bloqueio (com ou sem prazo) - sem isso, uma thread notificada antes do
+    // prazo antigo expirar, que iniciasse uma nova espera antes dele
+    // disparar, poderia ser acordada incorretamente pelo prazo antigo. Ver
+    // design.md, "Invariante contra prazos presos".
+    TIMED_WAITERS.lock().retain(|&(waiter, _, _)| waiter != id);
     *BLOCK_INTENT.lock() = Some((id, queue));
+}
+
+/// Remove de [`TIMED_WAITERS`] toda entrada cujo prazo já expirou
+/// (`<= now_nanos`) e devolve `(thread, fila)` de cada uma — lógica pura,
+/// testável em host sem tocar o escalonador. Separada de
+/// [`wake_expired_deadlines`] pelo mesmo motivo de
+/// `WaitQueue::try_register_block_intent`: isolar a decisão pura da parte que
+/// toca hardware/escalonador.
+fn take_expired_deadlines(now_nanos: u64) -> Vec<(ThreadId, &'static WaitQueue)> {
+    let mut waiters = TIMED_WAITERS.lock();
+    let mut expired = Vec::new();
+    waiters.retain(|&(id, deadline, queue)| {
+        if deadline <= now_nanos {
+            expired.push((id, queue));
+            false
+        } else {
+            true
+        }
+    });
+    expired
+}
+
+/// Chamada por `kernel::scheduler::on_timer_tick`, sempre com interrupções já
+/// desabilitadas (mesmo precedente de [`take_block_intent`]): para cada
+/// prazo expirado (ver [`take_expired_deadlines`]), tenta despertar a thread
+/// correspondente (`WaitQueue::cancel_if_blocked`) — se ela ainda estava
+/// bloqueada ali, marca `timed_out` e a devolve à rotação; se não (já
+/// despertada normalmente antes), não faz nada. Ver design.md, "Lista de
+/// prazos pendentes".
+pub(crate) fn wake_expired_deadlines(now_nanos: u64) {
+    for (id, queue) in take_expired_deadlines(now_nanos) {
+        if queue.cancel_if_blocked(id) {
+            scheduler::mark_timed_out(id);
+            scheduler::make_ready(id);
+        }
+    }
 }
 
 /// Chamada por `kernel::scheduler::on_timer_tick`, sempre com interrupções já
@@ -278,5 +364,84 @@ mod tests {
         assert!(take_block_intent(ThreadId(99)));
 
         assert_eq!(QUEUE.blocked.lock().pop(), Some(ThreadId(99)));
+    }
+
+    #[test]
+    fn cancel_if_blocked_removes_a_thread_still_in_the_queue() {
+        static QUEUE: WaitQueue = WaitQueue::new();
+        QUEUE.blocked.lock().push(ThreadId(200));
+
+        assert!(QUEUE.cancel_if_blocked(ThreadId(200)));
+        assert_eq!(QUEUE.blocked.lock().pop(), None);
+    }
+
+    #[test]
+    fn cancel_if_blocked_does_nothing_when_the_thread_already_left_the_queue() {
+        static QUEUE: WaitQueue = WaitQueue::new();
+        // Nunca foi colocada na fila (equivalente a já ter sido despertada
+        // normalmente antes do prazo expirar).
+        assert!(!QUEUE.cancel_if_blocked(ThreadId(201)));
+    }
+
+    #[test]
+    fn set_block_intent_purges_a_stale_timed_waiter_for_the_same_thread() {
+        let _guard = BLOCK_INTENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *BLOCK_INTENT.lock() = None;
+        TIMED_WAITERS.lock().clear();
+
+        static OLD_QUEUE: WaitQueue = WaitQueue::new();
+        static NEW_QUEUE: WaitQueue = WaitQueue::new();
+        TIMED_WAITERS.lock().push((ThreadId(300), 1_000, &OLD_QUEUE));
+
+        // Mesma thread registra uma NOVA intenção de bloqueio (com ou sem
+        // prazo) antes do prazo antigo expirar — ver design.md, "Invariante
+        // contra prazos presos".
+        set_block_intent(ThreadId(300), &NEW_QUEUE);
+
+        assert!(TIMED_WAITERS.lock().iter().all(|&(id, _, _)| id != ThreadId(300)));
+    }
+
+    #[test]
+    fn set_block_intent_does_not_purge_a_different_thread_s_pending_deadline() {
+        let _guard = BLOCK_INTENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *BLOCK_INTENT.lock() = None;
+        TIMED_WAITERS.lock().clear();
+
+        static QUEUE_A: WaitQueue = WaitQueue::new();
+        static QUEUE_B: WaitQueue = WaitQueue::new();
+        TIMED_WAITERS.lock().push((ThreadId(301), 1_000, &QUEUE_A));
+
+        set_block_intent(ThreadId(302), &QUEUE_B);
+
+        assert!(TIMED_WAITERS.lock().iter().any(|&(id, _, _)| id == ThreadId(301)));
+    }
+
+    #[test]
+    fn take_expired_deadlines_removes_only_entries_at_or_before_now() {
+        let _guard = BLOCK_INTENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        TIMED_WAITERS.lock().clear();
+        static QUEUE: WaitQueue = WaitQueue::new();
+        TIMED_WAITERS.lock().push((ThreadId(400), 100, &QUEUE));
+        TIMED_WAITERS.lock().push((ThreadId(401), 200, &QUEUE));
+
+        let expired = take_expired_deadlines(100);
+
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, ThreadId(400));
+        assert!(core::ptr::eq(expired[0].1, &QUEUE));
+        // A entrada ainda não expirada continua pendente.
+        assert!(TIMED_WAITERS.lock().iter().any(|&(id, _, _)| id == ThreadId(401)));
+        assert!(TIMED_WAITERS.lock().iter().all(|&(id, _, _)| id != ThreadId(400)));
+    }
+
+    #[test]
+    fn take_expired_deadlines_finds_nothing_when_no_deadline_passed() {
+        let _guard = BLOCK_INTENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        TIMED_WAITERS.lock().clear();
+        static QUEUE: WaitQueue = WaitQueue::new();
+        TIMED_WAITERS.lock().push((ThreadId(402), 1_000, &QUEUE));
+
+        assert!(take_expired_deadlines(500).is_empty());
+        assert!(TIMED_WAITERS.lock().iter().any(|&(id, _, _)| id == ThreadId(402)));
     }
 }

@@ -118,6 +118,25 @@ impl CondVar {
         mutex.lock();
     }
 
+    /// Mesma garantia de [`Self::wait`] (libera e reaquire `mutex`
+    /// atomicamente), mas também desperta se `deadline_nanos` (tempo
+    /// monotônico) expirar antes de qualquer notificação — o que vier
+    /// primeiro. Devolve `true` se despertada por notificação, `false` se
+    /// foi por expiração do prazo — ver design.md da change
+    /// `kernel-timed-wait`.
+    pub fn wait_timeout(&'static self, mutex: &'static Mutex, deadline_nanos: u64) -> bool {
+        let current: ThreadId = scheduler::current_thread_id();
+        scheduler::with_interrupts_disabled(|| {
+            self.queue.register_timed_intent_for(current, deadline_nanos);
+            mutex.release_state();
+        });
+        mutex.wake_one_waiter();
+        self.queue.commit_block();
+        let notified = !scheduler::take_timed_out(current);
+        mutex.lock();
+        notified
+    }
+
     /// Desperta a thread esperando há mais tempo nesta condição, se houver.
     pub fn notify_one(&self) {
         self.queue.wake_one();

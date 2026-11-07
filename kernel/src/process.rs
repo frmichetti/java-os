@@ -89,6 +89,23 @@ pub struct Context {
     /// `address_space_root`/`kernel_stack_top`). Ver design.md da change
     /// `kernel-fpu-context-switch`.
     pub fpu_state: u64,
+    /// Endereço do slot de `u64` (`kernel::scheduler::new_syscall_rsp_slot`)
+    /// onde a rotina assembly `syscall_entry` guarda/restaura o `RSP` de
+    /// modo usuário desta thread ao redor de `syscall`/`sysret` — alocado
+    /// uma única vez na criação, nunca liberado (mesma disciplina de
+    /// `fpu_state`). **Por-thread desde a change `kernel-timed-wait`**: antes
+    /// disso era uma única `static` global (`SYSCALL_USER_RSP_SCRATCH`),
+    /// corrompida sempre que uma syscall bloqueante cedia a CPU para outra
+    /// thread que também fizesse syscalls antes da primeira ser despertada —
+    /// ver `KNOW_ISSUES.md`.
+    pub syscall_rsp_slot: u64,
+    /// `true` se esta thread acabou de ser despertada por expiração de um
+    /// prazo (`kernel::wait_queue::wake_expired_deadlines`), `false` se foi
+    /// por notificação normal — lido e limpo pela própria thread logo após
+    /// `WaitQueue::commit_block()` retornar. Necessário porque `commit_block`
+    /// é só uma instrução `int`, sem nenhum canal de retorno de valor — ver
+    /// design.md da change `kernel-timed-wait`.
+    pub timed_out: bool,
 }
 
 /// Uma thread: unidade de escalonamento dentro de um `Process`, com seu
@@ -217,7 +234,7 @@ pub(crate) fn create_kernel_thread<S: FrameStore>(
     let stack_top = stack::alloc_thread_stack(frame_allocator)?;
     let rsp = unsafe { init_kernel_stack(stack_top, entry) };
     let id = next_thread_id();
-    Ok(Thread { id, process, context: Context { rsp, kernel_stack_top: stack_top, address_space_root: root, fpu_state: 0 } })
+    Ok(Thread { id, process, context: Context { rsp, kernel_stack_top: stack_top, address_space_root: root, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false } })
 }
 
 /// Aloca a stack de kernel (para troca de contexto/`syscall`) e a stack de
@@ -254,7 +271,7 @@ fn create_user_thread<S: FrameStore>(
         init_stack(kernel_stack_top, entry, USER_CODE_SELECTOR, USER_DATA_SELECTOR, user_stack_top - ABI_ALIGNMENT_PAD)
     };
     let id = next_thread_id();
-    Ok(Thread { id, process, context: Context { rsp, kernel_stack_top, address_space_root: root, fpu_state: 0 } })
+    Ok(Thread { id, process, context: Context { rsp, kernel_stack_top, address_space_root: root, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false } })
 }
 
 impl Process {

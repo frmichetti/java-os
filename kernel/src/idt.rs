@@ -134,11 +134,15 @@ extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, error_c
         return;
     }
 
+    let cr3: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)) };
     crate::serial_println_emergency!(
-        "EXCECAO #PF (page fault): endereco=0x{:x} codigo_erro=0x{:x} rip=0x{:x}",
+        "EXCECAO #PF (page fault): endereco=0x{:x} codigo_erro=0x{:x} rip=0x{:x} cr3=0x{:x} rsp=0x{:x}",
         address,
         error_code,
         frame.instruction_pointer,
+        cr3,
+        frame.stack_pointer,
     );
     crate::hlt_loop();
 }

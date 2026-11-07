@@ -52,14 +52,20 @@ até ser notificada, apoiado em `pthread_cond_wait` real.
 - **THEN** a chamada SHALL permanecer bloqueada até a notificação, e retornar
   normalmente depois dela
 
-### Requirement: Espera Com Prazo Permanece Explicitamente Não Suportada
-`PlatformMonitor::wait(millis)` chamado com `millis != 0` (um prazo real pedido) SHALL
-abortar o processo com uma mensagem de diagnóstico explícita, em vez de ignorar o
-prazo pedido e esperar indefinidamente, ou de aplicar um prazo aproximado que não
-reflete uma primitiva de tempo real do kernel.
+### Requirement: Espera Com Prazo Real via `PlatformMonitor::wait`
+`PlatformMonitor::wait(millis)` chamado com `millis != 0` (um prazo real pedido)
+SHALL bloquear a thread chamadora de verdade até ser notificada ou até esse prazo
+expirar, o que ocorrer primeiro, apoiado em `pthread_cond_timedwait` real — em vez de
+abortar o processo ou de ignorar o prazo pedido.
 
-#### Scenario: Pedir um prazo real é recusado explicitamente
-- **WHEN** `wait(millis)` é chamado com um `millis` maior que zero
-- **THEN** o processo SHALL abortar com uma mensagem de diagnóstico identificando que
-  espera com prazo não está implementada, em vez de retornar um resultado que finja
-  ter respeitado o prazo pedido
+#### Scenario: `wait(millis)` com millis > 0 expira após o prazo sem notificação
+- **WHEN** `wait(millis)` é chamado sobre um `PlatformMonitor` com `millis` maior que
+  zero, e nenhuma execução o notifica antes desse prazo
+- **THEN** a chamada SHALL retornar, indicando expiração do prazo, somente depois de
+  `millis` terem decorrido (dentro da granularidade do temporizador do kernel)
+
+#### Scenario: `wait(millis)` com millis > 0 notificado antes de expirar retorna com sucesso
+- **WHEN** `wait(millis)` é chamado sobre um `PlatformMonitor` com `millis` maior que
+  zero, e outra execução o notifica antes desse prazo expirar
+- **THEN** a chamada SHALL retornar indicando sucesso (não expiração), sem esperar o
+  restante do prazo pedido
