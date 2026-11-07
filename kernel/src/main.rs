@@ -380,6 +380,24 @@ extern "C" fn continue_boot() -> ! {
                 kernel::serial_println!("libc minima: falha ao montar sistema de arquivos: {:?}", e)
             }
         }
+        // Runtime C++ mínimo (change `cxx-minimal-runtime`) — ver
+        // design.md, tarefas 3.4/4.1. Mesma disciplina de erro explícito
+        // (nunca pânico) dos carregamentos acima.
+        match kernel::fat32::mount_boot_partition() {
+            Ok(fs) => match kernel::scheduler::spawn_from_elf(
+                &mut frame_allocator,
+                &fs,
+                "/bin/cxxtest.elf",
+                kernel::scheduler::CXX_TEST_PROGRAM_STACK_VIRT,
+                kernel::scheduler::CXX_TEST_PROGRAM_STACK_SIZE,
+            ) {
+                Ok(_) => kernel::serial_println!("runtime c++ minimo: /bin/cxxtest.elf carregado e em execucao"),
+                Err(e) => kernel::serial_println!("runtime c++ minimo: falha ao carregar /bin/cxxtest.elf: {:?}", e),
+            },
+            Err(e) => {
+                kernel::serial_println!("runtime c++ minimo: falha ao montar sistema de arquivos: {:?}", e)
+            }
+        }
         // Thread de demonstração do teclado (ver `design.md` da change
         // `kernel-keyboard`): compartilha o espaço de endereçamento da
         // thread de boot (não precisa de isolamento próprio), evitando uma

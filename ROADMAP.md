@@ -11,8 +11,8 @@ prazo — rodar uma JVM e ter uma interface gráfica. Para profundidade técnica
 - `openspec/changes/archive/` — o histórico completo de planejamento (proposta, design,
   tarefas) de cada entrega, uma pasta por change.
 
-Atualizado em 2026-11-06, ao final da sessão que entregou `kernel-file-syscalls`,
-`libc-minimal-port` e `kernel-fpu-context-switch`.
+Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
+`kernel-fpu-context-switch` e `cxx-minimal-runtime`.
 
 ## O que já está implementado (verificado em boot real)
 
@@ -84,11 +84,22 @@ Atualizado em 2026-11-06, ao final da sessão que entregou `kernel-file-syscalls
 - Verificado em boot real com um programa C de verdade: aloca memória, escreve no
   console, lê um arquivo do disco e termina — tudo via a libc portada.
 
+### Runtime C++ mínimo para programas de usuário
+- **`new`/`delete`, despacho de método virtual** — `operator new`/`operator delete`
+  delegando para `malloc`/`free` da libc já portada, `__cxa_pure_virtual` como stub
+  defensivo. **Sem exceções, RTTI, nem construtores/destrutores de objetos globais**
+  (achado real: `-fno-exceptions -fno-rtti -fno-use-cxa-atexit` elimina toda
+  dependência dessas três coisas para um `.cpp` com herança/virtual compilar e linkar)
+  (`cxx-minimal-runtime`).
+- Verificado em boot real: despacho de método virtual puro através de ponteiro de
+  classe-base executa a implementação derivada, e um objeto alocado via `new` é
+  liberado via `delete` sem corromper nada.
+
 ## O que está previsto
 
 ### Próximo passo imediato
-- **Esqueleto `os_javaos` do HotSpot** (C++): o próprio porte da JVM sobre a libc C e o
-  suporte a ponto flutuante já entregues — primeira sub-change concreta do item 8 do
+- **Esqueleto `os_javaos` do HotSpot** (C++): o próprio porte da JVM sobre a libc C, o
+  suporte a ponto flutuante e o runtime C++ já entregues — primeira sub-change do item 8 do
   roadmap que de fato toca código do HotSpot.
 
 ### Médio prazo
@@ -118,15 +129,19 @@ Atualizado em 2026-11-06, ao final da sessão que entregou `kernel-file-syscalls
 A base de primitivas de kernel que o HotSpot precisa (inventariada por
 `jvm-posix-compat-strategy`) está **completa**: memória virtual anônima, `pthread_mutex`/
 `pthread_cond`, relógio, sinal de safepoint, carregamento de executável/biblioteca
-dinâmica, E/S de arquivo, uma libc C mínima, e agora ponto flutuante via SSE. O que
-ainda falta, em ordem de dependência:
+dinâmica, E/S de arquivo, uma libc C mínima, ponto flutuante via SSE, e agora um
+runtime C++ mínimo (`new`/`delete`, despacho virtual). O que ainda falta, em ordem de
+dependência:
 
 1. **O esqueleto `os_javaos` em si** — nenhuma linha de código do HotSpot foi integrada
    ainda; esta é a próxima sub-change do roadmap.
 2. **`libm`/conversão float completa na libc** — o HotSpot usa `double`/`float`
    extensivamente (são tipos primitivos Java); a libc atual não tem `sin`/`cos`/`sqrt`/
    `strtod` reais (excluídos deliberadamente, não um bug).
-3. **`libstdc++`/suporte a exceções C++** — o HotSpot é C++; a libc portada é só C.
+3. **Exceções C++, RTTI e `libstdc++`/STL** — desligados deliberadamente no runtime C++
+   mínimo (`-fno-exceptions -fno-rtti`); se o HotSpot precisar de algum desses (ainda
+   não verificado, já que o código-fonte do HotSpot nem foi vendorizado), vira o escopo
+   de uma sub-change própria.
 4. **Isolamento de falha por processo** — hoje uma JVM que crashasse derrubaria o kernel
    inteiro junto; aceitável para um "hello world" de prova de conceito, não para um
    sistema de verdade.

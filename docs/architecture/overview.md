@@ -13,8 +13,8 @@
 > `kernel-syscalls`, `kernel-posix-virtual-memory`, `kernel-wait-queue`,
 > `kernel-pthread-sync`, `kernel-wall-clock`, `kernel-elf-loader`,
 > `kernel-dynamic-linker`, `kernel-fat32-filesystem`, `kernel-file-syscalls`,
-> `libc-minimal-port` e `kernel-fpu-context-switch`); as demais ficam registradas aqui
-> para orientar changes futuras.
+> `libc-minimal-port`, `kernel-fpu-context-switch` e `cxx-minimal-runtime`); as demais
+> ficam registradas aqui para orientar changes futuras.
 
 ## 1. Arquitetura do Kernel
 
@@ -519,6 +519,20 @@ armazenamento e rede — todos implementados.
   quando/se necessário. Verificado em boot real: duas threads concorrentes somando
   `double` via SSE (sementes/resultados distintos), preemptadas repetidamente pelo
   timer, cada uma termina com o resultado correto, sem mistura de estado entre elas.
+- **Runtime C++ mínimo — entregue pela change `cxx-minimal-runtime`**: gap descoberto
+  por teste empírico direto (compilando um `.cpp` de prova com herança/virtual) ao
+  escopar o próximo passo real do item 8 — o esqueleto `os_javaos` é C++, e não havia
+  nenhum suporte a C++ no projeto (só a libc C do `libc-minimal-port`). **Achado**: com
+  `-fno-exceptions -fno-rtti -fno-use-cxa-atexit`, um `.cpp` com herança/virtual compila
+  e linka só precisando de `operator new`/`operator delete` — nenhuma dependência de
+  exceções, RTTI ou `__cxa_atexit`/`__dso_handle` apareceu. Novo wrapper
+  `scripts/cross/x86_64-elf-g++` (mesmo padrão do wrapper de C, sem-SSE por
+  consistência — reabilitar ponto flutuante em C/C++ fica rastreado separadamente em
+  `ROADMAP.md`) e `userland_c/cxx_runtime.cpp` (`operator new`/`delete` sobre
+  `malloc`/`free` da libc já portada; `__cxa_pure_virtual` como stub defensivo).
+  Verificado em boot real: despacho de método virtual puro através de ponteiro de
+  classe-base executa a implementação derivada corretamente, e um objeto alocado via
+  `new` através desse ponteiro é liberado via `delete` sem corromper nada.
 - Esta change não implementa nenhuma primitiva nova — isso fica inteiramente para a
   change do item 8 do roadmap ("Porte inicial da JVM"), que decide a forma concreta de
   cada primitiva do inventário acima (ex.: syscalls novas vs. extensão das existentes)
@@ -710,10 +724,17 @@ entram como diretórios/subprojetos irmãos de `kernel/` quando forem propostos.
    `libc-minimal-port` como bloqueador para `double`/`float`. Verificado em
    boot real: duas threads concorrentes somando `double` via SSE,
    preemptadas repetidamente, cada uma com resultado correto e isolado —
-   ver seção 1/3/6. Próximo passo do item 8: o esqueleto `os_javaos` do
-   HotSpot propriamente dito, agora com libc e ponto flutuante disponíveis
-   (ainda sem `libm`/conversão float na libc — reconstruir essas partes
-   fica para quando/se necessário).
+   ver seção 1/3/6. `cxx-minimal-runtime` (concluída) entregou mais uma
+   sub-change, a mais recente até o momento: o runtime C++ mínimo (wrapper
+   `x86_64-elf-g++`, `operator new`/`delete` sobre a libc já portada,
+   `__cxa_pure_virtual`) — gap descoberto por teste empírico direto ao
+   escopar o esqueleto `os_javaos` (C++), que não tinha nenhum suporte a
+   C++ disponível — ver seção 6. Verificado em boot real: despacho de
+   método virtual e `new`/`delete` corretos através de ponteiro de
+   classe-base. Próximo passo do item 8: o esqueleto `os_javaos` do HotSpot
+   propriamente dito, agora com libc C, ponto flutuante e runtime C++
+   disponíveis (ainda sem `libm`/conversão float na libc, exceções C++,
+   RTTI nem `libstdc++`/STL — cada um fica para quando/se necessário).
 9. **Modelo híbrido de execução de JVM**: runtime compartilhado vs. JVM isolada por
    aplicação.
 10. **Java OS Platform (Java)**: gerenciamento de arquivos, serviços de sistema, rede,
