@@ -120,14 +120,27 @@ fn is_page_absent(error_code: u64) -> bool {
     error_code & PAGE_FAULT_ERROR_PRESENT == 0
 }
 
-/// Reporta uma exceção de CPU pelo canal de boot e entra em halt — cobre
-/// "Tratamento de Exceções de CPU" da spec `kernel-interrupts`. **Exceção**:
-/// uma falta por ausência de página dentro de uma faixa registrada como
-/// ponto de poll de safepoint (`kernel::safepoint`) retoma a execução
-/// normalmente em vez de haltar — o `iretq` gerado pela ABI `extern
-/// "x86-interrupt"` já faz isso sozinho ao retornar, já que `frame` nunca é
-/// alterado; ver design.md da change `kernel-safepoint-signal`, "Mecanismo:
-/// 'retry automático'...".
+/// `true` se `code_segment` (o `CS` ativo no momento de uma exceção, lido de
+/// `InterruptStackFrame::code_segment`) tem `RPL == 3` (modo usuário) — os 2
+/// bits baixos de qualquer seletor de segmento x86_64. Função pura, testável
+/// sem hardware — ver design.md da change `kernel-fault-isolation`.
+fn is_user_mode(code_segment: u64) -> bool {
+    const RPL_MASK: u64 = 0x3;
+    const RPL_USER: u64 = 0x3;
+    code_segment & RPL_MASK == RPL_USER
+}
+
+/// Reporta uma exceção de CPU e então, dependendo de onde ela ocorreu,
+/// encerra só a thread causadora (modo usuário) ou entra em halt total (modo
+/// kernel) — cobre "Tratamento de Exceções de CPU" da spec
+/// `kernel-interrupts`, estendida pela change `kernel-fault-isolation` para
+/// isolar faltas de modo usuário em vez de sempre derrubar o kernel inteiro
+/// junto. **Exceção**: uma falta por ausência de página dentro de uma faixa
+/// registrada como ponto de poll de safepoint (`kernel::safepoint`) retoma a
+/// execução normalmente em vez de qualquer um dos dois caminhos acima — o
+/// `iretq` gerado pela ABI `extern "x86-interrupt"` já faz isso sozinho ao
+/// retornar, já que `frame` nunca é alterado; ver design.md da change
+/// `kernel-safepoint-signal`, "Mecanismo: 'retry automático'...".
 extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, error_code: u64) {
     let address = read_cr2();
     if is_page_absent(error_code) && crate::safepoint::is_registered(address) {
@@ -136,22 +149,35 @@ extern "x86-interrupt" fn page_fault_handler(frame: InterruptStackFrame, error_c
 
     let cr3: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)) };
+    let user_mode = is_user_mode(frame.code_segment);
     crate::serial_println_emergency!(
-        "EXCECAO #PF (page fault): endereco=0x{:x} codigo_erro=0x{:x} rip=0x{:x} cr3=0x{:x} rsp=0x{:x}",
+        "EXCECAO #PF (page fault): endereco=0x{:x} codigo_erro=0x{:x} rip=0x{:x} cr3=0x{:x} rsp=0x{:x} modo_usuario={} - {}",
         address,
         error_code,
         frame.instruction_pointer,
         cr3,
         frame.stack_pointer,
+        user_mode,
+        if user_mode { "thread encerrada" } else { "kernel em halt" },
     );
+    if user_mode {
+        crate::scheduler::terminate_current_thread();
+    }
     crate::hlt_loop();
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(frame: InterruptStackFrame, error_code: u64) {
+    let user_mode = is_user_mode(frame.code_segment);
     crate::serial_println_emergency!(
-        "EXCECAO #GP (general protection fault): codigo_erro=0x{:x} rip=0x{:x}",
-        error_code, frame.instruction_pointer,
+        "EXCECAO #GP (general protection fault): codigo_erro=0x{:x} rip=0x{:x} modo_usuario={} - {}",
+        error_code,
+        frame.instruction_pointer,
+        user_mode,
+        if user_mode { "thread encerrada" } else { "kernel em halt" },
     );
+    if user_mode {
+        crate::scheduler::terminate_current_thread();
+    }
     crate::hlt_loop();
 }
 
@@ -252,6 +278,16 @@ mod tests {
     fn permission_violation_is_not_page_absence() {
         assert!(!is_page_absent(0x1));
         assert!(!is_page_absent(0x3));
+    }
+
+    #[test]
+    fn kernel_code_selector_is_not_user_mode() {
+        assert!(!is_user_mode(KERNEL_CODE_SELECTOR as u64));
+    }
+
+    #[test]
+    fn user_code_selector_is_user_mode() {
+        assert!(is_user_mode(crate::gdt::USER_CODE_SELECTOR as u64));
     }
 
     #[test]

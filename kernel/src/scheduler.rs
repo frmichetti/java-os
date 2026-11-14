@@ -125,6 +125,27 @@ pub(crate) fn is_terminated(id: ThreadId) -> bool {
     TERMINATED.lock()[id.0 as usize]
 }
 
+/// Encerra a thread corrente permanentemente, sem nunca retomar: marca-a
+/// como terminada ([`mark_terminated`]) e entra num laço `sti`/`hlt` que
+/// nunca mais executa nenhuma instrução desta thread — o próprio tick
+/// seguinte do timer, no seu curso normal, trata esta thread como
+/// `was_running` em [`schedule_next`], vê `is_terminated() == true`, e
+/// simplesmente não a devolve à `ReadyQueue`, escolhendo a próxima thread
+/// pronta via o `iretq` que o caminho do timer já usa normalmente — nenhuma
+/// troca de contexto manual é necessária aqui. Chamada por
+/// `kernel::syscall::sys_exit` (encerramento voluntário) e pelos handlers de
+/// exceção de `kernel::idt` (encerramento involuntário por `#PF`/`#GP` em
+/// modo usuário — ver design.md da change `kernel-fault-isolation`): `IF` já
+/// está mascarado em ambos os casos (`SFMASK` durante uma *syscall*, gate de
+/// interrupção durante uma exceção), então [`mark_terminated`] não precisa
+/// de proteção extra, mesmo racional já documentado ali.
+pub(crate) fn terminate_current_thread() -> ! {
+    mark_terminated(current_thread_id());
+    loop {
+        unsafe { core::arch::asm!("sti", "hlt", options(preserves_flags)) };
+    }
+}
+
 /// Processos criados via [`spawn`], retidos pelo escalonador pela mesma
 /// razão (sem encerramento/limpeza nesta change). Indexados por posição de
 /// criação, não por `ProcessId` diretamente.
@@ -550,6 +571,14 @@ pub const LIBM_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
 /// despejos de depuração.
 pub const TIMEDWAIT_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_0c00_0000_0000;
 pub const TIMEDWAIT_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
+
+/// Endereço virtual, na metade inferior, onde a stack de usuário do
+/// executável de teste de isolamento de falha por processo
+/// (`/bin/fault.elf`, change `kernel-fault-isolation`) é mapeada — mesmo
+/// papel de `TIMEDWAIT_TEST_PROGRAM_STACK_VIRT`, endereço distinto só por
+/// clareza em despejos de depuração.
+pub const FAULT_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_0d00_0000_0000;
+pub const FAULT_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
 
 /// Endereços virtuais das duas variantes de `kernel::fpu_demo` (change
 /// `kernel-fpu-context-switch`) — mesma faixa baixa e mesmo racional de

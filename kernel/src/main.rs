@@ -478,6 +478,27 @@ extern "C" fn continue_boot() -> ! {
                 kernel::serial_println!("timedwait: falha ao montar sistema de arquivos: {:?}", e)
             }
         }
+        // Isolamento de falha por processo (change `kernel-fault-isolation`)
+        // — causa deliberadamente um page fault em modo usuário, depois de
+        // vários outros processos/threads de teste já estarem em execução
+        // (acima), para provar que só a thread causadora é encerrada e o
+        // resto do sistema continua. Mesma disciplina de erro explícito
+        // (nunca pânico) dos carregamentos ELF acima.
+        match kernel::fat32::mount_boot_partition() {
+            Ok(fs) => match kernel::scheduler::spawn_from_elf(
+                &mut frame_allocator,
+                &fs,
+                "/bin/fault.elf",
+                kernel::scheduler::FAULT_TEST_PROGRAM_STACK_VIRT,
+                kernel::scheduler::FAULT_TEST_PROGRAM_STACK_SIZE,
+            ) {
+                Ok(_) => kernel::serial_println!("fault_isolation: /bin/fault.elf carregado e em execucao"),
+                Err(e) => kernel::serial_println!("fault_isolation: falha ao carregar /bin/fault.elf: {:?}", e),
+            },
+            Err(e) => {
+                kernel::serial_println!("fault_isolation: falha ao montar sistema de arquivos: {:?}", e)
+            }
+        }
         // Thread de demonstração do teclado (ver `design.md` da change
         // `kernel-keyboard`): compartilha o espaço de endereçamento da
         // thread de boot (não precisa de isolamento próprio), evitando uma

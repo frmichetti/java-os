@@ -467,17 +467,13 @@ fn sys_close(handle: u64) -> u64 {
     if crate::file_handles::close(handle) { 0 } else { SYSCALL_ERROR }
 }
 
-/// Termina a thread chamadora — cobre `SYSCALL_EXIT`. Marca a thread como
-/// terminada (`kernel::scheduler::mark_terminated`, consultada por
-/// `schedule_next` para nunca mais devolvê-la à `ReadyQueue`) e então
-/// aguarda ociosamente (`sti`/`hlt`, mesmo padrão de `kernel::idle_loop`) a
-/// próxima troca de contexto — que, por construção, nunca mais retoma esta
-/// chamada: a thread chamadora nunca volta a executar depois disto.
+/// Termina a thread chamadora — cobre `SYSCALL_EXIT`. Delega inteiramente a
+/// `kernel::scheduler::terminate_current_thread` (mesmo laço `mark_terminated`
+/// + `sti`/`hlt` também usado pelo encerramento involuntário por exceção de
+/// CPU — ver design.md da change `kernel-fault-isolation`): a thread
+/// chamadora nunca volta a executar depois disto.
 fn sys_exit() -> ! {
-    crate::scheduler::mark_terminated(crate::scheduler::current_thread_id());
-    loop {
-        unsafe { core::arch::asm!("sti", "hlt", options(preserves_flags)) };
-    }
+    crate::scheduler::terminate_current_thread()
 }
 
 /// Despacha uma chamada de sistema pelo número (`RAX` na entrada de

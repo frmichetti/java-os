@@ -164,7 +164,7 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
   (mapeamento de arquivo), `pd_reserve_memory_special` (páginas grandes),
   `pd_realign_memory` (realinhamento).
 
-### `PlatformMutex`/`PlatformMonitor` reais do porte `os_javaos`
+### `PlatformMutex`/`PlatformMonitor`/`PlatformEvent`/`PlatformParker` reais do porte `os_javaos`
 - **`pthread_mutex_init`/`destroy`/`lock`/`unlock`/`trylock` e `pthread_cond_init`/
   `destroy`/`signal`/`broadcast`/`wait` têm comportamento real** em
   `userland_c/glue.c`, sobre as syscalls de mutex/condvar que o kernel já expõe —
@@ -181,9 +181,20 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
   reais, e **`wait(millis)` real tanto para `millis == 0` (sem prazo) quanto para
   `millis != 0`** (com prazo, sobre a primitiva de espera com prazo do kernel —
   `kernel-timed-wait`) — devolve `OS_OK`/`OS_TIMEOUT` conforme o caso.
-  `PlatformEvent`/`PlatformParker` (`park_javaos.hpp`) continuam fora de escopo:
-  dependem de um protocolo mais complexo (`REL_INDEX`/`ABS_INDEX`, dois condvars,
-  `_counter`), consumidor separado da primitiva de prazo já entregue.
+- **`PlatformEvent`/`PlatformParker` (`os/javaos/park_javaos.cpp`, novo arquivo)
+  têm comportamento real** (`os-javaos-park-sync`): `PlatformEvent` como semáforo
+  binário real de 3 estados (`park`/`park(millis)`/`park_nanos`/`unpark`, protocolo
+  idêntico ao já vendorizado em `os/posix/os_posix.cpp`), e `PlatformParker`
+  construído/destruído de verdade (mutex + dois `pthread_cond_t`, `REL_INDEX`/
+  `ABS_INDEX`). **Fora de escopo, deliberadamente**: `Parker::park`/`unpark` (a
+  classe compartilhada que de fato usa `PlatformParker`) — depende de
+  `JavaThread::current()`/`ThreadBlockInVM`/`OSThreadWaitState`/safepoint,
+  infraestrutura nunca referenciada por este porte; não é mais uma questão de
+  primitiva do kernel faltando (ver roadmap, "Próximo passo imediato"). **Não
+  verificado em boot real**: `PlatformEvent`/`PlatformParker` são classes C++
+  internas do HotSpot sem nenhuma superfície chamável a partir de C — verificadas só
+  por compilação real (`g++ -fsyntax-only`) contra a árvore vendorizada, mesma
+  disciplina já aceita para partes do porte sem superfície C.
 - Verificado em boot real por dois programas C dedicados
   (`userland_c/javaos_pthread_test_program.c`, carregado como `/bin/jpthread.elf`;
   `userland_c/timedwait_test_program.c`, carregado como `/bin/timedw.elf`):
@@ -196,22 +207,46 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
   thread em modo usuário para provar isso com segurança (chamar `cond_wait` sem
   ninguém para notificar de volta travaria o processo de teste para sempre).
 
+### Isolamento de falha por processo
+- **Uma exceção de CPU (`#PF`/`#GP`) causada por código de modo usuário encerra só a
+  thread causadora, em vez de derrubar o kernel inteiro** (`kernel-fault-isolation`):
+  os handlers de `kernel::idt` distinguem a origem pelo `RPL` de `CS` — modo kernel
+  continua se comportando exatamente como antes (diagnóstico + halt total); modo
+  usuário reaproveita o mesmo mecanismo já existente de `SYSCALL_EXIT`
+  (`kernel::scheduler::terminate_current_thread`, extraída e compartilhada entre os
+  dois casos). `#DF` (double fault) continua sempre fatal, sem distinção — o estado
+  nesse ponto já está comprometido demais para confiar em qualquer decisão além de
+  parar.
+- **Equivalente a isolar o processo inteiro hoje**, não só a thread: nenhum processo
+  de modo usuário tem mais de uma thread ainda (não existe syscall de criação de
+  thread em modo usuário). Propagar o encerramento para outras threads do mesmo
+  processo, quando essa syscall existir, fica para depois.
+- **Recursos do processo encerrado continuam vazando** (`AddressSpace`/frames
+  físicos, entradas em `pthread_handles`/`file_handles`, o `Process`/`Thread` em si)
+  — mesma disciplina de "leak aceitável por enquanto" já aplicada a `SYSCALL_EXIT`
+  desde `libc-minimal-port`. Liberação real é o próximo passo (ver abaixo).
+- Verificado em boot real por um programa C dedicado
+  (`userland_c/fault_test_program.c`, carregado como `/bin/fault.elf`, depois de
+  vários outros processos/threads de teste já em execução): causa um `#PF` em modo
+  usuário de propósito (escrita em endereço `0x0`) e confirma que (a) nenhuma
+  instrução sua depois da falta executa, e (b) todos os demais processos/threads já
+  em execução continuam reportando exatamente os mesmos resultados de antes, sem
+  nenhum `hlt_loop`/pânico.
+
 ## O que está previsto
 
 ### Próximo passo imediato
-- **`PlatformEvent`/`PlatformParker` reais do porte `os_javaos`** (`park_javaos.hpp`)
-  — agora que a primitiva de espera com prazo existe de verdade no kernel
-  (`kernel-timed-wait`), esta é a última peça pendente da sincronização de baixo
-  nível que o HotSpot precisa. Protocolo mais complexo que `PlatformMonitor::wait`:
-  `REL_INDEX`/`ABS_INDEX`, dois condvars, um contador (`_counter`) com semântica
-  própria de "unpark antes do park não se perde" — merece sua própria change,
-  consumidora direta de `CondVar::wait_timeout`/`SYSCALL_COND_WAIT` já entregues.
+- **Liberação real de recursos do processo encerrado** — `AddressSpace`/frames
+  físicos, entradas em `pthread_handles`/`file_handles`, o `Process`/`Thread` em si
+  (hoje todos vazam, tanto no encerramento voluntário quanto no involuntário por
+  exceção — `kernel-fault-isolation`). Com o isolamento de falha pronto, um processo
+  pode falhar repetidamente sem derrubar o kernel, mas cada falha ainda consome
+  memória/handles para sempre — inaceitável fora de um boot de teste curto.
 
 ### Médio prazo
-- Isolamento de falha por processo — hoje uma exceção em modo usuário ainda derruba o
-  kernel inteiro; depende de um modelo real de término/encerramento de processo.
 - Isolar as tabelas de handle hoje globais (`pthread_handles`, `file_handles`, janela de
-  `kernel::vmm`) por processo/espaço de endereçamento.
+  `kernel::vmm`) por processo/espaço de endereçamento (mesmo trabalho do item acima,
+  visto por outro ângulo: isolamento estrutural, não só liberação).
 - Esquema de erro granular (`errno`-like) nas syscalls, e validação de ponteiro de
   usuário (hoje não validado, mesmo precedente de `sys_write`).
 - Parsing de ACPI/MADT, para hardware real além de QEMU/VirtualBox/VMware.
@@ -236,8 +271,10 @@ dinâmica, E/S de arquivo, uma libc C mínima com ponto flutuante real (`libm`+
 conversão float, `libc-float-math`), um runtime C++ mínimo (`new`/`delete`,
 despacho virtual), um esqueleto `os_javaos`/`os_cpu/javaos_zero` que compila contra
 a interface real do HotSpot, os `pd_*` de memória desse esqueleto com comportamento
-real (`os-javaos-memory-pd`), e `PlatformMutex`/`PlatformMonitor` reais
-(`os-javaos-platform-sync`). O que ainda falta, em ordem de dependência:
+real (`os-javaos-memory-pd`), `PlatformMutex`/`PlatformMonitor` reais
+(`os-javaos-platform-sync`), espera com prazo real no kernel/libc
+(`kernel-timed-wait`), e `PlatformEvent`/`PlatformParker` reais
+(`os-javaos-park-sync`). O que ainda falta, em ordem de dependência:
 
 1. ~~Implementação de verdade dos `pd_*` do esqueleto `os_javaos`~~ — **concluído
    para memória** (`pd_reserve_memory`/`pd_commit_memory`/`pd_uncommit_memory`/
@@ -246,14 +283,18 @@ real (`os-javaos-memory-pd`), e `PlatformMutex`/`PlatformMonitor` reais
    `pd_create_stack_guard_pages`, `pd_dll_unload`) continuam `fatal()`/stub — cobertos
    pelos itens 2 e seguintes.
 2. ~~`PlatformMutex`/`PlatformMonitor`/`PlatformEvent`/`PlatformParker` de verdade~~ —
-   **concluído para `PlatformMutex`/`PlatformMonitor`**, incluindo `wait(millis)` com
-   e sem prazo (`os-javaos-platform-sync` + `kernel-timed-wait`), as funções
+   **concluído**: `PlatformMutex`/`PlatformMonitor`, incluindo `wait(millis)` com e
+   sem prazo (`os-javaos-platform-sync` + `kernel-timed-wait`), e `PlatformEvent`
+   (semáforo binário de 3 estados real, com e sem prazo) + a construção/destruição
+   real de `PlatformParker` (`os-javaos-park-sync`) — todas sobre
    `pthread_mutex_*`/`pthread_cond_*`/`pthread_cond_timedwait`/`clock_gettime` reais
-   por trás deles, e duas novas syscalls (`SYSCALL_MUTEX_TRYLOCK`,
-   `SYSCALL_COND_WAIT` estendida com prazo). `PlatformEvent`/`PlatformParker`
-   (`park_javaos.hpp`) continuam fora de escopo — agora só pelo protocolo próprio
-   deles (não mais por falta de primitiva de prazo no kernel, ver roadmap, "Próximo
-   passo imediato").
+   e duas novas syscalls (`SYSCALL_MUTEX_TRYLOCK`, `SYSCALL_COND_WAIT` estendida com
+   prazo). **Único resto, deliberadamente fora de escopo**: `Parker::park`/`unpark`
+   (a classe compartilhada que dá uso real a `PlatformParker`) — depende de
+   `JavaThread::current()`/`ThreadBlockInVM`/`OSThreadWaitState`/safepoint,
+   infraestrutura de estado de thread que este porte nunca tocou; não é mais questão
+   de primitiva de kernel faltando, é o próprio início da integração de
+   runtime/estado de thread do HotSpot (ver item 5 abaixo e além).
 3. ~~`libm`/conversão float completa na libc~~ — **concluído**
    (`libc-float-math`): `sin`/`cos`/`sqrt`/`pow`/etc. e `strtod`/`atof`/`dtoa` reais,
    sobre SSE habilitado no toolchain C/C++. `printf`/`scanf` com `%f`/`%e`/`%g`
@@ -264,9 +305,12 @@ real (`os-javaos-memory-pd`), e `PlatformMutex`/`PlatformMonitor` reais
    nenhum dos três, mas isso cobre só a camada `os`/`os_cpu` — o restante do HotSpot
    (GC, JIT, interpretador) ainda não foi examinado, então se algum deles precisar
    disso continua sendo o escopo de uma sub-change própria.
-5. **Isolamento de falha por processo** — hoje uma JVM que crashasse derrubaria o kernel
-   inteiro junto; aceitável para um "hello world" de prova de conceito, não para um
-   sistema de verdade.
+5. ~~Isolamento de falha por processo~~ — **concluído para exceções de CPU**
+   (`#PF`/`#GP` em modo usuário, `kernel-fault-isolation`): uma JVM que crashasse
+   hoje encerraria só sua própria thread, não o kernel inteiro. Recursos do
+   processo encerrado ainda vazam (ver roadmap, "Próximo passo imediato") — liberação
+   real fica para depois, mas não bloqueia mais nenhum teste de boot real que rode
+   código de usuário com risco de falhar.
 6. Só depois disso: o próprio código-fonte do HotSpot (GC, JIT, interpretador,
    carregamento de classes via o `ClassLoader`) — ainda não escopado em nenhuma change.
 
