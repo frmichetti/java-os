@@ -49,11 +49,12 @@ fn idle_forever() -> ! {
 /// [`ARMED_TICKS`] e a compromete de novo (libera) — cobre o cenário "página
 /// de poll de safepoint" ponta a ponta.
 pub extern "C" fn coordinator() -> ! {
+    let caller = crate::scheduler::current_process_id();
     let region = crate::scheduler::with_interrupts_disabled(|| {
         let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
         let mut vmm = crate::vmm::VMM.lock();
-        let region = vmm.reserve(PAGE_SIZE).expect("reserva da pagina de safepoint falhou");
-        vmm.commit(&mut frame_allocator, &region, 0, PAGE_SIZE, PageFlags::KERNEL_RW)
+        let region = vmm.reserve(PAGE_SIZE, caller).expect("reserva da pagina de safepoint falhou");
+        vmm.commit(&mut frame_allocator, &region, 0, PAGE_SIZE, PageFlags::KERNEL_RW, caller)
             .expect("comprometimento inicial da pagina de safepoint falhou");
         region
     });
@@ -68,7 +69,7 @@ pub extern "C" fn coordinator() -> ! {
     crate::scheduler::with_interrupts_disabled(|| {
         let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
         let mut vmm = crate::vmm::VMM.lock();
-        vmm.decommit(&mut frame_allocator, &region, 0, PAGE_SIZE).expect("descomprometimento (armar) falhou");
+        vmm.decommit(&mut frame_allocator, &region, 0, PAGE_SIZE, caller).expect("descomprometimento (armar) falhou");
     });
     crate::serial_println!("safepoint: armado (pagina descomprometida)");
 
@@ -77,7 +78,7 @@ pub extern "C" fn coordinator() -> ! {
     crate::scheduler::with_interrupts_disabled(|| {
         let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
         let mut vmm = crate::vmm::VMM.lock();
-        vmm.commit(&mut frame_allocator, &region, 0, PAGE_SIZE, PageFlags::KERNEL_RW)
+        vmm.commit(&mut frame_allocator, &region, 0, PAGE_SIZE, PageFlags::KERNEL_RW, caller)
             .expect("comprometimento (liberar) falhou");
     });
     crate::serial_println!("safepoint: liberado (pagina comprometida de novo)");

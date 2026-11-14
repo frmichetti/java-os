@@ -106,6 +106,13 @@ pub struct Context {
     /// é só uma instrução `int`, sem nenhum canal de retorno de valor — ver
     /// design.md da change `kernel-timed-wait`.
     pub timed_out: bool,
+    /// `ProcessId` do processo dono desta thread — populado por
+    /// `kernel::scheduler::register_thread` a partir de `Thread::process`
+    /// (antes descartado ali). Usado por `kernel::scheduler::
+    /// current_process_id` para que qualquer *syscall* em andamento saiba
+    /// qual processo é o chamador, sem precisar consultar `Process`/
+    /// `PROCESSES` — ver design.md da change `kernel-handle-ownership`.
+    pub process: ProcessId,
 }
 
 /// Uma thread: unidade de escalonamento dentro de um `Process`, com seu
@@ -234,7 +241,7 @@ pub(crate) fn create_kernel_thread<S: FrameStore>(
     let stack_top = stack::alloc_thread_stack(frame_allocator)?;
     let rsp = unsafe { init_kernel_stack(stack_top, entry) };
     let id = next_thread_id();
-    Ok(Thread { id, process, context: Context { rsp, kernel_stack_top: stack_top, address_space_root: root, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false } })
+    Ok(Thread { id, process, context: Context { rsp, kernel_stack_top: stack_top, address_space_root: root, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false, process } })
 }
 
 /// Aloca a stack de kernel (para troca de contexto/`syscall`) e a stack de
@@ -271,7 +278,7 @@ fn create_user_thread<S: FrameStore>(
         init_stack(kernel_stack_top, entry, USER_CODE_SELECTOR, USER_DATA_SELECTOR, user_stack_top - ABI_ALIGNMENT_PAD)
     };
     let id = next_thread_id();
-    Ok(Thread { id, process, context: Context { rsp, kernel_stack_top, address_space_root: root, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false } })
+    Ok(Thread { id, process, context: Context { rsp, kernel_stack_top, address_space_root: root, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false, process } })
 }
 
 impl Process {

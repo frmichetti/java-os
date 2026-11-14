@@ -7,7 +7,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use crate::phys::{FrameAllocator, FrameStore};
-use crate::process::{self, Context, Process, ProcessError, Thread, ThreadId};
+use crate::process::{self, Context, Process, ProcessError, ProcessId, Thread, ThreadId};
 use crate::sync::Spinlock;
 
 /// Fila circular de todas as threads escalonáveis, em ordem round-robin — a
@@ -82,6 +82,39 @@ static mut CURRENT_FPU_AREA: u64 = 0;
 /// usuário de outra thread ao final de sua chamada.
 #[unsafe(no_mangle)]
 static mut CURRENT_SYSCALL_RSP_SLOT: u64 = 0;
+
+/// `ProcessId.0` (valor cru) do processo dono da thread corrente — mesmo
+/// padrão de `CURRENT_FPU_AREA`/`CURRENT_SYSCALL_RSP_SLOT` (atualizada por
+/// `schedule_next`/`register_boot_thread` a cada troca de contexto), mas
+/// nunca consultada por nenhuma rotina assembly — só por
+/// [`current_process_id`]. **Por que uma leitura direta de global, não
+/// `CONTEXTS.lock()[current_thread_id().0 as usize].process` sob
+/// `with_interrupts_disabled`**: `current_process_id()` é chamada por toda
+/// `sys_*` que cria/consulta um handle (change `kernel-handle-ownership`),
+/// inclusive nos testes de host já existentes de `kernel::syscall` que
+/// chamam `dispatch` diretamente — `with_interrupts_disabled` executa `cli`,
+/// instrução privilegiada que sempre causa `SIGSEGV` em anel 3 (confirmado
+/// ao rodar a suíte: todo teste que chama `SYSCALL_MUTEX_CREATE`/
+/// `SYSCALL_COND_CREATE` via `dispatch` travava o binário de teste inteiro).
+/// Uma leitura direta de `static mut`, sem lock nem instrução privilegiada
+/// nenhuma, é segura em qualquer anel — mesma categoria seguro-em-host de
+/// `CURRENT_FPU_AREA` (nunca lida por nenhum teste hoje, mas por natureza
+/// inofensiva se fosse). **Por que uma única global basta aqui, ao contrário
+/// de `CURRENT_SYSCALL_RSP_SLOT` (que precisou virar por-thread — ver
+/// `KNOW_ISSUES.md`)**: `current_process_id()` sempre é lida uma única vez,
+/// de forma síncrona, bem no início de cada `sys_*`, antes de qualquer
+/// bloqueio possível — nunca precisa sobreviver a uma troca de contexto
+/// dentro da mesma chamada (o valor usado é só a referência já obtida da
+/// tabela de handles, não o `ProcessId` em si).
+static mut CURRENT_PROCESS_ID: u64 = 0;
+
+/// `ProcessId` do processo dono da thread corrente — ver
+/// [`CURRENT_PROCESS_ID`] para o racional completo. Usada por toda `sys_*`
+/// que cria ou consulta um handle de mutex/condvar/arquivo/reserva de
+/// memória virtual (change `kernel-handle-ownership`).
+pub(crate) fn current_process_id() -> ProcessId {
+    ProcessId(unsafe { CURRENT_PROCESS_ID })
+}
 
 /// Aloca o "slot" por-thread descrito em [`CURRENT_SYSCALL_RSP_SLOT`] — uma
 /// única célula `u64`, nunca liberada (mesma disciplina de "leak aceitável
@@ -194,7 +227,7 @@ fn register_thread(thread: Thread) -> ThreadId {
             let mut contexts = CONTEXTS.lock();
             let index = id.0 as usize;
             if contexts.len() <= index {
-                contexts.resize_with(index + 1, || Context { rsp: 0, kernel_stack_top: 0, address_space_root: 0, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false });
+                contexts.resize_with(index + 1, || Context { rsp: 0, kernel_stack_top: 0, address_space_root: 0, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false, process: ProcessId(0) });
             }
             contexts[index] = thread.context;
             // Área de FXSAVE própria desta thread, alocada aqui (único ponto
@@ -279,7 +312,7 @@ pub fn register_boot_thread() -> ThreadId {
     let boot_process = process::next_process_id_for_scheduler();
     let kernel_stack_top = crate::stack::KERNEL_STACK_BASE + crate::stack::KERNEL_STACK_SIZE;
     let address_space_root = crate::paging::current_root();
-    let thread = Thread { id, process: boot_process, context: Context { rsp: 0, kernel_stack_top, address_space_root, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false } };
+    let thread = Thread { id, process: boot_process, context: Context { rsp: 0, kernel_stack_top, address_space_root, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false, process: boot_process } };
     // A stack de kernel confiável precisa estar correta desde já — não dá
     // para esperar o primeiro tick do timer, já que uma troca de privilégio
     // pode, em tese, acontecer antes dele (ver design.md da change
@@ -298,6 +331,11 @@ pub fn register_boot_thread() -> ThreadId {
     // `kernel-timed-wait`) — sem isto, a primeira `syscall` desta thread
     // guardaria/restauraria seu `RSP` de usuário no slot nulo (endereço 0).
     unsafe { CURRENT_SYSCALL_RSP_SLOT = CONTEXTS.lock()[thread_id.0 as usize].syscall_rsp_slot };
+    // Mesmo racional acima, agora para `CURRENT_PROCESS_ID` (change
+    // `kernel-handle-ownership`) — sem isto, a primeira syscall desta thread
+    // que crie/consulte um handle usaria `ProcessId(0)` em vez do processo
+    // real dela.
+    unsafe { CURRENT_PROCESS_ID = CONTEXTS.lock()[thread_id.0 as usize].process.0 };
     thread_id
 }
 
@@ -732,6 +770,12 @@ fn schedule_next(current_rsp: u64) -> u64 {
         // retornar, já que `next` pode retomar em qualquer ponto dentro de
         // `syscall_entry` (ex.: logo após ser despertada de um bloqueio).
         unsafe { CURRENT_SYSCALL_RSP_SLOT = contexts[next.0 as usize].syscall_rsp_slot };
+        // Mesmo racional acima, para `CURRENT_PROCESS_ID` (change
+        // `kernel-handle-ownership`) — precisa já refletir o processo de
+        // `next` antes de `schedule_next` retornar, já que a primeira
+        // syscall dela (ex.: logo após ser despertada) pode precisar
+        // identificar o processo chamador.
+        unsafe { CURRENT_PROCESS_ID = contexts[next.0 as usize].process.0 };
         let next_rsp = contexts[next.0 as usize].rsp;
         // Liberação real de recursos (change `kernel-process-cleanup`): agora
         // que `CR3` já trocou para `next` (acima), nunca mais para a PML4 de
@@ -763,6 +807,23 @@ fn schedule_next(current_rsp: u64) -> u64 {
                 free_before,
                 allocator.free_frames()
             );
+            // Posse de handles/reservas (change `kernel-handle-ownership`):
+            // mesmo ponto, mesmo racional — fecha todo arquivo e libera toda
+            // reserva de memória virtual que só esta thread (processo)
+            // possuía. `pthread_handles` fica deliberadamente de fora (ver
+            // design.md, "Por que `pthread_handles` continua sem destruição
+            // real").
+            let owner = contexts[was_running.0 as usize].process;
+            let files_closed = crate::file_handles::close_all_owned_by(owner);
+            let regions_released = crate::vmm::VMM.lock().release_all_owned_by(&mut allocator, owner);
+            if files_closed > 0 || regions_released > 0 {
+                crate::serial_println!(
+                    "kernel_handle_ownership: thread {} fechou {} arquivo(s) e liberou {} reserva(s) de memoria virtual",
+                    was_running.0,
+                    files_closed,
+                    regions_released
+                );
+            }
         }
         next_rsp
     })

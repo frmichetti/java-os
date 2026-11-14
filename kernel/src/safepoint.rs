@@ -50,7 +50,9 @@ static REGISTRY: Spinlock<SafepointRegistry> = Spinlock::new(SafepointRegistry::
 /// dentro de uma reserva de memória virtual viva (`kernel::vmm::VMM`) —
 /// cobre "Registro de Faixa de Safepoint" da spec.
 pub fn register(base: u64, size: u64) -> Result<(), SafepointError> {
-    let region = crate::vmm::VMM.lock().region_containing(base).ok_or(SafepointError::NotAReservedRange)?;
+    let caller = crate::scheduler::current_process_id();
+    let region =
+        crate::vmm::VMM.lock().region_containing(base, caller).ok_or(SafepointError::NotAReservedRange)?;
     let end = base.checked_add(size).ok_or(SafepointError::NotAReservedRange)?;
     if end > region.base() + region.size() {
         return Err(SafepointError::NotAReservedRange);
@@ -121,7 +123,10 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ensure_vmm_initialized();
 
-        let region = crate::vmm::VMM.lock().reserve(crate::paging::PAGE_SIZE).expect("reserva deveria ter sucesso");
+        let region = crate::vmm::VMM
+            .lock()
+            .reserve(crate::paging::PAGE_SIZE, crate::scheduler::current_process_id())
+            .expect("reserva deveria ter sucesso");
         assert!(register(region.base(), region.size()).is_ok());
         assert!(is_registered(region.base()));
     }

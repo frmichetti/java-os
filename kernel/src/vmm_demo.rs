@@ -27,17 +27,18 @@ fn run_fallible() -> Result<(), VmmError> {
     let region_size = 4 * PAGE_SIZE;
     let commit_len = 2 * PAGE_SIZE;
 
+    let caller = crate::scheduler::current_process_id();
     let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
     let mut vmm = crate::vmm::VMM.lock();
 
-    let region = vmm.reserve(region_size)?;
+    let region = vmm.reserve(region_size, caller)?;
     crate::serial_println!(
         "vmm: reservados 0x{:x} bytes em 0x{:x}, sem memoria fisica comprometida",
         region.size(),
         region.base()
     );
 
-    vmm.commit(&mut frame_allocator, &region, 0, commit_len, WRITE_FLAGS)?;
+    vmm.commit(&mut frame_allocator, &region, 0, commit_len, WRITE_FLAGS, caller)?;
     crate::serial_println!("vmm: 0x{:x} bytes comprometidos em 0x{:x}", commit_len, region.base());
 
     let ptr = region.base() as *mut u8;
@@ -57,20 +58,20 @@ fn run_fallible() -> Result<(), VmmError> {
         );
     }
 
-    vmm.protect(&mut frame_allocator, &region, 0, commit_len, READ_ONLY_FLAGS)?;
+    vmm.protect(&mut frame_allocator, &region, 0, commit_len, READ_ONLY_FLAGS, caller)?;
     crate::serial_println!("vmm: protecao de 0x{:x} bytes em 0x{:x} alterada para somente-leitura", commit_len, region.base());
 
-    vmm.decommit(&mut frame_allocator, &region, 0, commit_len)?;
+    vmm.decommit(&mut frame_allocator, &region, 0, commit_len, caller)?;
     crate::serial_println!("vmm: 0x{:x} bytes descomprometidos em 0x{:x}", commit_len, region.base());
 
     let released_base = region.base();
-    vmm.release(&mut frame_allocator, region)?;
+    vmm.release(&mut frame_allocator, region, caller)?;
     crate::serial_println!("vmm: reserva em 0x{:x} liberada", released_base);
 
     // Reaproveitamento do espaço virtual liberado (cobre "Reaproveitamento
     // de Faixas Virtuais Liberadas" da spec) — não depende de nenhum #PF,
     // só da contabilidade pura de `RangeAllocator`.
-    let region2 = vmm.reserve(region_size)?;
+    let region2 = vmm.reserve(region_size, caller)?;
     if region2.base() == released_base {
         crate::serial_println!("vmm: nova reserva reaproveitou o espaco virtual liberado (base 0x{:x}) - PASSOU", region2.base());
     } else {
@@ -80,7 +81,7 @@ fn run_fallible() -> Result<(), VmmError> {
             released_base
         );
     }
-    vmm.release(&mut frame_allocator, region2)?;
+    vmm.release(&mut frame_allocator, region2, caller)?;
 
     Ok(())
 }

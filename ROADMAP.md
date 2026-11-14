@@ -240,29 +240,43 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
   quanto por exceção de CPU (`kernel-fault-isolation`). A própria PML4 (4 KiB) fica
   retida de propósito — evita um ponteiro *dangling* no `Process`, que continua
   existindo para sempre.
-- **Ainda vazam**: entradas em `pthread_handles`/`file_handles`, janelas de
-  `kernel::vmm`, o pool de stacks de *kernel* (`kernel::stack`), e o próprio
-  `Process`/`Thread` nas tabelas de bookkeeping do escalonador — nenhum rastreia
-  qual processo é dono de qual entrada hoje. Ver "Próximo passo imediato".
 - Verificado em boot real: o log de boot mostra a liberação de toda thread que
   termina (voluntária ou involuntária), cada uma com um ganho positivo e plausível
   de frames livres (8 a 20, compatível com o tamanho real de cada ELF/stack) — não
   só `/bin/fault.elf`, mas também `test.elf`/`libctest.elf`/`cxxtest.elf`/
   `javaosvm.elf`/`jpthread.elf`/`libm.elf`/`timedw.elf`.
+- **As tabelas de handle (`pthread_handles`, `file_handles`, janela de
+  `kernel::vmm`) ganharam posse por processo** (`kernel-handle-ownership`):
+  `kernel::process::Context` ganha `process: ProcessId`, e cada tabela passa a
+  exigir o dono na criação e rejeitar (com o mesmo sentinela de "handle
+  desconhecido" já existente, nenhum código de erro novo) qualquer consulta
+  cujo chamador não seja o dono — um processo nunca mais consegue acessar o
+  handle de outro. Ao terminar, `kernel::file_handles::close_all_owned_by` e
+  `kernel::vmm::release_all_owned_by` fecham/liberam os arquivos/reservas do
+  processo encerrado, chamadas do mesmo ponto de `schedule_next` que já libera
+  a memória física (`kernel-process-cleanup`). **`pthread_handles` ganhou só a
+  parte de isolamento** (posse + rejeição entre processos) — continua vazando
+  os próprios objetos `Mutex`/`CondVar` (`Box::leak`'d), Non-Goal documentado
+  desde `kernel-pthread-sync` e mantido deliberadamente nesta change (ver
+  design.md de `kernel-handle-ownership`, "Por que `pthread_handles` continua
+  sem destruição real").
+- **Ainda vazam**: os próprios objetos de `pthread_handles` (acima), o pool de
+  stacks de *kernel* (`kernel::stack`), e o próprio `Process`/`Thread` nas
+  tabelas de bookkeeping do escalonador (nunca removidos dos vetores globais).
+- Verificado em boot real (`cargo xtask test`): o log mostra, logo após o
+  diagnóstico já existente de frames físicos liberados, `kernel_handle_ownership:
+  thread N fechou X arquivo(s) e liberou Y reserva(s) de memoria virtual` para
+  cada thread terminada que de fato possuía arquivos/reservas abertos (ex.:
+  a thread coordenadora de `kernel::safepoint_demo`, liberando sua página de
+  poll reservada ao terminar).
 
 ## O que está previsto
 
 ### Próximo passo imediato
-- **Isolar as tabelas de handle hoje globais (`pthread_handles`, `file_handles`,
-  janela de `kernel::vmm`) por processo/espaço de endereçamento** — pré-requisito
-  para liberar essas entradas quando o processo dono termina (hoje nenhuma delas
-  rastreia qual processo é dono de qual entrada, então não há como saber o que
-  liberar). Com a memória física já sendo recuperada (`kernel-process-cleanup`),
-  este é o próximo vazamento mais significativo.
-
-### Médio prazo
 - Esquema de erro granular (`errno`-like) nas syscalls, e validação de ponteiro de
   usuário (hoje não validado, mesmo precedente de `sys_write`).
+
+### Médio prazo
 - Parsing de ACPI/MADT, para hardware real além de QEMU/VirtualBox/VMware.
 
 ### Longo prazo

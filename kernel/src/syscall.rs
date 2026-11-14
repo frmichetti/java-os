@@ -153,7 +153,7 @@ fn prot_to_page_flags(prot: u64) -> PageFlags {
 /// `SYSCALL_VM_RESERVE`. Devolve o endereço base da reserva, ou
 /// `SYSCALL_ERROR` (tamanho zero, ou sem espaço virtual livre suficiente).
 fn sys_vm_reserve(size: u64) -> u64 {
-    match VMM.lock().reserve(size) {
+    match VMM.lock().reserve(size, crate::scheduler::current_process_id()) {
         Ok(region) => region.base(),
         Err(_) => SYSCALL_ERROR,
     }
@@ -167,16 +167,17 @@ fn sys_vm_reserve(size: u64) -> u64 {
 /// `SYSCALL_ERROR`.
 fn sys_vm_commit(addr: u64, len: u64, prot: u64) -> u64 {
     let flags = prot_to_page_flags(prot);
+    let caller = crate::scheduler::current_process_id();
     // Mesma ordem de aquisição de `kernel::vmm_demo` (frame allocator antes
     // de `VMM`) — evitar inversão de ordem de locks entre os dois pontos do
     // kernel que tocam ambos.
     let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
     let mut vmm = VMM.lock();
-    let Some(region) = vmm.region_containing(addr) else {
+    let Some(region) = vmm.region_containing(addr, caller) else {
         return SYSCALL_ERROR;
     };
     let offset = addr - region.base();
-    match vmm.commit(&mut frame_allocator, &region, offset, len, flags) {
+    match vmm.commit(&mut frame_allocator, &region, offset, len, flags, caller) {
         Ok(()) => 0,
         Err(_) => SYSCALL_ERROR,
     }
@@ -185,13 +186,14 @@ fn sys_vm_commit(addr: u64, len: u64, prot: u64) -> u64 {
 /// Descompromete `len` bytes a partir de `addr` — cobre
 /// `SYSCALL_VM_DECOMMIT`. Mesma tradução addr→`Region` de [`sys_vm_commit`].
 fn sys_vm_decommit(addr: u64, len: u64) -> u64 {
+    let caller = crate::scheduler::current_process_id();
     let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
     let mut vmm = VMM.lock();
-    let Some(region) = vmm.region_containing(addr) else {
+    let Some(region) = vmm.region_containing(addr, caller) else {
         return SYSCALL_ERROR;
     };
     let offset = addr - region.base();
-    match vmm.decommit(&mut frame_allocator, &region, offset, len) {
+    match vmm.decommit(&mut frame_allocator, &region, offset, len, caller) {
         Ok(()) => 0,
         Err(_) => SYSCALL_ERROR,
     }
@@ -202,13 +204,14 @@ fn sys_vm_decommit(addr: u64, len: u64) -> u64 {
 /// addr→`Region` de [`sys_vm_commit`].
 fn sys_vm_protect(addr: u64, len: u64, prot: u64) -> u64 {
     let flags = prot_to_page_flags(prot);
+    let caller = crate::scheduler::current_process_id();
     let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
     let mut vmm = VMM.lock();
-    let Some(region) = vmm.region_containing(addr) else {
+    let Some(region) = vmm.region_containing(addr, caller) else {
         return SYSCALL_ERROR;
     };
     let offset = addr - region.base();
-    match vmm.protect(&mut frame_allocator, &region, offset, len, flags) {
+    match vmm.protect(&mut frame_allocator, &region, offset, len, flags, caller) {
         Ok(()) => 0,
         Err(_) => SYSCALL_ERROR,
     }
@@ -222,15 +225,16 @@ fn sys_vm_protect(addr: u64, len: u64, prot: u64) -> u64 {
 /// o mapeamento inteiro identificado pelo seu endereço inicial) — ver
 /// design.md, tabela de numeração.
 fn sys_vm_release(addr: u64) -> u64 {
+    let caller = crate::scheduler::current_process_id();
     let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
     let mut vmm = VMM.lock();
-    let Some(region) = vmm.region_containing(addr) else {
+    let Some(region) = vmm.region_containing(addr, caller) else {
         return SYSCALL_ERROR;
     };
     if region.base() != addr {
         return SYSCALL_ERROR;
     }
-    match vmm.release(&mut frame_allocator, region) {
+    match vmm.release(&mut frame_allocator, region, caller) {
         Ok(()) => 0,
         Err(_) => SYSCALL_ERROR,
     }
@@ -238,15 +242,16 @@ fn sys_vm_release(addr: u64) -> u64 {
 
 /// Cria um novo mutex nomeado — cobre `SYSCALL_MUTEX_CREATE`. Nunca falha.
 fn sys_mutex_create() -> u64 {
-    crate::pthread_handles::create_mutex()
+    crate::pthread_handles::create_mutex(crate::scheduler::current_process_id())
 }
 
 /// Adquire o mutex identificado por `handle`, bloqueando a thread chamadora
 /// (sem busy-wait) se já estiver tomado por outra thread — cobre
 /// `SYSCALL_MUTEX_LOCK`. `SYSCALL_ERROR` se `handle` não corresponder a
-/// nenhum mutex criado.
+/// nenhum mutex criado pelo processo chamador (desconhecido, ou pertencente a
+/// outro processo — ver design.md da change `kernel-handle-ownership`).
 fn sys_mutex_lock(handle: u64) -> u64 {
-    match crate::pthread_handles::mutex(handle) {
+    match crate::pthread_handles::mutex(handle, crate::scheduler::current_process_id()) {
         Some(mutex) => {
             mutex.lock();
             0
@@ -258,9 +263,9 @@ fn sys_mutex_lock(handle: u64) -> u64 {
 /// Tenta adquirir o mutex identificado por `handle` sem bloquear a thread
 /// chamadora — cobre `SYSCALL_MUTEX_TRYLOCK`. `0` se adquirido agora,
 /// `SYSCALL_ERROR` se já estava tomado (por esta ou por outra thread) ou se
-/// `handle` não corresponder a nenhum mutex criado.
+/// `handle` não corresponder a nenhum mutex criado pelo processo chamador.
 fn sys_mutex_trylock(handle: u64) -> u64 {
-    match crate::pthread_handles::mutex(handle) {
+    match crate::pthread_handles::mutex(handle, crate::scheduler::current_process_id()) {
         Some(mutex) => {
             if mutex.try_acquire() {
                 0
@@ -274,9 +279,9 @@ fn sys_mutex_trylock(handle: u64) -> u64 {
 
 /// Libera o mutex identificado por `handle`, acordando uma thread em espera
 /// para adquiri-lo, se houver — cobre `SYSCALL_MUTEX_UNLOCK`. `SYSCALL_ERROR`
-/// se `handle` não corresponder a nenhum mutex criado.
+/// se `handle` não corresponder a nenhum mutex criado pelo processo chamador.
 fn sys_mutex_unlock(handle: u64) -> u64 {
-    match crate::pthread_handles::mutex(handle) {
+    match crate::pthread_handles::mutex(handle, crate::scheduler::current_process_id()) {
         Some(mutex) => {
             mutex.unlock();
             0
@@ -288,7 +293,7 @@ fn sys_mutex_unlock(handle: u64) -> u64 {
 /// Cria uma nova variável de condição nomeada — cobre `SYSCALL_COND_CREATE`.
 /// Nunca falha.
 fn sys_cond_create() -> u64 {
-    crate::pthread_handles::create_cond()
+    crate::pthread_handles::create_cond(crate::scheduler::current_process_id())
 }
 
 /// Libera `mutex_handle` e bloqueia a thread chamadora em `cond_handle`,
@@ -302,10 +307,11 @@ fn sys_cond_create() -> u64 {
 /// `SYSCALL_TIMEOUT` se `timeout_nanos > 0` e o prazo expirar antes de
 /// qualquer notificação.
 fn sys_cond_wait(cond_handle: u64, mutex_handle: u64, timeout_nanos: u64) -> u64 {
-    let Some(cond) = crate::pthread_handles::cond(cond_handle) else {
+    let caller = crate::scheduler::current_process_id();
+    let Some(cond) = crate::pthread_handles::cond(cond_handle, caller) else {
         return SYSCALL_ERROR;
     };
-    let Some(mutex) = crate::pthread_handles::mutex(mutex_handle) else {
+    let Some(mutex) = crate::pthread_handles::mutex(mutex_handle, caller) else {
         return SYSCALL_ERROR;
     };
     if timeout_nanos == 0 {
@@ -321,7 +327,7 @@ fn sys_cond_wait(cond_handle: u64, mutex_handle: u64, timeout_nanos: u64) -> u64
 /// `SYSCALL_ERROR` se `handle` não corresponder a nenhuma variável de
 /// condição criada.
 fn sys_cond_notify_one(handle: u64) -> u64 {
-    match crate::pthread_handles::cond(handle) {
+    match crate::pthread_handles::cond(handle, crate::scheduler::current_process_id()) {
         Some(cond) => {
             cond.notify_one();
             0
@@ -335,7 +341,7 @@ fn sys_cond_notify_one(handle: u64) -> u64 {
 /// `SYSCALL_ERROR` se `handle` não corresponder a nenhuma variável de
 /// condição criada.
 fn sys_cond_notify_all(handle: u64) -> u64 {
-    match crate::pthread_handles::cond(handle) {
+    match crate::pthread_handles::cond(handle, crate::scheduler::current_process_id()) {
         Some(cond) => {
             cond.notify_all();
             0
@@ -436,7 +442,7 @@ unsafe fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
     // o arquivo inteiro é lido de uma vez para memória (ver design.md,
     // Non-Goals: sem leitura incremental por cluster).
     match crate::storage::with_disk(|disk| fs.read_file(disk, path)) {
-        Some(Ok(contents)) => crate::file_handles::register(contents),
+        Some(Ok(contents)) => crate::file_handles::register(contents, crate::scheduler::current_process_id()),
         _ => SYSCALL_ERROR,
     }
 }
@@ -452,7 +458,8 @@ unsafe fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
 /// `buf_ptr`/`buf_len` vêm diretamente do chamador em modo usuário, sem
 /// validação — mesmo precedente de `sys_write`.
 unsafe fn sys_read(handle: u64, buf_ptr: u64, buf_len: u64) -> u64 {
-    let Some(bytes) = crate::file_handles::read(handle, buf_len as usize) else {
+    let Some(bytes) = crate::file_handles::read(handle, buf_len as usize, crate::scheduler::current_process_id())
+    else {
         return SYSCALL_ERROR;
     };
     let dest = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, bytes.len()) };
@@ -464,7 +471,7 @@ unsafe fn sys_read(handle: u64, buf_ptr: u64, buf_len: u64) -> u64 {
 /// associados a ele — cobre `SYSCALL_CLOSE`. `SYSCALL_ERROR` se `handle`
 /// não corresponder a nenhum arquivo atualmente aberto.
 fn sys_close(handle: u64) -> u64 {
-    if crate::file_handles::close(handle) { 0 } else { SYSCALL_ERROR }
+    if crate::file_handles::close(handle, crate::scheduler::current_process_id()) { 0 } else { SYSCALL_ERROR }
 }
 
 /// Termina a thread chamadora — cobre `SYSCALL_EXIT`. Delega inteiramente a

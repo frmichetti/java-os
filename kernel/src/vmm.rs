@@ -19,6 +19,7 @@ use alloc::vec::Vec;
 use crate::hhdm;
 use crate::paging::{MapError, Mapper, PageFlags, PAGE_SIZE};
 use crate::phys::{FrameAllocator, FrameStore};
+use crate::process::ProcessId;
 use crate::sync::Spinlock;
 
 /// Primeiro endereço virtual da faixa fixa reservada para `kernel::vmm`:
@@ -170,6 +171,7 @@ impl Region {
 }
 
 struct ReservationState {
+    owner: ProcessId,
     size: u64,
     generation: u64,
     /// `committed[i]` é `true` se a página `i` (a partir de `base`) está
@@ -191,24 +193,29 @@ impl ReservationTable {
         Self { reservations: BTreeMap::new(), next_generation: 0 }
     }
 
-    fn reserve(&mut self, base: u64, size: u64) -> Region {
+    fn reserve(&mut self, base: u64, size: u64, owner: ProcessId) -> Region {
         let generation = self.next_generation;
         self.next_generation += 1;
         let pages = (size / PAGE_SIZE) as usize;
-        self.reservations.insert(base, ReservationState { size, generation, committed: alloc::vec![false; pages] });
+        self.reservations.insert(base, ReservationState { owner, size, generation, committed: alloc::vec![false; pages] });
         Region { base, size, generation }
     }
 
-    fn lookup(&self, region: &Region) -> Result<&ReservationState, VmmError> {
+    /// Devolve o estado da reserva identificada por `region`, só se `caller`
+    /// for o processo dono dela — mesmo sentinela de erro (`StaleHandle`) de
+    /// um `handle`/geração que nunca existiu, tanto para um `handle`
+    /// desconhecido quanto para um que existe mas pertence a outro processo
+    /// (ver design.md da change `kernel-handle-ownership`).
+    fn lookup(&self, region: &Region, caller: ProcessId) -> Result<&ReservationState, VmmError> {
         match self.reservations.get(&region.base) {
-            Some(state) if state.generation == region.generation => Ok(state),
+            Some(state) if state.generation == region.generation && state.owner == caller => Ok(state),
             _ => Err(VmmError::StaleHandle),
         }
     }
 
-    fn lookup_mut(&mut self, region: &Region) -> Result<&mut ReservationState, VmmError> {
+    fn lookup_mut(&mut self, region: &Region, caller: ProcessId) -> Result<&mut ReservationState, VmmError> {
         match self.reservations.get_mut(&region.base) {
-            Some(state) if state.generation == region.generation => Ok(state),
+            Some(state) if state.generation == region.generation && state.owner == caller => Ok(state),
             _ => Err(VmmError::StaleHandle),
         }
     }
@@ -230,8 +237,8 @@ impl ReservationTable {
     /// totalmente livre (nenhuma página já comprometida), sem alterar nada —
     /// cobre "nenhum frame físico SHALL ser alocado como efeito colateral"
     /// de um comprometimento rejeitado.
-    fn validate_commit(&self, region: &Region, offset: u64, len: u64) -> Result<(), VmmError> {
-        let state = self.lookup(region)?;
+    fn validate_commit(&self, region: &Region, offset: u64, len: u64, caller: ProcessId) -> Result<(), VmmError> {
+        let state = self.lookup(region, caller)?;
         let pages = Self::page_range(state, offset, len)?;
         if state.committed[pages].iter().any(|&c| c) {
             return Err(VmmError::AlreadyCommitted);
@@ -242,8 +249,9 @@ impl ReservationTable {
     /// Marca `offset..offset+len` como comprometida. Só deve ser chamada
     /// depois de `validate_commit` ter sido aceita e de todo o mapeamento
     /// real correspondente já ter sido feito com sucesso.
-    fn mark_committed(&mut self, region: &Region, offset: u64, len: u64) {
-        let state = self.lookup_mut(region).expect("region validada por validate_commit deveria continuar valida");
+    fn mark_committed(&mut self, region: &Region, offset: u64, len: u64, caller: ProcessId) {
+        let state =
+            self.lookup_mut(region, caller).expect("region validada por validate_commit deveria continuar valida");
         let pages = Self::page_range(state, offset, len).expect("limites ja validados por validate_commit");
         for committed in &mut state.committed[pages] {
             *committed = true;
@@ -252,8 +260,8 @@ impl ReservationTable {
 
     /// Valida que `offset..offset+len` está dentro dos limites da reserva e
     /// totalmente comprometida — usado por `decommit` e `protect`.
-    fn validate_fully_committed(&self, region: &Region, offset: u64, len: u64) -> Result<(), VmmError> {
-        let state = self.lookup(region)?;
+    fn validate_fully_committed(&self, region: &Region, offset: u64, len: u64, caller: ProcessId) -> Result<(), VmmError> {
+        let state = self.lookup(region, caller)?;
         let pages = Self::page_range(state, offset, len)?;
         if state.committed[pages].iter().any(|&c| !c) {
             return Err(VmmError::NotCommitted);
@@ -264,8 +272,10 @@ impl ReservationTable {
     /// Marca `offset..offset+len` como não comprometida. Só deve ser
     /// chamada depois de `validate_fully_committed` ter sido aceita e de
     /// todo o desmapeamento real correspondente já ter sido feito.
-    fn mark_decommitted(&mut self, region: &Region, offset: u64, len: u64) {
-        let state = self.lookup_mut(region).expect("region validada por validate_fully_committed deveria continuar valida");
+    fn mark_decommitted(&mut self, region: &Region, offset: u64, len: u64, caller: ProcessId) {
+        let state = self
+            .lookup_mut(region, caller)
+            .expect("region validada por validate_fully_committed deveria continuar valida");
         let pages = Self::page_range(state, offset, len).expect("limites ja validados por validate_fully_committed");
         for committed in &mut state.committed[pages] {
             *committed = false;
@@ -273,13 +283,14 @@ impl ReservationTable {
     }
 
     /// Busca a reserva viva cujo intervalo `[base, base+size)` contém
-    /// `addr` — ver design.md da change `kernel-jvm-posix-syscalls`, "VM por
-    /// endereço". `None` se `addr` não cair dentro de nenhuma reserva viva
-    /// (incluindo uma já liberada: `remove` já apagou sua entrada deste
-    /// `BTreeMap`).
-    fn region_containing(&self, addr: u64) -> Option<Region> {
+    /// `addr`, só se `caller` for a dona — ver design.md da change
+    /// `kernel-jvm-posix-syscalls`, "VM por endereço", e
+    /// `kernel-handle-ownership`. `None` se `addr` não cair dentro de nenhuma
+    /// reserva viva (incluindo uma já liberada), ou se a reserva encontrada
+    /// pertencer a outro processo.
+    fn region_containing(&self, addr: u64, caller: ProcessId) -> Option<Region> {
         let (&base, state) = self.reservations.range(..=addr).next_back()?;
-        if addr < base + state.size {
+        if addr < base + state.size && state.owner == caller {
             Some(Region { base, size: state.size, generation: state.generation })
         } else {
             None
@@ -290,8 +301,8 @@ impl ReservationTable {
     /// partir da base da reserva) de cada página que ainda estava
     /// comprometida — para o chamador descomprometer de verdade antes de
     /// devolver o espaço virtual ao `RangeAllocator`.
-    fn remove(&mut self, region: &Region) -> Result<Vec<u64>, VmmError> {
-        self.lookup(region)?; // valida a geração antes de mexer em qualquer coisa
+    fn remove(&mut self, region: &Region, caller: ProcessId) -> Result<Vec<u64>, VmmError> {
+        self.lookup(region, caller)?; // valida geracao e dono antes de mexer em qualquer coisa
         let state = self.reservations.remove(&region.base).expect("presenca ja confirmada por lookup");
         let committed_offsets = state
             .committed
@@ -335,20 +346,20 @@ impl Vmm {
     /// "VM por endereço": necessário porque a ABI de syscall (convenção
     /// `mmap`/`munmap`/`mprotect`: endereço + tamanho) não tem onde carregar
     /// de volta o `Region` opaco que `reserve` devolveu.
-    pub fn region_containing(&self, addr: u64) -> Option<Region> {
-        self.table.region_containing(addr)
+    pub fn region_containing(&self, addr: u64, caller: ProcessId) -> Option<Region> {
+        self.table.region_containing(addr, caller)
     }
 
     /// Reserva `size` bytes (arredondado para cima em páginas) de memória
-    /// virtual anônima, sem comprometer nenhuma memória física — cobre
-    /// "Reserva de Faixa de Memória Virtual Anônima" da spec.
-    pub fn reserve(&mut self, size: u64) -> Result<Region, VmmError> {
+    /// virtual anônima, dona `owner`, sem comprometer nenhuma memória física
+    /// — cobre "Reserva de Faixa de Memória Virtual Anônima" da spec.
+    pub fn reserve(&mut self, size: u64, owner: ProcessId) -> Result<Region, VmmError> {
         if size == 0 {
             return Err(VmmError::Misaligned);
         }
         let rounded = size.div_ceil(PAGE_SIZE) * PAGE_SIZE;
         let base = self.ranges.allocate(rounded).ok_or(VmmError::OutOfVirtualSpace)?;
-        Ok(self.table.reserve(base, rounded))
+        Ok(self.table.reserve(base, rounded, owner))
     }
 
     /// Compromete a sub-região `offset..offset+len` de `region`: aloca um
@@ -363,8 +374,9 @@ impl Vmm {
         offset: u64,
         len: u64,
         flags: PageFlags,
+        caller: ProcessId,
     ) -> Result<(), VmmError> {
-        self.table.validate_commit(region, offset, len)?;
+        self.table.validate_commit(region, offset, len, caller)?;
 
         let pages = len / PAGE_SIZE;
         for i in 0..pages {
@@ -379,7 +391,7 @@ impl Vmm {
                 .expect("pagina recem-reservada nao deveria colidir com um mapeamento existente");
         }
 
-        self.table.mark_committed(region, offset, len);
+        self.table.mark_committed(region, offset, len, caller);
         Ok(())
     }
 
@@ -393,8 +405,9 @@ impl Vmm {
         region: &Region,
         offset: u64,
         len: u64,
+        caller: ProcessId,
     ) -> Result<(), VmmError> {
-        self.table.validate_fully_committed(region, offset, len)?;
+        self.table.validate_fully_committed(region, offset, len, caller)?;
 
         let pages = len / PAGE_SIZE;
         for i in 0..pages {
@@ -405,7 +418,7 @@ impl Vmm {
             frame_allocator.free(frame).expect("frame recem-desmapeado deveria pertencer a este alocador");
         }
 
-        self.table.mark_decommitted(region, offset, len);
+        self.table.mark_decommitted(region, offset, len, caller);
         Ok(())
     }
 
@@ -419,8 +432,9 @@ impl Vmm {
         offset: u64,
         len: u64,
         flags: PageFlags,
+        caller: ProcessId,
     ) -> Result<(), VmmError> {
-        self.table.validate_fully_committed(region, offset, len)?;
+        self.table.validate_fully_committed(region, offset, len, caller)?;
 
         let pages = len / PAGE_SIZE;
         let mut mapper = Mapper::new(frame_allocator);
@@ -445,8 +459,9 @@ impl Vmm {
         &mut self,
         frame_allocator: &mut FrameAllocator<S>,
         region: Region,
+        caller: ProcessId,
     ) -> Result<(), VmmError> {
-        let committed_offsets = self.table.remove(&region)?;
+        let committed_offsets = self.table.remove(&region, caller)?;
 
         for offset in committed_offsets {
             let virt = region.base + offset;
@@ -458,6 +473,31 @@ impl Vmm {
 
         self.ranges.release(region.base, region.size);
         Ok(())
+    }
+
+    /// Libera toda reserva ainda viva pertencente a `owner` — chamada quando
+    /// o processo dono termina (`kernel::scheduler::schedule_next`, mesmo
+    /// ponto que já chama `AddressSpace::free_user_mappings` — ver design.md
+    /// da change `kernel-handle-ownership`). Devolve quantas reservas foram
+    /// liberadas, só para diagnóstico.
+    pub(crate) fn release_all_owned_by<S: FrameStore>(
+        &mut self,
+        frame_allocator: &mut FrameAllocator<S>,
+        owner: ProcessId,
+    ) -> usize {
+        let regions: Vec<Region> = self
+            .table
+            .reservations
+            .iter()
+            .filter(|(_, state)| state.owner == owner)
+            .map(|(&base, state)| Region { base, size: state.size, generation: state.generation })
+            .collect();
+        let released = regions.len();
+        for region in regions {
+            self.release(frame_allocator, region, owner)
+                .expect("region filtrada por dono==owner nao deveria falhar na checagem de posse");
+        }
+        released
     }
 }
 
@@ -555,112 +595,161 @@ mod tests {
     // ReservationTable (tarefa 2.2)
     // -------------------------------------------------------------
 
+    const OWNER: ProcessId = ProcessId(1);
+    const OTHER: ProcessId = ProcessId(2);
+
     #[test]
     fn committing_within_bounds_marks_exactly_the_right_pages() {
         let mut table = ReservationTable::empty();
-        let region = table.reserve(0x1000, 4 * PAGE_SIZE);
+        let region = table.reserve(0x1000, 4 * PAGE_SIZE, OWNER);
 
-        table.validate_commit(&region, PAGE_SIZE, 2 * PAGE_SIZE).unwrap();
-        table.mark_committed(&region, PAGE_SIZE, 2 * PAGE_SIZE);
+        table.validate_commit(&region, PAGE_SIZE, 2 * PAGE_SIZE, OWNER).unwrap();
+        table.mark_committed(&region, PAGE_SIZE, 2 * PAGE_SIZE, OWNER);
 
-        let state = table.lookup(&region).unwrap();
+        let state = table.lookup(&region, OWNER).unwrap();
         assert_eq!(state.committed, alloc::vec![false, true, true, false]);
     }
 
     #[test]
     fn committing_out_of_bounds_is_rejected_without_changing_state() {
         let mut table = ReservationTable::empty();
-        let region = table.reserve(0x1000, 2 * PAGE_SIZE);
+        let region = table.reserve(0x1000, 2 * PAGE_SIZE, OWNER);
 
-        assert_eq!(table.validate_commit(&region, PAGE_SIZE, 2 * PAGE_SIZE), Err(VmmError::OutOfBounds));
-        assert_eq!(table.lookup(&region).unwrap().committed, alloc::vec![false, false]);
+        assert_eq!(table.validate_commit(&region, PAGE_SIZE, 2 * PAGE_SIZE, OWNER), Err(VmmError::OutOfBounds));
+        assert_eq!(table.lookup(&region, OWNER).unwrap().committed, alloc::vec![false, false]);
     }
 
     #[test]
     fn committing_an_already_committed_sub_region_is_rejected() {
         let mut table = ReservationTable::empty();
-        let region = table.reserve(0x1000, 4 * PAGE_SIZE);
-        table.validate_commit(&region, 0, 2 * PAGE_SIZE).unwrap();
-        table.mark_committed(&region, 0, 2 * PAGE_SIZE);
+        let region = table.reserve(0x1000, 4 * PAGE_SIZE, OWNER);
+        table.validate_commit(&region, 0, 2 * PAGE_SIZE, OWNER).unwrap();
+        table.mark_committed(&region, 0, 2 * PAGE_SIZE, OWNER);
 
         // Sobreposição parcial com o que já está comprometido.
-        assert_eq!(table.validate_commit(&region, PAGE_SIZE, 2 * PAGE_SIZE), Err(VmmError::AlreadyCommitted));
+        assert_eq!(table.validate_commit(&region, PAGE_SIZE, 2 * PAGE_SIZE, OWNER), Err(VmmError::AlreadyCommitted));
         // Estado inalterado pela tentativa rejeitada.
-        assert_eq!(table.lookup(&region).unwrap().committed, alloc::vec![true, true, false, false]);
+        assert_eq!(table.lookup(&region, OWNER).unwrap().committed, alloc::vec![true, true, false, false]);
     }
 
     #[test]
     fn decommitting_clears_the_committed_pages() {
         let mut table = ReservationTable::empty();
-        let region = table.reserve(0x1000, 2 * PAGE_SIZE);
-        table.validate_commit(&region, 0, 2 * PAGE_SIZE).unwrap();
-        table.mark_committed(&region, 0, 2 * PAGE_SIZE);
+        let region = table.reserve(0x1000, 2 * PAGE_SIZE, OWNER);
+        table.validate_commit(&region, 0, 2 * PAGE_SIZE, OWNER).unwrap();
+        table.mark_committed(&region, 0, 2 * PAGE_SIZE, OWNER);
 
-        table.validate_fully_committed(&region, 0, 2 * PAGE_SIZE).unwrap();
-        table.mark_decommitted(&region, 0, 2 * PAGE_SIZE);
+        table.validate_fully_committed(&region, 0, 2 * PAGE_SIZE, OWNER).unwrap();
+        table.mark_decommitted(&region, 0, 2 * PAGE_SIZE, OWNER);
 
-        assert_eq!(table.lookup(&region).unwrap().committed, alloc::vec![false, false]);
+        assert_eq!(table.lookup(&region, OWNER).unwrap().committed, alloc::vec![false, false]);
     }
 
     #[test]
     fn protect_requires_the_whole_sub_region_to_already_be_committed() {
         let mut table = ReservationTable::empty();
-        let region = table.reserve(0x1000, 2 * PAGE_SIZE);
+        let region = table.reserve(0x1000, 2 * PAGE_SIZE, OWNER);
 
-        assert_eq!(table.validate_fully_committed(&region, 0, 2 * PAGE_SIZE), Err(VmmError::NotCommitted));
+        assert_eq!(table.validate_fully_committed(&region, 0, 2 * PAGE_SIZE, OWNER), Err(VmmError::NotCommitted));
 
-        table.validate_commit(&region, 0, PAGE_SIZE).unwrap();
-        table.mark_committed(&region, 0, PAGE_SIZE);
+        table.validate_commit(&region, 0, PAGE_SIZE, OWNER).unwrap();
+        table.mark_committed(&region, 0, PAGE_SIZE, OWNER);
         // Só a primeira página está comprometida; a segunda ainda não.
-        assert_eq!(table.validate_fully_committed(&region, 0, 2 * PAGE_SIZE), Err(VmmError::NotCommitted));
+        assert_eq!(table.validate_fully_committed(&region, 0, 2 * PAGE_SIZE, OWNER), Err(VmmError::NotCommitted));
 
-        table.validate_commit(&region, PAGE_SIZE, PAGE_SIZE).unwrap();
-        table.mark_committed(&region, PAGE_SIZE, PAGE_SIZE);
-        assert!(table.validate_fully_committed(&region, 0, 2 * PAGE_SIZE).is_ok());
+        table.validate_commit(&region, PAGE_SIZE, PAGE_SIZE, OWNER).unwrap();
+        table.mark_committed(&region, PAGE_SIZE, PAGE_SIZE, OWNER);
+        assert!(table.validate_fully_committed(&region, 0, 2 * PAGE_SIZE, OWNER).is_ok());
     }
 
     #[test]
     fn region_containing_finds_the_reservation_that_owns_the_address() {
         let mut table = ReservationTable::empty();
-        let region = table.reserve(0x1000, 4 * PAGE_SIZE);
+        let region = table.reserve(0x1000, 4 * PAGE_SIZE, OWNER);
 
-        assert_eq!(table.region_containing(0x1000), Some(region));
-        assert_eq!(table.region_containing(0x1000 + PAGE_SIZE), Some(region));
-        assert_eq!(table.region_containing(0x1000 + 4 * PAGE_SIZE - 1), Some(region));
+        assert_eq!(table.region_containing(0x1000, OWNER), Some(region));
+        assert_eq!(table.region_containing(0x1000 + PAGE_SIZE, OWNER), Some(region));
+        assert_eq!(table.region_containing(0x1000 + 4 * PAGE_SIZE - 1, OWNER), Some(region));
     }
 
     #[test]
     fn region_containing_rejects_an_address_outside_any_reservation() {
         let mut table = ReservationTable::empty();
-        table.reserve(0x1000, PAGE_SIZE);
+        table.reserve(0x1000, PAGE_SIZE, OWNER);
 
-        assert_eq!(table.region_containing(0x0999), None);
-        assert_eq!(table.region_containing(0x1000 + PAGE_SIZE), None);
+        assert_eq!(table.region_containing(0x0999, OWNER), None);
+        assert_eq!(table.region_containing(0x1000 + PAGE_SIZE, OWNER), None);
     }
 
     #[test]
     fn region_containing_rejects_an_address_inside_a_released_reservation() {
         let mut table = ReservationTable::empty();
-        let region = table.reserve(0x1000, PAGE_SIZE);
-        table.remove(&region).unwrap();
+        let region = table.reserve(0x1000, PAGE_SIZE, OWNER);
+        table.remove(&region, OWNER).unwrap();
 
-        assert_eq!(table.region_containing(0x1000), None);
+        assert_eq!(table.region_containing(0x1000, OWNER), None);
+    }
+
+    #[test]
+    fn region_containing_rejects_a_reservation_owned_by_another_process() {
+        let mut table = ReservationTable::empty();
+        table.reserve(0x1000, PAGE_SIZE, OWNER);
+
+        assert_eq!(table.region_containing(0x1000, OTHER), None);
     }
 
     #[test]
     fn a_stale_handle_is_rejected_even_after_its_address_is_reused() {
         let mut table = ReservationTable::empty();
-        let old = table.reserve(0x1000, PAGE_SIZE);
-        table.remove(&old).unwrap();
+        let old = table.reserve(0x1000, PAGE_SIZE, OWNER);
+        table.remove(&old, OWNER).unwrap();
 
         // Uma reserva nova reaproveita exatamente o mesmo endereço base
         // (simulando o `RangeAllocator` devolvendo o espaço liberado).
-        let new = table.reserve(0x1000, PAGE_SIZE);
+        let new = table.reserve(0x1000, PAGE_SIZE, OWNER);
         assert_ne!(old.generation, new.generation);
 
-        assert_eq!(table.validate_commit(&old, 0, PAGE_SIZE), Err(VmmError::StaleHandle));
-        assert_eq!(table.remove(&old), Err(VmmError::StaleHandle));
+        assert_eq!(table.validate_commit(&old, 0, PAGE_SIZE, OWNER), Err(VmmError::StaleHandle));
+        assert_eq!(table.remove(&old, OWNER), Err(VmmError::StaleHandle));
         // O handle novo, em contraste, continua funcionando normalmente.
-        assert!(table.validate_commit(&new, 0, PAGE_SIZE).is_ok());
+        assert!(table.validate_commit(&new, 0, PAGE_SIZE, OWNER).is_ok());
+    }
+
+    #[test]
+    fn a_reservation_is_not_accessible_from_another_process() {
+        let mut table = ReservationTable::empty();
+        let region = table.reserve(0x1000, PAGE_SIZE, OWNER);
+
+        assert!(table.lookup(&region, OTHER).is_err());
+        assert_eq!(table.validate_commit(&region, 0, PAGE_SIZE, OTHER), Err(VmmError::StaleHandle));
+        assert_eq!(table.remove(&region, OTHER), Err(VmmError::StaleHandle));
+    }
+
+    // -------------------------------------------------------------
+    // Vmm::release_all_owned_by (change `kernel-handle-ownership`)
+    // -------------------------------------------------------------
+    //
+    // Testável em host só com reservas nunca comprometidas: `release` só
+    // toca `Mapper`/HHDM reais (inseguro em host) para páginas comprometidas
+    // — sem nenhuma, `remove()` devolve uma lista vazia de offsets e o laço
+    // que chamaria `Mapper::unmap` nunca executa.
+
+    #[test]
+    fn release_all_owned_by_releases_only_the_requested_owner_s_uncommitted_reservations() {
+        use crate::phys::{FrameAllocator, HhdmFrameStore};
+        let mut frame_allocator = FrameAllocator::new(HhdmFrameStore);
+        let mut vmm = Vmm::new();
+        vmm.ranges.add_window(0x1000, 10 * PAGE_SIZE);
+
+        let mine = vmm.reserve(PAGE_SIZE, OWNER).unwrap();
+        let theirs = vmm.reserve(PAGE_SIZE, OTHER).unwrap();
+
+        assert_eq!(vmm.release_all_owned_by(&mut frame_allocator, OWNER), 1);
+
+        // A reserva do dono pedido sumiu (geração antiga, mesmo erro de
+        // handle obsoleto).
+        assert!(vmm.table.lookup(&mine, OWNER).is_err());
+        // A de outro processo continua intacta.
+        assert!(vmm.table.lookup(&theirs, OTHER).is_ok());
     }
 }
