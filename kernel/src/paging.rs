@@ -395,6 +395,71 @@ impl AddressSpace {
     pub unsafe fn switch(&self) {
         unsafe { switch_address_space(self.pml4_phys) };
     }
+
+    /// Percorre recursivamente a metade inferior desta PML4 (índices
+    /// `0..KERNEL_PML4_START` — a metade superior é compartilhada com todo
+    /// o resto do kernel/outros processos, nunca tocada) e devolve ao
+    /// alocador todo frame físico presente: cada página de usuário mapeada
+    /// e cada tabela intermediária (PDPT/PD/PT) que só este espaço de
+    /// endereçamento possuía. **Nunca libera a própria PML4** (`self.
+    /// pml4_phys`) — ver design.md da change `kernel-process-cleanup`, "Por
+    /// que a PML4 em si não é liberada": quem possui este `AddressSpace`
+    /// (um `Process` em `kernel::scheduler::PROCESSES`) continua existindo
+    /// para sempre, então seu campo nunca pode ficar *dangling*.
+    ///
+    /// Chamada uma única vez, quando uma thread dona deste espaço de
+    /// endereçamento é definitivamente excluída da rotação do escalonador
+    /// por ter terminado (`kernel::scheduler::schedule_next`) — nunca
+    /// enquanto `CR3` ainda aponta para esta mesma PML4 (ver design.md,
+    /// "Chamada depois de `switch_address_space`..."). Recebe `root`
+    /// diretamente (não `&self`/`AddressSpace`): o escalonador só guarda o
+    /// `u64` de `Context::address_space_root` por thread, nunca uma
+    /// `AddressSpace` inteira (cuja posse é do `Process`) — mesmo racional
+    /// já documentado em [`switch_address_space`].
+    ///
+    /// Mesma limitação de testabilidade de [`Mapper::map`]/[`Mapper::unmap`]/
+    /// [`Mapper::translate`] (acesso real a `CR3`/HHDM): só verificável em
+    /// boot real, não em teste de host.
+    pub fn free_user_mappings<S: FrameStore>(root: u64, frame_allocator: &mut FrameAllocator<S>) {
+        let pml4 = unsafe { &*phys_to_table_ptr(root) };
+        for pml4_entry in &pml4.entries[..KERNEL_PML4_START] {
+            if pml4_entry.is_present() {
+                free_table_tree(frame_allocator, pml4_entry.addr(), 3);
+            }
+        }
+    }
+}
+
+/// Libera recursivamente a árvore de tabelas enraizada em `phys`, cujo
+/// `level` indica quantos níveis de tabela existem entre ela e uma página
+/// folha real: `3` para uma PDPT (PDPT → PD → PT → página), `2` para uma PD,
+/// `1` para uma PT (cujas entradas já são páginas folha, não tabelas). Libera
+/// em pós-ordem — nunca libera uma tabela antes de liberar tudo que ela
+/// aponta — para nunca devolver ao alocador um frame que ainda está sendo
+/// referenciado por outra entrada presente. Usada só por
+/// [`AddressSpace::free_user_mappings`].
+fn free_table_tree<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>, phys: u64, level: u8) {
+    let table = unsafe { &*phys_to_table_ptr(phys) };
+    for entry in &table.entries {
+        if entry.is_present() {
+            if level > 1 {
+                free_table_tree(frame_allocator, entry.addr(), level - 1);
+            } else {
+                // `table` é uma PT: suas entradas presentes já são páginas
+                // folha reais (código/stack/heap de usuário), não tabelas.
+                //
+                // Nunca falha na prática (cada frame aqui só foi alocado uma
+                // vez, pela própria `Mapper`/`next_table_or_create`, nunca
+                // visitado duas vezes por esta caminhada em árvore) — um erro
+                // aqui só indicaria uma tabela de página já corrompida, caso
+                // em que deixar o frame retido é inofensivo.
+                let _ = frame_allocator.free(entry.addr());
+            }
+        }
+    }
+    // Mesmo racional do comentário acima, agora para a própria tabela deste
+    // nível (PDPT/PD/PT).
+    let _ = frame_allocator.free(phys);
 }
 
 /// Endereço físico da PML4 atualmente ativa (`CR3`). Usado pelo escalonador

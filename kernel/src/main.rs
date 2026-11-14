@@ -484,6 +484,17 @@ extern "C" fn continue_boot() -> ! {
         // (acima), para provar que só a thread causadora é encerrada e o
         // resto do sistema continua. Mesma disciplina de erro explícito
         // (nunca pânico) dos carregamentos ELF acima.
+        //
+        // Medição "antes" da liberação real de recursos (change
+        // `kernel-process-cleanup`) — comparada com a medição "depois" logo
+        // antes de `idle_loop()`, mais abaixo. Usa a `frame_allocator` já
+        // travada neste escopo (nunca `FRAME_ALLOCATOR.lock()` de novo aqui —
+        // autodeadlock, achado real ao testar em boot real: o `Spinlock` não
+        // é reentrante).
+        kernel::serial_println!(
+            "fault_isolation: frames livres antes de /bin/fault.elf: {}",
+            frame_allocator.free_frames()
+        );
         match kernel::fat32::mount_boot_partition() {
             Ok(fs) => match kernel::scheduler::spawn_from_elf(
                 &mut frame_allocator,

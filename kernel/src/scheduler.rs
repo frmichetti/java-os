@@ -732,7 +732,39 @@ fn schedule_next(current_rsp: u64) -> u64 {
         // retornar, já que `next` pode retomar em qualquer ponto dentro de
         // `syscall_entry` (ex.: logo após ser despertada de um bloqueio).
         unsafe { CURRENT_SYSCALL_RSP_SLOT = contexts[next.0 as usize].syscall_rsp_slot };
-        contexts[next.0 as usize].rsp
+        let next_rsp = contexts[next.0 as usize].rsp;
+        // Liberação real de recursos (change `kernel-process-cleanup`): agora
+        // que `CR3` já trocou para `next` (acima), nunca mais para a PML4 de
+        // `was_running`, é seguro devolver ao alocador todo frame físico que
+        // só o espaço de endereçamento dela possuía — ver design.md, "Chamada
+        // depois de `switch_address_space`...". `is_terminated` garante que
+        // isto só roda exatamente uma vez por thread (ela nunca mais é
+        // escolhida como `was_running` depois de não voltar à `ReadyQueue`).
+        if is_terminated(was_running) {
+            let mut allocator = crate::phys::FRAME_ALLOCATOR.lock();
+            let free_before = allocator.free_frames();
+            crate::paging::AddressSpace::free_user_mappings(
+                contexts[was_running.0 as usize].address_space_root,
+                &mut allocator,
+            );
+            // Achado real ao verificar em boot real (change
+            // `kernel-process-cleanup`): medir "antes"/"depois" em pontos
+            // distantes no tempo (ex.: antes de carregar este processo vs.
+            // logo antes de `idle_loop()`) não funciona — nada é de fato
+            // escalonado antes de `idle_loop()` chamar `sti` pela primeira
+            // vez (nenhuma troca de contexto acontece com interrupções
+            // desabilitadas), então qualquer falta/limpeza real só acontece
+            // bem depois, em plena rotação já com `sti`. A medição confiável
+            // é esta: imediatamente antes/depois desta própria liberação.
+            crate::serial_println!(
+                "kernel_process_cleanup: thread {} liberou {} frames (livres: {} -> {})",
+                was_running.0,
+                allocator.free_frames() - free_before,
+                free_before,
+                allocator.free_frames()
+            );
+        }
+        next_rsp
     })
 }
 

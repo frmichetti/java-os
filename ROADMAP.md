@@ -221,10 +221,6 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
   de modo usuário tem mais de uma thread ainda (não existe syscall de criação de
   thread em modo usuário). Propagar o encerramento para outras threads do mesmo
   processo, quando essa syscall existir, fica para depois.
-- **Recursos do processo encerrado continuam vazando** (`AddressSpace`/frames
-  físicos, entradas em `pthread_handles`/`file_handles`, o `Process`/`Thread` em si)
-  — mesma disciplina de "leak aceitável por enquanto" já aplicada a `SYSCALL_EXIT`
-  desde `libc-minimal-port`. Liberação real é o próximo passo (ver abaixo).
 - Verificado em boot real por um programa C dedicado
   (`userland_c/fault_test_program.c`, carregado como `/bin/fault.elf`, depois de
   vários outros processos/threads de teste já em execução): causa um `#PF` em modo
@@ -233,20 +229,38 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
   em execução continuam reportando exatamente os mesmos resultados de antes, sem
   nenhum `hlt_loop`/pânico.
 
+### Liberação real de recursos do processo encerrado
+- **A memória física do espaço de endereçamento de uma thread terminada volta a
+  ficar disponível** (`kernel-process-cleanup`): `AddressSpace::free_user_mappings`
+  percorre recursivamente a metade inferior da PML4 (nunca a superior,
+  compartilhada) e devolve ao `kernel::phys::FrameAllocator` toda página de usuário
+  mapeada e cada tabela intermediária (PDPT/PD/PT) — chamada de
+  `kernel::scheduler::schedule_next` assim que uma thread é definitivamente
+  excluída da rotação por ter terminado, tanto voluntariamente (`SYSCALL_EXIT`)
+  quanto por exceção de CPU (`kernel-fault-isolation`). A própria PML4 (4 KiB) fica
+  retida de propósito — evita um ponteiro *dangling* no `Process`, que continua
+  existindo para sempre.
+- **Ainda vazam**: entradas em `pthread_handles`/`file_handles`, janelas de
+  `kernel::vmm`, o pool de stacks de *kernel* (`kernel::stack`), e o próprio
+  `Process`/`Thread` nas tabelas de bookkeeping do escalonador — nenhum rastreia
+  qual processo é dono de qual entrada hoje. Ver "Próximo passo imediato".
+- Verificado em boot real: o log de boot mostra a liberação de toda thread que
+  termina (voluntária ou involuntária), cada uma com um ganho positivo e plausível
+  de frames livres (8 a 20, compatível com o tamanho real de cada ELF/stack) — não
+  só `/bin/fault.elf`, mas também `test.elf`/`libctest.elf`/`cxxtest.elf`/
+  `javaosvm.elf`/`jpthread.elf`/`libm.elf`/`timedw.elf`.
+
 ## O que está previsto
 
 ### Próximo passo imediato
-- **Liberação real de recursos do processo encerrado** — `AddressSpace`/frames
-  físicos, entradas em `pthread_handles`/`file_handles`, o `Process`/`Thread` em si
-  (hoje todos vazam, tanto no encerramento voluntário quanto no involuntário por
-  exceção — `kernel-fault-isolation`). Com o isolamento de falha pronto, um processo
-  pode falhar repetidamente sem derrubar o kernel, mas cada falha ainda consome
-  memória/handles para sempre — inaceitável fora de um boot de teste curto.
+- **Isolar as tabelas de handle hoje globais (`pthread_handles`, `file_handles`,
+  janela de `kernel::vmm`) por processo/espaço de endereçamento** — pré-requisito
+  para liberar essas entradas quando o processo dono termina (hoje nenhuma delas
+  rastreia qual processo é dono de qual entrada, então não há como saber o que
+  liberar). Com a memória física já sendo recuperada (`kernel-process-cleanup`),
+  este é o próximo vazamento mais significativo.
 
 ### Médio prazo
-- Isolar as tabelas de handle hoje globais (`pthread_handles`, `file_handles`, janela de
-  `kernel::vmm`) por processo/espaço de endereçamento (mesmo trabalho do item acima,
-  visto por outro ângulo: isolamento estrutural, não só liberação).
 - Esquema de erro granular (`errno`-like) nas syscalls, e validação de ponteiro de
   usuário (hoje não validado, mesmo precedente de `sys_write`).
 - Parsing de ACPI/MADT, para hardware real além de QEMU/VirtualBox/VMware.
