@@ -332,10 +332,41 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
   `efault_test_program`, etc.) reporta exatamente o mesmo padrão de sucesso
   de antes desta change.
 
+### Parsing de ACPI/MADT
+- **O kernel descobre a topologia real de interrupção via ACPI em vez de
+  assumir os valores fixos corretos só para QEMU/VirtualBox/VMware**
+  (`kernel-acpi-madt`): nova capacidade `kernel::acpi` localiza e valida o
+  RSDP (via `RsdpRequest` do Limine)/RSDT ou XSDT/MADT, e extrai o endereço
+  MMIO do I/O APIC e as substituições de origem de interrupção legada
+  declaradas. `kernel::ioapic::init` usa o endereço descoberto quando
+  disponível (com o endereço fixo de sempre como contingência);
+  `kernel::keyboard` resolve o `GSI` real da IRQ1 via
+  `kernel::acpi::resolve_isa_irq_gsi`, em vez de assumir identidade.
+- **Verificado em boot real de forma mais rica do que o esperado**: o
+  QEMU/OVMF deste projeto expõe uma MADT real e válida, não só o caminho de
+  contingência — `acpi: MADT valida - I/O APIC em 0xfec00000 - 5
+  substituicao(oes) de IRQ legada` (`IRQ0→GSI2`, o remapeamento clássico do
+  PIT, mais 4 substituições identidade declaradas explicitamente). IRQ1
+  (teclado) não tem substituição nesta plataforma, então nenhum
+  comportamento observável muda, mas o caminho de descoberta via ACPI está
+  genuinamente exercitado, não só codificado e nunca testado.
+- **Dois achados reais graves, corrigidos durante a implementação**: um bug
+  de auto-consistência que rejeitava toda tabela ACPI real maior que seu
+  próprio cabeçalho (mascarado como "ACPI indisponível"), e uma alocação de
+  heap antes de `kernel::heap::init` existir (aborta o boot inteiro) —
+  ambos registrados em `KNOW_ISSUES.md` com o racional completo.
+- **Fora de escopo, deliberadamente**: múltiplos I/O APICs, enumeração de
+  outros processadores/Local APICs (SMP é item de prazo mais longo, abaixo),
+  substituição de endereço do Local APIC (já vem de MSR, mais direto), e
+  qualquer tabela ACPI além da MADT (FADT/HPET/MCFG/SRAT, interpretação de
+  AML/DSDT/SSDT) — ver design.md da change, "Non-Goals".
+
 ## O que está previsto
 
-### Próximo passo imediato
-- Parsing de ACPI/MADT, para hardware real além de QEMU/VirtualBox/VMware.
+Nenhum item de endurecimento de infraestrutura pendente no momento — o
+próximo passo real é começar a examinar o código-fonte do HotSpot em si
+(ver "Destaque: o que falta para a JVM rodar", item 6, abaixo), que ainda
+não foi escopado em nenhuma change.
 
 ### Longo prazo
 - Modelo híbrido de execução de JVM (runtime compartilhado vs. JVM isolada por

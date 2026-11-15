@@ -359,7 +359,11 @@ extern "x86-interrupt" fn keyboard_irq_handler(_frame: InterruptStackFrame) {
 /// Inicializa o teclado PS/2: o controlador 8042 ([`init_controller`]),
 /// registra o handler de IRQ1 na IDT, mapeia a página MMIO do I/O APIC
 /// (`kernel::ioapic::init`) e roteia a IRQ1 para esse vetor via
-/// `kernel::ioapic::route_irq` — ver design.md.
+/// `kernel::ioapic::route_irq` — ver design.md. O `GSI` roteado é o
+/// resolvido por `kernel::acpi::resolve_isa_irq_gsi` (change
+/// `kernel-acpi-madt`): o mesmo número da IRQ1 quando a MADT não declara
+/// nenhuma substituição para ela (sempre o caso em QEMU/VirtualBox/VMware
+/// hoje), ou o `GSI` substituto quando declarado.
 ///
 /// # Safety
 /// Deve ser chamada depois de `apic::init()` e `idt::load()` (Local APIC e
@@ -369,7 +373,8 @@ pub unsafe fn init<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>) {
         init_controller();
         crate::idt::set_handler(KEYBOARD_VECTOR, keyboard_irq_handler as *const () as u64, 0);
         crate::ioapic::init(frame_allocator).expect("mapear a pagina MMIO do I/O APIC falhou");
-        crate::ioapic::route_irq(KEYBOARD_IRQ, KEYBOARD_VECTOR as u8, crate::apic::local_apic_id());
+        let gsi = crate::acpi::resolve_isa_irq_gsi(KEYBOARD_IRQ);
+        crate::ioapic::route_irq(gsi as u8, KEYBOARD_VECTOR as u8, crate::apic::local_apic_id());
     }
 }
 

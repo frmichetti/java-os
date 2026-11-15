@@ -8,7 +8,7 @@ use core::panic::PanicInfo;
 use kernel::fmtbuf::StackBuf;
 use kernel::{memmap_report, serial};
 
-use limine::request::{BootloaderInfoRequest, FramebufferRequest, HhdmRequest, MemmapRequest};
+use limine::request::{BootloaderInfoRequest, FramebufferRequest, HhdmRequest, MemmapRequest, RsdpRequest};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
 const KERNEL_NAME: &str = "Java OS kernel";
@@ -33,6 +33,10 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -104,6 +108,16 @@ pub extern "C" fn kernel_main() -> ! {
         hlt_loop();
     };
     kernel::hhdm::init(hhdm_info.offset);
+
+    // Localiza/interpreta as tabelas ACPI (RSDP/RSDT/XSDT/MADT) — ver
+    // design.md da change `kernel-acpi-madt`. Logo após a HHDM (única
+    // dependência real) e bem antes de `kernel::apic::init`/
+    // `kernel::ioapic::init`/`kernel::keyboard::init`, que consomem a
+    // topologia aqui descoberta. Nunca falha o boot: RSDP ausente ou
+    // qualquer tabela inválida só deixa a topologia indisponível (ver
+    // `kernel::acpi::init`).
+    let rsdp_ptr = RSDP_REQUEST.response().map(|r| r.address as *const u8);
+    unsafe { kernel::acpi::init(rsdp_ptr) };
 
     let mut banner = StackBuf::<256>::new();
     match BOOTLOADER_INFO_REQUEST.response() {

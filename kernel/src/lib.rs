@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), no_std)]
 #![feature(abi_x86_interrupt)]
 
+pub mod acpi;
 pub mod apic;
 pub mod clock;
 pub mod clock_demo;

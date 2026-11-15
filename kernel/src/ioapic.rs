@@ -5,35 +5,46 @@
 use crate::paging::{MapError, Mapper, PageFlags};
 use crate::phys::{FrameAllocator, FrameStore};
 
-/// Endereço físico MMIO fixo do I/O APIC — o padrão de qualquer plataforma
-/// PC-compatível (e o valor usado pelo I/O APIC emulado de QEMU,
-/// VirtualBox e VMware, os únicos alvos atuais do projeto). Sem parsing de
-/// ACPI/MADT — ver design.md, "I/O APIC: endereço MMIO fixo". Precisa ser
-/// acessado através da HHDM (ver [`ioapic_base_virt`]): nenhuma página do
-/// kernel mapeia esse endereço físico diretamente como virtual.
-const IOAPIC_BASE_PHYS: u64 = 0xFEC0_0000;
+/// Endereço físico MMIO de contingência do I/O APIC — o padrão de qualquer
+/// plataforma PC-compatível (e o valor usado pelo I/O APIC emulado de
+/// QEMU, VirtualBox e VMware). Usado só quando `kernel::acpi` não descobre
+/// um endereço real via MADT (ACPI ausente/inválido, ou MADT sem entrada
+/// de I/O APIC) — ver design.md da change `kernel-acpi-madt`, "Endereço do
+/// I/O APIC é descoberto via ACPI quando disponível". Precisa ser acessado
+/// através da HHDM (ver [`ioapic_base_virt`]): nenhuma página do kernel
+/// mapeia esse endereço físico diretamente como virtual.
+const IOAPIC_BASE_PHYS_FALLBACK: u64 = 0xFEC0_0000;
 
-/// Endereço virtual (via HHDM) onde o I/O APIC pode ser acessado. Achado
-/// durante a implementação: escrever direto em `IOAPIC_BASE_PHYS` como se
-/// fosse um endereço virtual causa um page fault (endereço não mapeado) —
-/// ao contrário do framebuffer do Limine, que já vem como um ponteiro HHDM
-/// pronto, o I/O APIC é um endereço físico "cru" que o próprio kernel
-/// escolheu (ver design.md), e precisa da mesma tradução já usada pelo
-/// alocador de frames físicos e pela paginação (`kernel::hhdm::phys_to_virt`).
-fn ioapic_base_virt() -> usize {
-    crate::hhdm::phys_to_virt(crate::hhdm::offset(), IOAPIC_BASE_PHYS) as usize
+/// Endereço físico MMIO efetivo do I/O APIC: o descoberto via ACPI/MADT
+/// quando disponível, ou [`IOAPIC_BASE_PHYS_FALLBACK`] caso contrário.
+fn ioapic_base_phys() -> u64 {
+    crate::acpi::ioapic_address().unwrap_or(IOAPIC_BASE_PHYS_FALLBACK)
 }
 
-/// Mapeia a página MMIO do I/O APIC no endereço virtual da HHDM
-/// correspondente a `IOAPIC_BASE_PHYS` — precisa ser chamada antes de
-/// qualquer uso de [`route_irq`]. Achado durante a implementação: a HHDM do
-/// Limine só garante cobrir memória usável/reclamável pelo bootloader, não
-/// qualquer endereço físico arbitrário (ver design.md, "I/O APIC: endereço
-/// MMIO fixo"); o kernel precisa mapear essa página ele mesmo, com o mesmo
-/// `Mapper` já usado por `kernel::heap`/`kernel::stack`.
+/// Endereço virtual (via HHDM) onde o I/O APIC pode ser acessado. Achado
+/// durante a implementação (change `kernel-keyboard`): escrever direto no
+/// endereço físico como se fosse um endereço virtual causa um page fault
+/// (endereço não mapeado) — ao contrário do framebuffer do Limine, que já
+/// vem como um ponteiro HHDM pronto, o I/O APIC é um endereço físico "cru"
+/// (fixo ou descoberto via ACPI), e precisa da mesma tradução já usada
+/// pelo alocador de frames físicos e pela paginação
+/// (`kernel::hhdm::phys_to_virt`).
+fn ioapic_base_virt() -> usize {
+    crate::hhdm::phys_to_virt(crate::hhdm::offset(), ioapic_base_phys()) as usize
+}
+
+/// Mapeia a página MMIO do I/O APIC (endereço descoberto via ACPI/MADT, ou
+/// o de contingência) no endereço virtual da HHDM correspondente —
+/// precisa ser chamada antes de qualquer uso de [`route_irq`], e depois de
+/// `kernel::acpi::init` (para que o endereço descoberto, se houver, já
+/// esteja disponível). Achado durante a implementação (change
+/// `kernel-keyboard`): a HHDM do Limine só garante cobrir memória usável/
+/// reclamável pelo bootloader, não qualquer endereço físico arbitrário; o
+/// kernel precisa mapear essa página ele mesmo, com o mesmo `Mapper` já
+/// usado por `kernel::heap`/`kernel::stack`.
 pub fn init<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>) -> Result<(), MapError> {
     let virt = ioapic_base_virt() as u64;
-    Mapper::new(frame_allocator).map(virt, IOAPIC_BASE_PHYS, PageFlags::KERNEL_RW, false)
+    Mapper::new(frame_allocator).map(virt, ioapic_base_phys(), PageFlags::KERNEL_RW, false)
 }
 
 /// Offset do registrador de seleção (`IOREGSEL`): escrever aqui seleciona
