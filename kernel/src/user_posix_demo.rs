@@ -89,8 +89,10 @@ core::arch::global_asm!(
     "syscall",
     "mov r13, rax", // r13 = handle do mutex
     "mov byte ptr [rip + .Lupd_st6], 'F'",
-    "cmp r13, -1",
-    "je 1f",
+    // Handle valido = inteiro pequeno nao-negativo; qualquer erro agora e
+    // um codigo de erro especifico (`-errno`, change `kernel-syscall-errno`).
+    "cmp r13, 0",
+    "jl 1f",
     "mov rdi, r13",
     "mov eax, 8", // SYSCALL_MUTEX_LOCK
     "syscall",
@@ -108,8 +110,8 @@ core::arch::global_asm!(
     "syscall",
     "mov r14, rax", // r14 = handle da variavel de condicao
     "mov byte ptr [rip + .Lupd_st7], 'F'",
-    "cmp r14, -1",
-    "je 1f",
+    "cmp r14, 0",
+    "jl 1f",
     "mov rdi, r14",
     "mov eax, 12", // SYSCALL_COND_NOTIFY_ONE
     "syscall",
@@ -149,7 +151,8 @@ core::arch::global_asm!(
     "mov eax, 3", // SYSCALL_VM_COMMIT
     "syscall",
     "mov byte ptr [rip + .Lupd_st10], 'F'",
-    "cmp rax, -1",
+    // Endereco fora de qualquer reserva viva → EINVAL (change `kernel-syscall-errno`).
+    "cmp rax, -22",
     "jne 1f",
     "mov byte ptr [rip + .Lupd_st10], 'P'",
     "1:",
@@ -158,7 +161,8 @@ core::arch::global_asm!(
     "mov eax, 8", // SYSCALL_MUTEX_LOCK
     "syscall",
     "mov byte ptr [rip + .Lupd_st11], 'F'",
-    "cmp rax, -1",
+    // Handle de mutex inexistente → EINVAL (change `kernel-syscall-errno`).
+    "cmp rax, -22",
     "jne 1f",
     "mov byte ptr [rip + .Lupd_st11], 'P'",
     "1:",

@@ -33,8 +33,11 @@ core::arch::global_asm!(
     "syscall",
     "mov r12, rax", // r12 = handle, preservado entre syscalls (callee-saved)
     "mov byte ptr [rip + .Lfsd_st0], 'F'",
-    "cmp r12, -1",
-    "je 1f",
+    // Handle valido = inteiro pequeno nao-negativo; qualquer erro agora e
+    // um codigo de erro especifico (`-errno`, change `kernel-syscall-errno`),
+    // nao mais um unico sentinela fixo — checa sinal, nao um valor exato.
+    "cmp r12, 0",
+    "jl 1f",
     "mov byte ptr [rip + .Lfsd_st0], 'P'",
     "1:",
     // ---------- 2) SYSCALL_READ(handle, buf, 8): primeiros 8 bytes ("ABCDEFGH") ----------
@@ -94,7 +97,8 @@ core::arch::global_asm!(
     "mov eax, 19",
     "syscall",
     "mov byte ptr [rip + .Lfsd_st5], 'F'",
-    "cmp rax, -1",
+    // `handle` desconhecido/já fechado → EBADF (change `kernel-syscall-errno`).
+    "cmp rax, -9",
     "jne 1f",
     "mov byte ptr [rip + .Lfsd_st5], 'P'",
     "1:",
@@ -103,7 +107,7 @@ core::arch::global_asm!(
     "mov eax, 20",
     "syscall",
     "mov byte ptr [rip + .Lfsd_st6], 'F'",
-    "cmp rax, -1",
+    "cmp rax, -9",
     "jne 1f",
     "mov byte ptr [rip + .Lfsd_st6], 'P'",
     "1:",
@@ -113,7 +117,8 @@ core::arch::global_asm!(
     "mov eax, 18",
     "syscall",
     "mov byte ptr [rip + .Lfsd_st7], 'F'",
-    "cmp rax, -1",
+    // Caminho inexistente → ENOENT (change `kernel-syscall-errno`).
+    "cmp rax, -2",
     "jne 1f",
     "mov byte ptr [rip + .Lfsd_st7], 'P'",
     "1:",

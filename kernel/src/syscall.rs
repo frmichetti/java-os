@@ -4,9 +4,11 @@
 extern crate alloc;
 
 use crate::apic::{rdmsr, wrmsr};
+use crate::dylib::DylibError;
+use crate::fat32::Fat32Error;
 use crate::gdt::KERNEL_CODE_SELECTOR;
 use crate::paging::{Mapper, PageFlags};
-use crate::vmm::VMM;
+use crate::vmm::{VmmError, VMM};
 
 const IA32_EFER: u32 = 0xC000_0080;
 const IA32_STAR: u32 = 0xC000_0081;
@@ -63,22 +65,25 @@ pub const SYSCALL_CLOCK_MONOTONIC: u64 = 15;
 /// Ver design.md da change `kernel-dynamic-linker`. `SYSCALL_DLOPEN`:
 /// `arg0`/`arg1` = ponteiro/tamanho do caminho (convenção de
 /// `SYSCALL_WRITE`); retorno = `handle` opaco da biblioteca carregada no
-/// espaço de endereçamento do chamador, ou `SYSCALL_ERROR`.
+/// espaço de endereçamento do chamador, ou um código de erro.
 /// `SYSCALL_DLSYM`: `arg0` = `handle` devolvido por `SYSCALL_DLOPEN`;
 /// `arg1`/`arg2` = ponteiro/tamanho do nome do símbolo; retorno = endereço
-/// resolvido, ou `SYSCALL_ERROR`.
+/// resolvido, ou um código de erro. Ver design.md da change
+/// `kernel-syscall-errno`, "Mapeamento de erro por syscall", para o código
+/// específico de cada causa de falha.
 pub const SYSCALL_DLOPEN: u64 = 16;
 pub const SYSCALL_DLSYM: u64 = 17;
 
 /// Ver design.md da change `kernel-file-syscalls`, "Numeração de syscalls".
 /// `SYSCALL_OPEN`: `arg0`/`arg1` = ponteiro/tamanho do caminho absoluto
 /// (convenção de `SYSCALL_WRITE`/`SYSCALL_DLOPEN`); retorno = `handle`
-/// opaco do arquivo aberto, ou `SYSCALL_ERROR`. `SYSCALL_READ`: `arg0` =
+/// opaco do arquivo aberto, ou um código de erro. `SYSCALL_READ`: `arg0` =
 /// `handle` devolvido por `SYSCALL_OPEN`; `arg1`/`arg2` = ponteiro/tamanho
 /// do buffer do chamador; retorno = quantidade de bytes efetivamente
-/// lidos (`0` no fim do arquivo, não um erro), ou `SYSCALL_ERROR` para
+/// lidos (`0` no fim do arquivo, não um erro), ou um código de erro para
 /// `handle` desconhecido. `SYSCALL_CLOSE`: `arg0` = `handle`; retorno =
-/// `0`, ou `SYSCALL_ERROR` para `handle` desconhecido.
+/// `0`, ou um código de erro para `handle` desconhecido. Ver design.md da
+/// change `kernel-syscall-errno`, "Mapeamento de erro por syscall".
 pub const SYSCALL_OPEN: u64 = 18;
 pub const SYSCALL_READ: u64 = 19;
 pub const SYSCALL_CLOSE: u64 = 20;
@@ -90,27 +95,46 @@ pub const SYSCALL_EXIT: u64 = 21;
 
 /// Ver design.md da change `os-javaos-platform-sync`. `arg0` = `handle` de
 /// mutex devolvido por `SYSCALL_MUTEX_CREATE`; retorno = `0` se adquirido
-/// agora, `SYSCALL_ERROR` se já estava tomado ou `handle` desconhecido —
+/// agora, `EBUSY` se já estava tomado, `EINVAL` se `handle` desconhecido —
 /// nunca bloqueia a thread chamadora, ao contrário de `SYSCALL_MUTEX_LOCK`.
 pub const SYSCALL_MUTEX_TRYLOCK: u64 = 22;
 
-/// Valor devolvido em `RAX` para um número de chamada não reconhecido, em
-/// vez de executar qualquer serviço — ver spec `kernel-syscalls`, "Despacho
-/// por Número de Chamada".
-pub const SYSCALL_ERROR: u64 = u64::MAX;
+// ---------------------------------------------------------------------
+// Códigos de erro POSIX devolvidos por uma syscall que falha — ver
+// design.md da change `kernel-syscall-errno`, "Mapeamento de erro por
+// syscall". Valores numéricos copiados de
+// `vendor/newlib-4.6.0.20260123/newlib/libc/include/sys/errno.h` (sem
+// cabeçalho compartilhado entre Rust e C neste projeto — mesma disciplina
+// já usada para os números de syscall em `userland_c/glue.c`).
+// ---------------------------------------------------------------------
 
-/// Valor devolvido em `RAX` por `SYSCALL_COND_WAIT` quando o prazo pedido
-/// (terceiro argumento, `timeout_nanos`) expira antes de qualquer
-/// notificação — distinto de `SYSCALL_ERROR` (handle desconhecido) e de `0`
-/// (notificada) — ver design.md da change `kernel-timed-wait`.
-pub const SYSCALL_TIMEOUT: u64 = u64::MAX - 1;
+pub const EPERM: i32 = 1;
+pub const ENOENT: i32 = 2;
+pub const EIO: i32 = 5;
+pub const EBADF: i32 = 9;
+pub const ENOMEM: i32 = 12;
+pub const EFAULT: i32 = 14;
+pub const EBUSY: i32 = 16;
+pub const ENODEV: i32 = 19;
+pub const ENOTDIR: i32 = 20;
+pub const EISDIR: i32 = 21;
+pub const EINVAL: i32 = 22;
+pub const ENOEXEC: i32 = 8;
+pub const ELOOP: i32 = 92;
+pub const ENOSYS: i32 = 88;
+pub const ETIMEDOUT: i32 = 116;
 
-/// Valor devolvido em `RAX` quando um ponteiro de modo usuário passado como
-/// argumento de uma *syscall* não está inteiramente mapeado, acessível a
-/// partir do modo usuário, ou (quando a chamada escreve nele) gravável —
-/// distinto de `SYSCALL_ERROR`/`SYSCALL_TIMEOUT` — ver design.md da change
-/// `kernel-user-pointer-validation`.
-pub const SYSCALL_EFAULT: u64 = u64::MAX - 2;
+/// Codifica um código de erro POSIX como valor de retorno de syscall —
+/// mesma convenção usada pelas syscalls reais do kernel Linux: `-errno`
+/// como inteiro de 64 bits assinado, reinterpretado como `u64`. Qualquer
+/// valor de sucesso de qualquer syscall (endereço, handle, contagem de
+/// bytes, nanossegundos) está muito abaixo da faixa reservada por essa
+/// codificação (`errno` é sempre < 300, então o valor codificado é sempre
+/// > `u64::MAX - 300`) — nenhuma ambiguidade possível. Função pura,
+/// testável sem hardware.
+pub fn syscall_err(errno: i32) -> u64 {
+    (-(errno as i64)) as u64
+}
 
 /// Verifica se `[ptr, ptr+len)` está inteiramente mapeado no espaço de
 /// endereçamento do chamador, acessível a partir do modo usuário e (se
@@ -125,7 +149,7 @@ fn user_range_is_valid(ptr: u64, len: u64, require_writable: bool) -> bool {
 
 /// Escreve `len` bytes a partir de `ptr` (endereço do chamador, modo
 /// usuário) no console serial do kernel. Devolve a quantidade de bytes
-/// escritos, ou `SYSCALL_EFAULT` se `ptr`/`len` não corresponder a memória
+/// escritos, ou `EFAULT` se `ptr`/`len` não corresponder a memória
 /// mapeada e acessível do chamador (ver `user_range_is_valid`).
 ///
 /// # Safety
@@ -134,7 +158,7 @@ fn user_range_is_valid(ptr: u64, len: u64, require_writable: bool) -> bool {
 /// validação.
 unsafe fn sys_write(ptr: u64, len: u64) -> u64 {
     if !user_range_is_valid(ptr, len, false) {
-        return SYSCALL_EFAULT;
+        return syscall_err(EFAULT);
     }
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
     {
@@ -170,12 +194,13 @@ fn prot_to_page_flags(prot: u64) -> PageFlags {
 }
 
 /// Reserva `size` bytes de memória virtual anônima — cobre
-/// `SYSCALL_VM_RESERVE`. Devolve o endereço base da reserva, ou
-/// `SYSCALL_ERROR` (tamanho zero, ou sem espaço virtual livre suficiente).
+/// `SYSCALL_VM_RESERVE`. Devolve o endereço base da reserva, ou `EINVAL`
+/// (tamanho zero) / `ENOMEM` (sem espaço virtual livre suficiente).
 fn sys_vm_reserve(size: u64) -> u64 {
     match VMM.lock().reserve(size, crate::scheduler::current_process_id()) {
         Ok(region) => region.base(),
-        Err(_) => SYSCALL_ERROR,
+        Err(VmmError::OutOfVirtualSpace) => syscall_err(ENOMEM),
+        Err(_) => syscall_err(EINVAL),
     }
 }
 
@@ -183,8 +208,8 @@ fn sys_vm_reserve(size: u64) -> u64 {
 /// reserva viva) com as permissões decodificadas de `prot` — cobre
 /// `SYSCALL_VM_COMMIT`. `addr` é traduzido para o `Region` que o contém via
 /// `Vmm::region_containing` (ver design.md, "VM por endereço"); qualquer
-/// endereço fora de uma reserva viva, ou condição de `VmmError`, devolve
-/// `SYSCALL_ERROR`.
+/// endereço fora de uma reserva viva, ou condição de `VmmError` que não
+/// seja falta de memória física, devolve `EINVAL`.
 fn sys_vm_commit(addr: u64, len: u64, prot: u64) -> u64 {
     let flags = prot_to_page_flags(prot);
     let caller = crate::scheduler::current_process_id();
@@ -194,12 +219,13 @@ fn sys_vm_commit(addr: u64, len: u64, prot: u64) -> u64 {
     let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
     let mut vmm = VMM.lock();
     let Some(region) = vmm.region_containing(addr, caller) else {
-        return SYSCALL_ERROR;
+        return syscall_err(EINVAL);
     };
     let offset = addr - region.base();
     match vmm.commit(&mut frame_allocator, &region, offset, len, flags, caller) {
         Ok(()) => 0,
-        Err(_) => SYSCALL_ERROR,
+        Err(VmmError::OutOfFrames) => syscall_err(ENOMEM),
+        Err(_) => syscall_err(EINVAL),
     }
 }
 
@@ -210,12 +236,12 @@ fn sys_vm_decommit(addr: u64, len: u64) -> u64 {
     let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
     let mut vmm = VMM.lock();
     let Some(region) = vmm.region_containing(addr, caller) else {
-        return SYSCALL_ERROR;
+        return syscall_err(EINVAL);
     };
     let offset = addr - region.base();
     match vmm.decommit(&mut frame_allocator, &region, offset, len, caller) {
         Ok(()) => 0,
-        Err(_) => SYSCALL_ERROR,
+        Err(_) => syscall_err(EINVAL),
     }
 }
 
@@ -228,12 +254,12 @@ fn sys_vm_protect(addr: u64, len: u64, prot: u64) -> u64 {
     let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
     let mut vmm = VMM.lock();
     let Some(region) = vmm.region_containing(addr, caller) else {
-        return SYSCALL_ERROR;
+        return syscall_err(EINVAL);
     };
     let offset = addr - region.base();
     match vmm.protect(&mut frame_allocator, &region, offset, len, flags, caller) {
         Ok(()) => 0,
-        Err(_) => SYSCALL_ERROR,
+        Err(_) => syscall_err(EINVAL),
     }
 }
 
@@ -249,14 +275,14 @@ fn sys_vm_release(addr: u64) -> u64 {
     let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
     let mut vmm = VMM.lock();
     let Some(region) = vmm.region_containing(addr, caller) else {
-        return SYSCALL_ERROR;
+        return syscall_err(EINVAL);
     };
     if region.base() != addr {
-        return SYSCALL_ERROR;
+        return syscall_err(EINVAL);
     }
     match vmm.release(&mut frame_allocator, region, caller) {
         Ok(()) => 0,
-        Err(_) => SYSCALL_ERROR,
+        Err(_) => syscall_err(EINVAL),
     }
 }
 
@@ -267,7 +293,7 @@ fn sys_mutex_create() -> u64 {
 
 /// Adquire o mutex identificado por `handle`, bloqueando a thread chamadora
 /// (sem busy-wait) se já estiver tomado por outra thread — cobre
-/// `SYSCALL_MUTEX_LOCK`. `SYSCALL_ERROR` se `handle` não corresponder a
+/// `SYSCALL_MUTEX_LOCK`. `EINVAL` se `handle` não corresponder a
 /// nenhum mutex criado pelo processo chamador (desconhecido, ou pertencente a
 /// outro processo — ver design.md da change `kernel-handle-ownership`).
 fn sys_mutex_lock(handle: u64) -> u64 {
@@ -276,29 +302,31 @@ fn sys_mutex_lock(handle: u64) -> u64 {
             mutex.lock();
             0
         }
-        None => SYSCALL_ERROR,
+        None => syscall_err(EINVAL),
     }
 }
 
 /// Tenta adquirir o mutex identificado por `handle` sem bloquear a thread
 /// chamadora — cobre `SYSCALL_MUTEX_TRYLOCK`. `0` se adquirido agora,
-/// `SYSCALL_ERROR` se já estava tomado (por esta ou por outra thread) ou se
-/// `handle` não corresponder a nenhum mutex criado pelo processo chamador.
+/// `EBUSY` se já estava tomado (por esta ou por outra thread), `EINVAL` se
+/// `handle` não corresponder a nenhum mutex criado pelo processo chamador —
+/// dois códigos distintos (mesma distinção real de `pthread_mutex_trylock(3)`
+/// POSIX).
 fn sys_mutex_trylock(handle: u64) -> u64 {
     match crate::pthread_handles::mutex(handle, crate::scheduler::current_process_id()) {
         Some(mutex) => {
             if mutex.try_acquire() {
                 0
             } else {
-                SYSCALL_ERROR
+                syscall_err(EBUSY)
             }
         }
-        None => SYSCALL_ERROR,
+        None => syscall_err(EINVAL),
     }
 }
 
 /// Libera o mutex identificado por `handle`, acordando uma thread em espera
-/// para adquiri-lo, se houver — cobre `SYSCALL_MUTEX_UNLOCK`. `SYSCALL_ERROR`
+/// para adquiri-lo, se houver — cobre `SYSCALL_MUTEX_UNLOCK`. `EINVAL`
 /// se `handle` não corresponder a nenhum mutex criado pelo processo chamador.
 fn sys_mutex_unlock(handle: u64) -> u64 {
     match crate::pthread_handles::mutex(handle, crate::scheduler::current_process_id()) {
@@ -306,7 +334,7 @@ fn sys_mutex_unlock(handle: u64) -> u64 {
             mutex.unlock();
             0
         }
-        None => SYSCALL_ERROR,
+        None => syscall_err(EINVAL),
     }
 }
 
@@ -321,30 +349,30 @@ fn sys_cond_create() -> u64 {
 /// `timeout_nanos` expirar — cobre `SYSCALL_COND_WAIT`. `timeout_nanos == 0`
 /// preserva exatamente o comportamento original (espera indefinida, mesmo
 /// valor que todo chamador já existente desta syscall sempre passou aqui) —
-/// ver design.md da change `kernel-timed-wait`. `SYSCALL_ERROR` se
+/// ver design.md da change `kernel-timed-wait`. `EINVAL` se
 /// `cond_handle` ou `mutex_handle` não corresponderem a objetos criados, sem
 /// bloquear a thread chamadora nem alterar o estado do mutex nesse caso;
-/// `SYSCALL_TIMEOUT` se `timeout_nanos > 0` e o prazo expirar antes de
+/// `ETIMEDOUT` se `timeout_nanos > 0` e o prazo expirar antes de
 /// qualquer notificação.
 fn sys_cond_wait(cond_handle: u64, mutex_handle: u64, timeout_nanos: u64) -> u64 {
     let caller = crate::scheduler::current_process_id();
     let Some(cond) = crate::pthread_handles::cond(cond_handle, caller) else {
-        return SYSCALL_ERROR;
+        return syscall_err(EINVAL);
     };
     let Some(mutex) = crate::pthread_handles::mutex(mutex_handle, caller) else {
-        return SYSCALL_ERROR;
+        return syscall_err(EINVAL);
     };
     if timeout_nanos == 0 {
         cond.wait(mutex);
         return 0;
     }
     let deadline = crate::clock::monotonic_nanos() + timeout_nanos;
-    if cond.wait_timeout(mutex, deadline) { 0 } else { SYSCALL_TIMEOUT }
+    if cond.wait_timeout(mutex, deadline) { 0 } else { syscall_err(ETIMEDOUT) }
 }
 
 /// Acorda a thread esperando há mais tempo na variável de condição
 /// identificada por `handle`, se houver — cobre `SYSCALL_COND_NOTIFY_ONE`.
-/// `SYSCALL_ERROR` se `handle` não corresponder a nenhuma variável de
+/// `EINVAL` se `handle` não corresponder a nenhuma variável de
 /// condição criada.
 fn sys_cond_notify_one(handle: u64) -> u64 {
     match crate::pthread_handles::cond(handle, crate::scheduler::current_process_id()) {
@@ -352,13 +380,13 @@ fn sys_cond_notify_one(handle: u64) -> u64 {
             cond.notify_one();
             0
         }
-        None => SYSCALL_ERROR,
+        None => syscall_err(EINVAL),
     }
 }
 
 /// Acorda todas as threads atualmente esperando na variável de condição
 /// identificada por `handle` — cobre `SYSCALL_COND_NOTIFY_ALL`.
-/// `SYSCALL_ERROR` se `handle` não corresponder a nenhuma variável de
+/// `EINVAL` se `handle` não corresponder a nenhuma variável de
 /// condição criada.
 fn sys_cond_notify_all(handle: u64) -> u64 {
     match crate::pthread_handles::cond(handle, crate::scheduler::current_process_id()) {
@@ -366,7 +394,7 @@ fn sys_cond_notify_all(handle: u64) -> u64 {
             cond.notify_all();
             0
         }
-        None => SYSCALL_ERROR,
+        None => syscall_err(EINVAL),
     }
 }
 
@@ -381,6 +409,35 @@ fn sys_clock_monotonic() -> u64 {
     crate::clock::monotonic_nanos()
 }
 
+/// Traduz uma falha de leitura/montagem do sistema de arquivos FAT32 para o
+/// código de erro POSIX correspondente — compartilhada por `sys_open` (via
+/// `mount_boot_partition`) e [`dylib_err`] (via `DylibError::FileRead`). Ver
+/// design.md da change `kernel-syscall-errno`, "Mapeamento de erro por
+/// syscall".
+fn fat32_err(e: Fat32Error) -> u64 {
+    match e {
+        Fat32Error::NotFound => syscall_err(ENOENT),
+        Fat32Error::NotAFile => syscall_err(EISDIR),
+        Fat32Error::NotADirectory => syscall_err(ENOTDIR),
+        Fat32Error::NotFat32 | Fat32Error::UnsupportedSectorSize | Fat32Error::ReadFailed => syscall_err(EIO),
+    }
+}
+
+/// Traduz uma falha de `kernel::dylib::load_library`/`dlsym` para o código
+/// de erro POSIX correspondente — usada por `sys_dlopen`. A maioria das
+/// variantes representa uma biblioteca ELF malformada de alguma forma,
+/// colapsadas em `ENOEXEC` (ver design.md, "Colapsando variantes de baixo
+/// nível"). `InvalidHandle`/`SymbolNotFound` não aparecem aqui — só
+/// relevantes para `dlsym`, tratadas separadamente em `sys_dlsym`.
+fn dylib_err(e: DylibError) -> u64 {
+    match e {
+        DylibError::NoDisk => syscall_err(ENODEV),
+        DylibError::FileRead(fat32_error) => fat32_err(fat32_error),
+        DylibError::CircularDependency => syscall_err(ELOOP),
+        _ => syscall_err(ENOEXEC),
+    }
+}
+
 /// Carrega a biblioteca compartilhada ELF64 (`ET_DYN`) cujo caminho está em
 /// `ptr`/`len` no espaço de endereçamento do chamador — cobre
 /// `SYSCALL_DLOPEN`. Monta o sistema de arquivos a cada chamada (mesmo
@@ -388,20 +445,19 @@ fn sys_clock_monotonic() -> u64 {
 ///
 /// # Safety
 /// `ptr`/`len` são validados via `user_range_is_valid` antes de qualquer
-/// acesso (ver `sys_write`); UTF-8 inválido é `SYSCALL_ERROR`, não um
-/// pânico.
+/// acesso (ver `sys_write`); UTF-8 inválido é `EINVAL`, não um pânico.
 unsafe fn sys_dlopen(ptr: u64, len: u64) -> u64 {
     if !user_range_is_valid(ptr, len, false) {
-        return SYSCALL_EFAULT;
+        return syscall_err(EFAULT);
     }
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
     let Ok(path) = core::str::from_utf8(bytes) else {
-        return SYSCALL_ERROR;
+        return syscall_err(EINVAL);
     };
 
     let fs = match crate::fat32::mount_boot_partition() {
         Ok(fs) => fs,
-        Err(_) => return SYSCALL_ERROR,
+        Err(_) => return syscall_err(EIO),
     };
 
     let root = crate::paging::current_root();
@@ -412,12 +468,12 @@ unsafe fn sys_dlopen(ptr: u64, len: u64) -> u64 {
         Err(e) => {
             // Mesmo padrão de log de erro de outros subsistemas opcionais
             // (`kernel::storage::init`, `kernel::network::init`): reporta o
-            // motivo exato no console serial para depuração, mas a
-            // *syscall* em si sempre devolve só o sentinela `SYSCALL_ERROR`
-            // — cobre "Falha de Carregamento ou Resolução Não Compromete a
+            // motivo exato no console serial para depuração, mesmo com a
+            // *syscall* em si já devolvendo um código de erro específico —
+            // cobre "Falha de Carregamento ou Resolução Não Compromete a
             // Estabilidade do Kernel" da spec `kernel-dynamic-linker`.
             crate::serial_println!("dlopen: falha ao carregar {:?}: {:?}", path, e);
-            SYSCALL_ERROR
+            dylib_err(e)
         }
     }
 }
@@ -428,43 +484,48 @@ unsafe fn sys_dlopen(ptr: u64, len: u64) -> u64 {
 ///
 /// # Safety
 /// `name_ptr`/`name_len` são validados via `user_range_is_valid` antes de
-/// qualquer acesso (ver `sys_write`).
+/// qualquer acesso (ver `sys_write`). `EBADF` se `handle` não corresponder a
+/// nenhuma biblioteca carregada pelo chamador; `ENOENT` se o símbolo não
+/// existir nela.
 unsafe fn sys_dlsym(handle: u64, name_ptr: u64, name_len: u64) -> u64 {
     if !user_range_is_valid(name_ptr, name_len, false) {
-        return SYSCALL_EFAULT;
+        return syscall_err(EFAULT);
     }
     let bytes = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
     let Ok(name) = core::str::from_utf8(bytes) else {
-        return SYSCALL_ERROR;
+        return syscall_err(EINVAL);
     };
 
     let root = crate::paging::current_root();
-    crate::dylib::dlsym(root, handle, name).unwrap_or(SYSCALL_ERROR)
+    match crate::dylib::dlsym(root, handle, name) {
+        Ok(addr) => addr,
+        Err(DylibError::InvalidHandle) => syscall_err(EBADF),
+        Err(_) => syscall_err(ENOENT),
+    }
 }
 
 /// Abre, por caminho absoluto em `path_ptr`/`path_len`, um arquivo do
 /// sistema de arquivos montado — cobre `SYSCALL_OPEN`. Devolve o `handle`
-/// devolvido por `kernel::file_handles::register`, ou `SYSCALL_ERROR` para
-/// UTF-8 inválido, falha de montagem, ou caminho que não corresponde a um
-/// arquivo existente (inclui o caso de apontar para um diretório — mesmo
-/// sentinela de erro de `Fat32Error::NotAFile`/`NotFound`/`NotADirectory`,
-/// sem esquema granular de erro, mesma disciplina das demais *syscalls*).
+/// devolvido por `kernel::file_handles::register`, ou o código de erro
+/// correspondente (ver [`fat32_err`]) para UTF-8 inválido (`EINVAL`), falha
+/// de montagem (`EIO`), disco não inicializado (`ENODEV`), ou caminho que
+/// não corresponde a um arquivo existente (`ENOENT`/`EISDIR`/`ENOTDIR`).
 ///
 /// # Safety
 /// `path_ptr`/`path_len` são validados via `user_range_is_valid` antes de
 /// qualquer acesso (ver `sys_write`).
 unsafe fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
     if !user_range_is_valid(path_ptr, path_len, false) {
-        return SYSCALL_EFAULT;
+        return syscall_err(EFAULT);
     }
     let bytes = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let Ok(path) = core::str::from_utf8(bytes) else {
-        return SYSCALL_ERROR;
+        return syscall_err(EINVAL);
     };
 
     let fs = match crate::fat32::mount_boot_partition() {
         Ok(fs) => fs,
-        Err(_) => return SYSCALL_ERROR,
+        Err(_) => return syscall_err(EIO),
     };
 
     // Mesmo padrão de `kernel::scheduler::spawn_from_elf`/`kernel::dylib::load_library`:
@@ -472,7 +533,8 @@ unsafe fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
     // Non-Goals: sem leitura incremental por cluster).
     match crate::storage::with_disk(|disk| fs.read_file(disk, path)) {
         Some(Ok(contents)) => crate::file_handles::register(contents, crate::scheduler::current_process_id()),
-        _ => SYSCALL_ERROR,
+        Some(Err(e)) => fat32_err(e),
+        None => syscall_err(ENODEV),
     }
 }
 
@@ -480,8 +542,8 @@ unsafe fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
 /// por `handle`, copiando-os para `buf_ptr` (buffer do chamador, modo
 /// usuário) — cobre `SYSCALL_READ`. Devolve a quantidade de bytes
 /// efetivamente copiada (`0` ao alcançar o fim do arquivo, o que não é um
-/// erro), ou `SYSCALL_ERROR` se `handle` não corresponder a nenhum arquivo
-/// atualmente aberto, ou `SYSCALL_EFAULT` se `buf_ptr`/`buf_len` não
+/// erro), ou `EBADF` se `handle` não corresponder a nenhum arquivo
+/// atualmente aberto, ou `EFAULT` se `buf_ptr`/`buf_len` não
 /// corresponder a um buffer de escrita válido do chamador — verificado
 /// antes de tocar o arquivo (nenhum byte é lido dele, nem o cursor avança,
 /// se a validação falhar).
@@ -491,11 +553,11 @@ unsafe fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
 /// permissão de escrita) antes de qualquer acesso.
 unsafe fn sys_read(handle: u64, buf_ptr: u64, buf_len: u64) -> u64 {
     if !user_range_is_valid(buf_ptr, buf_len, true) {
-        return SYSCALL_EFAULT;
+        return syscall_err(EFAULT);
     }
     let Some(bytes) = crate::file_handles::read(handle, buf_len as usize, crate::scheduler::current_process_id())
     else {
-        return SYSCALL_ERROR;
+        return syscall_err(EBADF);
     };
     let dest = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, bytes.len()) };
     dest.copy_from_slice(&bytes);
@@ -503,10 +565,10 @@ unsafe fn sys_read(handle: u64, buf_ptr: u64, buf_len: u64) -> u64 {
 }
 
 /// Fecha o arquivo identificado por `handle`, liberando os recursos
-/// associados a ele — cobre `SYSCALL_CLOSE`. `SYSCALL_ERROR` se `handle`
+/// associados a ele — cobre `SYSCALL_CLOSE`. `EBADF` se `handle`
 /// não corresponder a nenhum arquivo atualmente aberto.
 fn sys_close(handle: u64) -> u64 {
-    if crate::file_handles::close(handle, crate::scheduler::current_process_id()) { 0 } else { SYSCALL_ERROR }
+    if crate::file_handles::close(handle, crate::scheduler::current_process_id()) { 0 } else { syscall_err(EBADF) }
 }
 
 /// Termina a thread chamadora — cobre `SYSCALL_EXIT`. Delega inteiramente a
@@ -520,7 +582,7 @@ fn sys_exit() -> ! {
 
 /// Despacha uma chamada de sistema pelo número (`RAX` na entrada de
 /// `syscall`), com até quatro argumentos. Devolve o valor de retorno (`RAX`
-/// na saída) — `SYSCALL_ERROR` para um número não reconhecido. `extern "C"`
+/// na saída) — `ENOSYS` para um número não reconhecido. `extern "C"`
 /// e `#[no_mangle]`: chamada diretamente pela rotina de entrada em
 /// assembly ([`syscall_entry`], abaixo), não só por código Rust.
 ///
@@ -553,7 +615,7 @@ unsafe extern "C" fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg
         SYSCALL_CLOSE => sys_close(arg0),
         SYSCALL_EXIT => sys_exit(),
         SYSCALL_MUTEX_TRYLOCK => sys_mutex_trylock(arg0),
-        _ => SYSCALL_ERROR,
+        _ => syscall_err(ENOSYS),
     }
 }
 
@@ -662,9 +724,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_syscall_number_returns_error_sentinel() {
+    fn unknown_syscall_number_returns_enosys() {
         let result = unsafe { dispatch(0xdead_beef, 0, 0, 0, 0) };
-        assert_eq!(result, SYSCALL_ERROR);
+        assert_eq!(result, syscall_err(ENOSYS));
     }
 
     #[test]
@@ -699,51 +761,59 @@ mod tests {
     /// local lá) — ver `kernel::vmm::test_support`.
     use crate::vmm::test_support::{VMM_TEST_LOCK as VM_TEST_LOCK, ensure_vmm_initialized};
 
+    /// Qualquer valor de sucesso de qualquer syscall está muito abaixo da
+    /// faixa reservada a código de erro (`errno` sempre < 300) — ver
+    /// `syscall_err`. Usado nos testes abaixo que só precisam confirmar
+    /// "não é um erro", sem uma asserção mais específica disponível.
+    fn is_success(v: u64) -> bool {
+        v < u64::MAX - 300
+    }
+
     #[test]
     fn vm_reserve_returns_an_address_inside_the_managed_window() {
         let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ensure_vmm_initialized();
         let addr = unsafe { dispatch(SYSCALL_VM_RESERVE, crate::paging::PAGE_SIZE, 0, 0, 0) };
-        assert_ne!(addr, SYSCALL_ERROR);
+        assert!(is_success(addr));
         assert!(addr >= crate::vmm::VMM_WINDOW_START);
         assert!(addr < crate::vmm::VMM_WINDOW_START + crate::vmm::VMM_WINDOW_SIZE);
     }
 
     #[test]
-    fn vm_reserve_with_zero_size_returns_error_sentinel() {
+    fn vm_reserve_with_zero_size_returns_einval() {
         let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(unsafe { dispatch(SYSCALL_VM_RESERVE, 0, 0, 0, 0) }, SYSCALL_ERROR);
+        assert_eq!(unsafe { dispatch(SYSCALL_VM_RESERVE, 0, 0, 0, 0) }, syscall_err(EINVAL));
     }
 
     #[test]
-    fn vm_commit_outside_any_reservation_returns_error_sentinel_without_touching_the_mapper() {
+    fn vm_commit_outside_any_reservation_returns_einval_without_touching_the_mapper() {
         let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Endereço bem fora da janela gerenciada: nunca corresponde a nenhuma
         // reserva viva, então `region_containing` rejeita antes de chegar a
         // `Vmm::commit`/`Mapper` (que não seriam seguros de tocar em host).
         let result = unsafe { dispatch(SYSCALL_VM_COMMIT, 0, crate::paging::PAGE_SIZE, 0b01, 0) };
-        assert_eq!(result, SYSCALL_ERROR);
+        assert_eq!(result, syscall_err(EINVAL));
     }
 
     #[test]
-    fn vm_decommit_outside_any_reservation_returns_error_sentinel_without_touching_the_mapper() {
+    fn vm_decommit_outside_any_reservation_returns_einval_without_touching_the_mapper() {
         let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let result = unsafe { dispatch(SYSCALL_VM_DECOMMIT, 0, crate::paging::PAGE_SIZE, 0, 0) };
-        assert_eq!(result, SYSCALL_ERROR);
+        assert_eq!(result, syscall_err(EINVAL));
     }
 
     #[test]
-    fn vm_protect_outside_any_reservation_returns_error_sentinel_without_touching_the_mapper() {
+    fn vm_protect_outside_any_reservation_returns_einval_without_touching_the_mapper() {
         let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let result = unsafe { dispatch(SYSCALL_VM_PROTECT, 0, crate::paging::PAGE_SIZE, 0b01, 0) };
-        assert_eq!(result, SYSCALL_ERROR);
+        assert_eq!(result, syscall_err(EINVAL));
     }
 
     #[test]
-    fn vm_release_outside_any_reservation_returns_error_sentinel() {
+    fn vm_release_outside_any_reservation_returns_einval() {
         let _guard = VM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let result = unsafe { dispatch(SYSCALL_VM_RELEASE, 0, 0, 0, 0) };
-        assert_eq!(result, SYSCALL_ERROR);
+        assert_eq!(result, syscall_err(EINVAL));
     }
 
     #[test]
@@ -752,7 +822,7 @@ mod tests {
         ensure_vmm_initialized();
         let size = crate::paging::PAGE_SIZE;
         let addr = unsafe { dispatch(SYSCALL_VM_RESERVE, size, 0, 0, 0) };
-        assert_ne!(addr, SYSCALL_ERROR);
+        assert!(is_success(addr));
 
         // Nada foi comprometido ainda: `Vmm::release` nunca chega a chamar
         // `Mapper::unmap` (laço sobre offsets comprometidos fica vazio),
@@ -771,21 +841,21 @@ mod tests {
         // seguro em host mesmo sem o guard de `VM_TEST_LOCK` (não toca
         // `VMM`/`FRAME_ALLOCATOR`).
         let handle = unsafe { dispatch(SYSCALL_MUTEX_CREATE, 0, 0, 0, 0) };
-        assert_ne!(handle, SYSCALL_ERROR);
+        assert!(is_success(handle));
         assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_LOCK, handle, 0, 0, 0) }, 0);
     }
 
     #[test]
-    fn mutex_lock_with_an_unknown_handle_returns_error_sentinel() {
-        assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_LOCK, u64::MAX / 2, 0, 0, 0) }, SYSCALL_ERROR);
+    fn mutex_lock_with_an_unknown_handle_returns_einval() {
+        assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_LOCK, u64::MAX / 2, 0, 0, 0) }, syscall_err(EINVAL));
     }
 
     #[test]
-    fn mutex_unlock_with_an_unknown_handle_returns_error_sentinel() {
+    fn mutex_unlock_with_an_unknown_handle_returns_einval() {
         // Só o caminho de rejeição é testável em host: o de sucesso sempre
         // chama `scheduler::with_interrupts_disabled` — ver design.md,
         // "Escopo de testes em host".
-        assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_UNLOCK, u64::MAX / 2, 0, 0, 0) }, SYSCALL_ERROR);
+        assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_UNLOCK, u64::MAX / 2, 0, 0, 0) }, syscall_err(EINVAL));
     }
 
     #[test]
@@ -793,70 +863,73 @@ mod tests {
         // Mesma observação de `mutex_create_then_lock_on_a_free_mutex_...`:
         // `try_acquire` é uma CAS atômica pura, seguro em host.
         let handle = unsafe { dispatch(SYSCALL_MUTEX_CREATE, 0, 0, 0, 0) };
-        assert_ne!(handle, SYSCALL_ERROR);
+        assert!(is_success(handle));
         assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_TRYLOCK, handle, 0, 0, 0) }, 0);
     }
 
     #[test]
-    fn mutex_trylock_on_an_already_taken_mutex_fails_without_blocking() {
+    fn mutex_trylock_on_an_already_taken_mutex_fails_with_ebusy_without_blocking() {
         let handle = unsafe { dispatch(SYSCALL_MUTEX_CREATE, 0, 0, 0, 0) };
         assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_TRYLOCK, handle, 0, 0, 0) }, 0);
         // Segunda tentativa sobre o mesmo mutex, já tomado pela "thread"
         // deste teste — deve falhar imediatamente, nunca bloquear (bloquear
         // travaria o processo de teste em host, sem nenhum escalonador para
         // acordá-lo).
-        assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_TRYLOCK, handle, 0, 0, 0) }, SYSCALL_ERROR);
+        assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_TRYLOCK, handle, 0, 0, 0) }, syscall_err(EBUSY));
     }
 
     #[test]
-    fn mutex_trylock_with_an_unknown_handle_returns_error_sentinel() {
-        assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_TRYLOCK, u64::MAX / 2, 0, 0, 0) }, SYSCALL_ERROR);
+    fn mutex_trylock_with_an_unknown_handle_returns_einval_distinct_from_ebusy() {
+        // Distinção que não existia antes desta change: um `handle`
+        // desconhecido devolve um código diferente de um mutex já tomado.
+        assert_eq!(unsafe { dispatch(SYSCALL_MUTEX_TRYLOCK, u64::MAX / 2, 0, 0, 0) }, syscall_err(EINVAL));
+        assert_ne!(syscall_err(EINVAL), syscall_err(EBUSY));
     }
 
     #[test]
     fn cond_create_returns_a_usable_handle() {
         let handle = unsafe { dispatch(SYSCALL_COND_CREATE, 0, 0, 0, 0) };
-        assert_ne!(handle, SYSCALL_ERROR);
+        assert!(is_success(handle));
     }
 
     #[test]
-    fn cond_wait_with_an_unknown_cond_handle_returns_error_sentinel_without_touching_the_mutex() {
+    fn cond_wait_with_an_unknown_cond_handle_returns_einval_without_touching_the_mutex() {
         let mutex_handle = unsafe { dispatch(SYSCALL_MUTEX_CREATE, 0, 0, 0, 0) };
         let result = unsafe { dispatch(SYSCALL_COND_WAIT, u64::MAX / 2, mutex_handle, 0, 0) };
-        assert_eq!(result, SYSCALL_ERROR);
+        assert_eq!(result, syscall_err(EINVAL));
     }
 
     #[test]
-    fn cond_wait_with_an_unknown_mutex_handle_returns_error_sentinel() {
+    fn cond_wait_with_an_unknown_mutex_handle_returns_einval() {
         let cond_handle = unsafe { dispatch(SYSCALL_COND_CREATE, 0, 0, 0, 0) };
         let result = unsafe { dispatch(SYSCALL_COND_WAIT, cond_handle, u64::MAX / 2, 0, 0) };
-        assert_eq!(result, SYSCALL_ERROR);
+        assert_eq!(result, syscall_err(EINVAL));
     }
 
     #[test]
-    fn cond_wait_with_an_unknown_cond_handle_returns_error_sentinel_regardless_of_timeout() {
+    fn cond_wait_with_an_unknown_cond_handle_returns_einval_regardless_of_timeout() {
         // Mesmo teste de `..._without_touching_the_mutex` acima, mas com um
         // prazo > 0 — o handle desconhecido deve ser rejeitado antes de
         // qualquer lógica de prazo entrar em jogo (change `kernel-timed-wait`).
         let mutex_handle = unsafe { dispatch(SYSCALL_MUTEX_CREATE, 0, 0, 0, 0) };
         let result = unsafe { dispatch(SYSCALL_COND_WAIT, u64::MAX / 2, mutex_handle, 1_000_000, 0) };
-        assert_eq!(result, SYSCALL_ERROR);
+        assert_eq!(result, syscall_err(EINVAL));
     }
 
     #[test]
-    fn cond_wait_with_an_unknown_mutex_handle_returns_error_sentinel_regardless_of_timeout() {
+    fn cond_wait_with_an_unknown_mutex_handle_returns_einval_regardless_of_timeout() {
         let cond_handle = unsafe { dispatch(SYSCALL_COND_CREATE, 0, 0, 0, 0) };
         let result = unsafe { dispatch(SYSCALL_COND_WAIT, cond_handle, u64::MAX / 2, 1_000_000, 0) };
-        assert_eq!(result, SYSCALL_ERROR);
+        assert_eq!(result, syscall_err(EINVAL));
     }
 
     #[test]
-    fn cond_notify_one_and_all_with_an_unknown_handle_return_error_sentinel() {
+    fn cond_notify_one_and_all_with_an_unknown_handle_return_einval() {
         // Mesma limitação do caminho de sucesso de `SYSCALL_MUTEX_UNLOCK`:
         // `notify_one`/`notify_all` sempre chamam
         // `scheduler::with_interrupts_disabled`, mesmo sem ninguém esperando.
-        assert_eq!(unsafe { dispatch(SYSCALL_COND_NOTIFY_ONE, u64::MAX / 2, 0, 0, 0) }, SYSCALL_ERROR);
-        assert_eq!(unsafe { dispatch(SYSCALL_COND_NOTIFY_ALL, u64::MAX / 2, 0, 0, 0) }, SYSCALL_ERROR);
+        assert_eq!(unsafe { dispatch(SYSCALL_COND_NOTIFY_ONE, u64::MAX / 2, 0, 0, 0) }, syscall_err(EINVAL));
+        assert_eq!(unsafe { dispatch(SYSCALL_COND_NOTIFY_ALL, u64::MAX / 2, 0, 0, 0) }, syscall_err(EINVAL));
     }
 
     #[test]
@@ -865,10 +938,10 @@ mod tests {
         ensure_vmm_initialized();
         let size = 2 * crate::paging::PAGE_SIZE;
         let addr = unsafe { dispatch(SYSCALL_VM_RESERVE, size, 0, 0, 0) };
-        assert_ne!(addr, SYSCALL_ERROR);
+        assert!(is_success(addr));
 
         let result = unsafe { dispatch(SYSCALL_VM_RELEASE, addr + crate::paging::PAGE_SIZE, 0, 0, 0) };
-        assert_eq!(result, SYSCALL_ERROR);
+        assert_eq!(result, syscall_err(EINVAL));
 
         // A reserva original continua viva: liberar pelo endereço base certo
         // ainda funciona depois da tentativa rejeitada.
@@ -878,21 +951,27 @@ mod tests {
     // `SYSCALL_OPEN` não é testado aqui: `sys_open` monta o sistema de
     // arquivos via `kernel::storage::with_disk` (disco AHCI real), mesma
     // limitação já documentada para `SYSCALL_WRITE`/`SYSCALL_DLOPEN` —
-    // verificado em boot real na tarefa 3.3. `sys_read`/`sys_close`, por
+    // verificado em boot real na tarefa 8.1. `sys_read`/`sys_close`, por
     // outro lado, só tocam `kernel::file_handles` (lógica pura, sem
     // hardware) — seus caminhos de rejeição por handle desconhecido são
     // testáveis em host independentemente de `SYSCALL_OPEN` já ter sido
     // chamado.
 
     #[test]
-    fn read_with_an_unknown_handle_returns_error_sentinel() {
+    fn read_with_an_unknown_handle_returns_ebadf() {
         let result = unsafe { dispatch(SYSCALL_READ, u64::MAX / 2, 0, 0, 0) };
-        assert_eq!(result, SYSCALL_ERROR);
+        assert_eq!(result, syscall_err(EBADF));
     }
 
     #[test]
-    fn close_with_an_unknown_handle_returns_error_sentinel() {
+    fn close_with_an_unknown_handle_returns_ebadf() {
         let result = unsafe { dispatch(SYSCALL_CLOSE, u64::MAX / 2, 0, 0, 0) };
-        assert_eq!(result, SYSCALL_ERROR);
+        assert_eq!(result, syscall_err(EBADF));
+    }
+
+    #[test]
+    fn syscall_err_encodes_errno_as_negative_i64_reinterpreted_as_u64() {
+        assert_eq!(syscall_err(EFAULT), (-(EFAULT as i64)) as u64);
+        assert!(syscall_err(EFAULT) > u64::MAX - 300);
     }
 }

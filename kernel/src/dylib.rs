@@ -456,8 +456,8 @@ pub(crate) fn resolve_symbol_by_name(root: u64, name: &str) -> Option<u64> {
 /// Resolve `name` entre os símbolos exportados pela biblioteca `handle` do
 /// espaço de endereçamento `root` — cobre "Resolução de Símbolo por Nome a
 /// partir de um Handle de Biblioteca" da spec; usada por
-/// `kernel::syscall::sys_dlsym`, que colapsa `InvalidHandle`/`SymbolNotFound`
-/// no mesmo sentinela `SYSCALL_ERROR`.
+/// `kernel::syscall::sys_dlsym`, que traduz `InvalidHandle`/`SymbolNotFound`
+/// para `EBADF`/`ENOENT` respectivamente (change `kernel-syscall-errno`).
 pub(crate) fn dlsym(root: u64, handle: u64, name: &str) -> Result<u64, DylibError> {
     let state = DYLIB_STATE.lock();
     let process_state = state.get(&root).ok_or(DylibError::InvalidHandle)?;

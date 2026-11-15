@@ -6,10 +6,15 @@
  * Ao contrario de fault_test_program.c (que causa deliberadamente um page
  * fault para provar o isolamento de falha), este programa nunca deveria
  * causar nenhuma falta de pagina: ele invoca diretamente, via syscall bruta
- * (sem passar pelos wrappers de glue.c, para poder distinguir o sentinela
- * SYSCALL_EFAULT de SYSCALL_ERROR), as syscalls que recebem ponteiro de modo
- * usuario com ponteiros deliberadamente invalidos, e confirma que cada uma
- * e rejeitada com SYSCALL_EFAULT - nunca com uma excecao de CPU.
+ * (sem passar pelos wrappers de glue.c, para poder inspecionar o codigo de
+ * erro exato devolvido pelo kernel), as syscalls que recebem ponteiro de
+ * modo usuario com ponteiros deliberadamente invalidos, e confirma que cada
+ * uma e rejeitada com EFAULT - nunca com uma excecao de CPU.
+ *
+ * Atualizado pela change `kernel-syscall-errno`: o kernel agora devolve
+ * `-errno` (convencao do kernel Linux - ver design.md daquela change) em
+ * vez dos sentinelas fixos `SYSCALL_ERROR`/`SYSCALL_EFAULT` (`-1`/`-3`)
+ * que este arquivo comparava antes.
  */
 
 #include <string.h>
@@ -20,11 +25,8 @@
 #define SYS_READ 19
 #define SYS_CLOSE 20
 
-/* Mesma convencao de glue.c: SYSCALL_ERROR/SYSCALL_EFAULT do kernel sao
- * `u64::MAX`/`u64::MAX - 2`, que como `long` assinado de 64 bits sao
- * exatamente -1/-3. */
-#define SYSCALL_ERROR (-1L)
-#define SYSCALL_EFAULT (-3L)
+/* Mesmo valor de `kernel::syscall::EFAULT` (`vendor/newlib-.../sys/errno.h`). */
+#define EFAULT 14
 
 /* Mesmo deslocamento de glue.c entre descritor POSIX e handle do kernel. */
 #define FD_OFFSET 3
@@ -51,15 +53,15 @@ int main(void) {
 
     /* 2) ponteiro nulo (pagina 0, nunca mapeada - mesma pagina que
      * fault_test_program.c usa para provocar seu page fault deliberado) em
-     * SYS_WRITE e rejeitado com SYSCALL_EFAULT, sem nenhuma excecao de CPU. */
+     * SYS_WRITE e rejeitado com EFAULT, sem nenhuma excecao de CPU. */
     r = raw_syscall(SYS_WRITE, 0, 8, 0, 0);
-    result[1] = (r == SYSCALL_EFAULT) ? 'P' : 'F';
+    result[1] = (r == -EFAULT) ? 'P' : 'F';
 
     /* 3) ponteiro de caminho invalido (nao nulo, mas dentro da mesma pagina
      * 0 nunca mapeada) em SYS_OPEN e rejeitado, sem chegar a montar o
      * sistema de arquivos nem ler nada. */
     r = raw_syscall(SYS_OPEN, 1, 4, 0, 0);
-    result[2] = (r == SYSCALL_EFAULT) ? 'P' : 'F';
+    result[2] = (r == -EFAULT) ? 'P' : 'F';
 
     /* 4) buffer de escrita invalido em SYS_READ e rejeitado sem avancar o
      * cursor do arquivo: uma leitura valida logo depois ainda ve o primeiro
@@ -68,11 +70,11 @@ int main(void) {
     result[3] = 'F';
     const char path[] = "/TEST.TXT";
     long h = raw_syscall(SYS_OPEN, (long)path, (long)(sizeof(path) - 1), 0, 0);
-    if (h != SYSCALL_ERROR) {
+    if (h >= 0) {
         long bad = raw_syscall(SYS_READ, h, 0, 1, 0);
         char first_byte = 0;
         long got = raw_syscall(SYS_READ, h, (long)&first_byte, 1, 0);
-        if (bad == SYSCALL_EFAULT && got == 1 && first_byte == 'A') {
+        if (bad == -EFAULT && got == 1 && first_byte == 'A') {
             result[3] = 'P';
         }
         raw_syscall(SYS_CLOSE, h, 0, 0, 0);

@@ -1,0 +1,267 @@
+# Spec Delta
+
+## ADDED Requirements
+
+### Requirement: Convenção de Código de Erro POSIX no Retorno de Syscall
+Toda chamada de sistema que falhar SHALL devolver um código de erro POSIX
+real (os mesmos identificadores e valores numéricos de `<errno.h>`), nunca
+um sentinela genérico e indistinto — o chamador SHALL ser capaz de
+distinguir, a partir do valor devolvido, a categoria real da falha.
+
+#### Scenario: Valor de sucesso nunca é ambíguo com um código de erro
+- **WHEN** qualquer chamada de sistema tem sucesso
+- **THEN** o valor devolvido SHALL estar sempre dentro da faixa de uso
+  normal dessa chamada (endereço, `handle`, contagem de bytes, ou
+  nanossegundos), nunca podendo ser confundido com um código de erro
+
+## MODIFIED Requirements
+
+### Requirement: Despacho por Número de Chamada
+O kernel SHALL identificar qual serviço está sendo solicitado por um número de chamada explícito, e SHALL rejeitar de forma explícita um número de chamada não reconhecido, em vez de executar um serviço arbitrário ou travar.
+
+#### Scenario: Número de chamada inválido é rejeitado explicitamente
+- **WHEN** uma chamada de sistema é feita com um número de chamada que o kernel não reconhece
+- **THEN** o kernel SHALL retornar o código de erro `ENOSYS`, em vez de executar um serviço não intencional, travar, ou produzir comportamento indefinido
+
+### Requirement: Chamada de Reserva de Memória Virtual Anônima
+O kernel SHALL fornecer uma chamada de sistema que reserva uma faixa de memória virtual anônima de tamanho pedido pelo chamador, sem comprometer memória física, e devolve o endereço virtual base da faixa reservada.
+
+#### Scenario: Reserva bem-sucedida devolve um endereço base
+- **WHEN** um processo em modo usuário invoca a chamada com um tamanho válido e há espaço virtual livre suficiente
+- **THEN** o kernel devolve o endereço virtual base de uma faixa recém-reservada daquele tamanho (arredondado para página), sem comprometer nenhuma memória física
+
+#### Scenario: Tamanho inválido ou sem espaço livre é rejeitado
+- **WHEN** um processo em modo usuário invoca a chamada com tamanho zero, ou não há espaço virtual livre suficiente
+- **THEN** o kernel devolve um código de erro, sem reservar nenhuma faixa
+
+#### Scenario: Tamanho zero é distinguível de falta de espaço virtual livre
+- **WHEN** um processo em modo usuário invoca a chamada com tamanho zero
+- **THEN** o kernel devolve especificamente `EINVAL` — um código diferente do devolvido quando o tamanho é válido mas não há espaço virtual livre (`ENOMEM`), permitindo ao chamador distinguir as duas causas
+
+### Requirement: Chamada de Comprometimento de Sub-região Reservada
+O kernel SHALL fornecer uma chamada de sistema que compromete, com as permissões de acesso pedidas pelo chamador, uma sub-região de uma faixa previamente reservada, identificada pelo endereço virtual e tamanho da sub-região.
+
+#### Scenario: Comprometimento bem-sucedido torna a sub-região acessível
+- **WHEN** um processo em modo usuário invoca a chamada com um endereço e tamanho dentro de uma faixa reservada ainda não comprometida naquela sub-região
+- **THEN** o kernel compromete a sub-região e o chamador consegue ler e escrever nela conforme as permissões pedidas
+
+#### Scenario: Página comprometida nunca concede acesso privilegiado de kernel
+- **WHEN** um processo em modo usuário invoca a chamada, com qualquer combinação de permissões pedidas
+- **THEN** a página resultante SHALL permanecer acessível a partir do modo usuário, independentemente do valor bruto de permissões recebido do chamador
+
+#### Scenario: Endereço fora de uma reserva, ou sub-região já comprometida, é rejeitado
+- **WHEN** um processo em modo usuário invoca a chamada com um endereço/tamanho que não corresponde a uma sub-região livre dentro de uma faixa reservada viva
+- **THEN** o kernel devolve o código de erro `EINVAL`, sem comprometer nenhuma memória física
+
+#### Scenario: Falta de memória física disponível é distinguível de um argumento inválido
+- **WHEN** um processo em modo usuário invoca a chamada sobre uma sub-região válida, mas não há memória física disponível para comprometê-la
+- **THEN** o kernel devolve `ENOMEM` — um código diferente do devolvido para um endereço/tamanho inválido (`EINVAL`), sem comprometer nenhuma memória física
+
+### Requirement: Chamada de Descomprometimento de Sub-região Comprometida
+O kernel SHALL fornecer uma chamada de sistema que descompromete uma sub-região previamente comprometida, identificada por endereço virtual e tamanho, liberando sua memória física e preservando a reserva virtual.
+
+#### Scenario: Descomprometimento bem-sucedido libera a memória física
+- **WHEN** um processo em modo usuário invoca a chamada com um endereço/tamanho totalmente comprometido
+- **THEN** o kernel descompromete a sub-região e um acesso subsequente a ela falha, enquanto a faixa reservada permanece disponível para um novo comprometimento
+
+#### Scenario: Sub-região não totalmente comprometida é rejeitada
+- **WHEN** um processo em modo usuário invoca a chamada com um endereço/tamanho que não está totalmente comprometido
+- **THEN** o kernel devolve o código de erro `EINVAL`, sem alterar nenhum estado de comprometimento
+
+### Requirement: Chamada de Alteração de Proteção de Sub-região Comprometida
+O kernel SHALL fornecer uma chamada de sistema que altera as permissões de acesso de uma sub-região já comprometida, identificada por endereço virtual e tamanho, sem alterar seu conteúdo.
+
+#### Scenario: Alteração de proteção bem-sucedida aplica as novas permissões
+- **WHEN** um processo em modo usuário invoca a chamada com um endereço/tamanho totalmente comprometido e novas permissões
+- **THEN** o kernel aplica as novas permissões de acesso à sub-região, preservando seu conteúdo e os frames físicos que a sustentam
+
+#### Scenario: Sub-região não totalmente comprometida é rejeitada
+- **WHEN** um processo em modo usuário invoca a chamada com um endereço/tamanho que não está totalmente comprometido
+- **THEN** o kernel devolve o código de erro `EINVAL`, sem alterar nenhuma permissão
+
+### Requirement: Chamada de Liberação de Reserva
+O kernel SHALL fornecer uma chamada de sistema que libera por completo uma faixa de memória virtual previamente reservada, identificada pelo seu endereço virtual base, descomprometendo qualquer sub-região ainda comprometida.
+
+#### Scenario: Liberação bem-sucedida devolve a faixa ao espaço livre
+- **WHEN** um processo em modo usuário invoca a chamada com o endereço base de uma faixa reservada viva
+- **THEN** o kernel descompromete qualquer sub-região ainda comprometida, libera a faixa inteira e esse espaço de endereço volta a ficar disponível para reservas futuras
+
+#### Scenario: Endereço que não corresponde a uma reserva viva é rejeitado
+- **WHEN** um processo em modo usuário invoca a chamada com um endereço que não é a base de nenhuma reserva viva
+- **THEN** o kernel devolve o código de erro `EINVAL`, sem liberar nenhuma faixa
+
+### Requirement: Chamada de Aquisição Bloqueante de Mutex Nomeado
+O kernel SHALL fornecer uma chamada de sistema que adquire o mutex identificado pelo `handle` informado, bloqueando a thread chamadora (sem busy-wait) se o mutex já estiver tomado por outra thread.
+
+#### Scenario: Aquisição de mutex livre retorna imediatamente
+- **WHEN** um processo em modo usuário invoca a chamada com o `handle` de um mutex livre
+- **THEN** o kernel marca o mutex como tomado pela thread chamadora e a chamada retorna com sucesso
+
+#### Scenario: Aquisição de mutex já tomado bloqueia até ele ser liberado
+- **WHEN** um processo em modo usuário invoca a chamada com o `handle` de um mutex já tomado por outra thread
+- **THEN** a thread chamadora é bloqueada (sem busy-wait) até o mutex ser liberado e então adquirido por ela
+
+#### Scenario: Handle desconhecido é rejeitado
+- **WHEN** um processo em modo usuário invoca a chamada com um `handle` que não corresponde a nenhum mutex criado
+- **THEN** o kernel devolve o código de erro `EINVAL`, sem bloquear a thread chamadora
+
+### Requirement: Chamada de Tentativa de Aquisição Não-Bloqueante de Mutex Nomeado
+O kernel SHALL fornecer uma chamada de sistema que tenta adquirir o mutex
+identificado pelo `handle` informado sem bloquear a thread chamadora, devolvendo
+sucesso imediato se o mutex estava livre, ou um código de erro imediatamente se já
+estava tomado ou o `handle` for desconhecido — sem nunca bloquear a thread chamadora, ao contrário da chamada de
+aquisição bloqueante já existente.
+
+#### Scenario: Tentativa sobre mutex livre adquire e retorna imediatamente
+- **WHEN** um processo em modo usuário invoca a chamada com o `handle` de um mutex
+  livre
+- **THEN** o kernel marca o mutex como tomado pela thread chamadora e a chamada
+  retorna com sucesso imediatamente
+
+#### Scenario: Tentativa sobre mutex já tomado falha sem bloquear
+- **WHEN** um processo em modo usuário invoca a chamada com o `handle` de um mutex já
+  tomado (pela própria thread chamadora ou por outra)
+- **THEN** o kernel devolve o código de erro `EBUSY` imediatamente, sem bloquear a thread
+  chamadora e sem alterar o estado do mutex
+
+#### Scenario: Handle desconhecido é rejeitado
+- **WHEN** um processo em modo usuário invoca a chamada com um `handle` que não
+  corresponde a nenhum mutex criado
+- **THEN** o kernel devolve o código de erro `EINVAL`, distinto do devolvido quando o mutex já está tomado (`EBUSY`), sem bloquear a thread chamadora
+
+### Requirement: Chamada de Liberação de Mutex Nomeado
+O kernel SHALL fornecer uma chamada de sistema que libera o mutex identificado pelo `handle` informado, acordando uma thread em espera para adquiri-lo, se houver.
+
+#### Scenario: Liberação bem-sucedida acorda uma thread em espera
+- **WHEN** um processo em modo usuário invoca a chamada com o `handle` de um mutex tomado, havendo uma ou mais threads bloqueadas tentando adquiri-lo
+- **THEN** o kernel libera o mutex e acorda exatamente uma dessas threads, que passa a deter o mutex
+
+#### Scenario: Handle desconhecido é rejeitado
+- **WHEN** um processo em modo usuário invoca a chamada com um `handle` que não corresponde a nenhum mutex criado
+- **THEN** o kernel devolve o código de erro `EINVAL`
+
+### Requirement: Chamada de Espera em Variável de Condição Nomeada
+O kernel SHALL fornecer uma chamada de sistema que libera o mutex nomeado informado e bloqueia a thread chamadora na variável de condição nomeada informada, como uma única operação atômica, reaquirindo o mesmo mutex antes de retornar quando a thread for notificada ou quando um prazo opcional informado pelo chamador expirar.
+
+#### Scenario: Espera bem-sucedida libera o mutex e bloqueia a thread
+- **WHEN** um processo em modo usuário invoca a chamada com os `handles` de uma variável de condição e de um mutex que a thread chamadora detém
+- **THEN** o kernel libera o mutex, bloqueia a thread chamadora na variável de condição e, ao ser notificada, reaquire o mesmo mutex antes da chamada retornar
+
+#### Scenario: Handle de variável de condição ou de mutex desconhecido é rejeitado
+- **WHEN** um processo em modo usuário invoca a chamada com um `handle` de variável de condição ou de mutex que não corresponde a nenhum objeto criado
+- **THEN** o kernel devolve o código de erro `EINVAL`, sem bloquear a thread chamadora nem alterar o estado do mutex
+
+#### Scenario: Prazo zero preserva a espera indefinida já existente
+- **WHEN** um processo em modo usuário invoca a chamada com um prazo de zero (mesmo valor que todo chamador já existente desta chamada sempre passou)
+- **THEN** o comportamento SHALL ser exatamente o de uma espera indefinida, idêntico ao de antes desta capacidade existir
+
+#### Scenario: Prazo maior que zero expirando sem notificação retorna indicando expiração
+- **WHEN** um processo em modo usuário invoca a chamada com um prazo maior que zero, e nenhuma notificação alcança a thread chamadora antes desse prazo expirar
+- **THEN** o kernel SHALL retomar a thread chamadora automaticamente quando o prazo expirar, com o mutex associado reaquirido, e a chamada SHALL devolver o código de erro `ETIMEDOUT`, distinto do devolvido para um `handle` desconhecido (`EINVAL`)
+
+#### Scenario: Prazo maior que zero notificado antes de expirar retorna indicando notificação
+- **WHEN** um processo em modo usuário invoca a chamada com um prazo maior que zero, e é notificado antes desse prazo expirar
+- **THEN** a chamada SHALL retornar sucesso, nunca o código `ETIMEDOUT`
+
+### Requirement: Chamada de Notificação de Variável de Condição Nomeada
+O kernel SHALL fornecer chamadas de sistema que notificam, respectivamente, uma ou todas as threads atualmente esperando na variável de condição identificada pelo `handle` informado.
+
+#### Scenario: Notificar uma thread acorda a que espera há mais tempo
+- **WHEN** um processo em modo usuário invoca a chamada de notificar uma thread, com o `handle` de uma variável de condição com uma ou mais threads esperando
+- **THEN** o kernel acorda exatamente a thread esperando há mais tempo naquela variável de condição
+
+#### Scenario: Notificar todas acorda cada thread em espera
+- **WHEN** um processo em modo usuário invoca a chamada de notificar todas, com o `handle` de uma variável de condição com uma ou mais threads esperando
+- **THEN** o kernel acorda todas as threads atualmente esperando naquela variável de condição
+
+#### Scenario: Handle desconhecido é rejeitado
+- **WHEN** um processo em modo usuário invoca qualquer uma das chamadas de notificação com um `handle` que não corresponde a nenhuma variável de condição criada
+- **THEN** o kernel devolve o código de erro `EINVAL`
+
+### Requirement: Chamada de Abertura de Arquivo
+O kernel SHALL fornecer uma chamada de sistema que abre, por caminho absoluto fornecido pelo chamador, um arquivo do sistema de arquivos montado, devolvendo um `handle` opaco utilizável pelas chamadas de leitura e fechamento.
+
+#### Scenario: Abertura bem-sucedida devolve um handle utilizável
+- **WHEN** um processo em modo usuário invoca a chamada de abertura com um caminho absoluto válido apontando para um arquivo existente
+- **THEN** o kernel devolve um `handle` que identifica esse arquivo aberto, pronto para leitura a partir do início
+
+#### Scenario: Caminho inexistente ou apontando para diretório é rejeitado
+- **WHEN** um processo em modo usuário invoca a chamada de abertura com um caminho que não corresponde a nenhum arquivo existente, ou que corresponde a um diretório
+- **THEN** o kernel devolve um código de erro, sem produzir nenhum handle
+
+#### Scenario: Caminho inexistente é distinguível de um caminho apontando para diretório
+- **WHEN** um processo em modo usuário invoca a chamada de abertura com um caminho que não corresponde a nenhuma entrada existente, ou, em uma invocação separada, com um caminho que corresponde a um diretório
+- **THEN** o kernel devolve `ENOENT` no primeiro caso e `EISDIR` no segundo — dois códigos distintos, nunca o mesmo
+
+#### Scenario: Componente intermediário do caminho que não é diretório é rejeitado
+- **WHEN** um processo em modo usuário invoca a chamada de abertura com um caminho cujo componente intermediário corresponde a um arquivo, não a um diretório
+- **THEN** o kernel devolve o código de erro `ENOTDIR`, sem produzir nenhum handle
+
+### Requirement: Chamada de Leitura de Arquivo Aberto
+O kernel SHALL fornecer uma chamada de sistema que lê, a partir do cursor atual do `handle` informado, até uma quantidade de bytes pedida pelo chamador, copiando-os para um buffer fornecido pelo chamador em modo usuário e avançando o cursor pela quantidade efetivamente lida.
+
+#### Scenario: Leitura bem-sucedida copia os bytes para o buffer do chamador e avança o cursor
+- **WHEN** um processo em modo usuário invoca a chamada de leitura com o `handle` de um arquivo aberto, um buffer válido e uma quantidade de bytes pedida
+- **THEN** o kernel copia para o buffer do chamador a quantidade de bytes efetivamente lida (até a quantidade pedida, ou menos se o fim do arquivo for alcançado antes), devolve essa quantidade, e o cursor do handle avança na mesma quantidade
+
+#### Scenario: Leitura no fim do arquivo devolve zero sem erro
+- **WHEN** um processo em modo usuário invoca a chamada de leitura com o `handle` de um arquivo cujo cursor já está no fim do arquivo
+- **THEN** o kernel devolve zero, sem copiar nenhum byte e sem tratar isso como erro
+
+#### Scenario: Handle desconhecido é rejeitado
+- **WHEN** um processo em modo usuário invoca a chamada de leitura com um `handle` que não corresponde a nenhum arquivo atualmente aberto
+- **THEN** o kernel devolve o código de erro `EBADF`, sem copiar nenhum byte
+
+### Requirement: Chamada de Fechamento de Arquivo Aberto
+O kernel SHALL fornecer uma chamada de sistema que fecha o `handle` de arquivo informado, liberando os recursos associados a ele.
+
+#### Scenario: Fechamento bem-sucedido invalida o handle
+- **WHEN** um processo em modo usuário invoca a chamada de fechamento com o `handle` de um arquivo atualmente aberto
+- **THEN** o kernel libera os recursos associados a esse handle, e uma chamada de leitura subsequente com o mesmo handle é rejeitada como handle desconhecido
+
+#### Scenario: Handle desconhecido é rejeitado
+- **WHEN** um processo em modo usuário invoca a chamada de fechamento com um `handle` que não corresponde a nenhum arquivo atualmente aberto
+- **THEN** o kernel devolve o código de erro `EBADF`, sem afetar nenhum outro handle aberto
+
+### Requirement: Ponteiro de Usuário Inválido em Argumento de Syscall é Rejeitado
+Toda chamada de sistema que recebe, como argumento, um ponteiro de modo
+usuário a ser lido ou escrito pelo kernel SHALL validar essa memória antes
+de acessá-la, rejeitando com o código de erro `EFAULT` se a validação
+falhar, sem nunca acessar a memória apontada.
+
+#### Scenario: Ponteiro válido continua funcionando sem nenhuma mudança observável
+- **WHEN** um processo em modo usuário invoca qualquer uma dessas chamadas
+  com um ponteiro e tamanho que apontam inteiramente para memória sua,
+  mapeada e com a permissão necessária (leitura ou escrita, conforme a
+  chamada)
+- **THEN** a chamada SHALL ter sucesso, exatamente como se nenhuma validação
+  de ponteiro existisse
+
+#### Scenario: Ponteiro apontando para memória não mapeada é rejeitado sem acessá-la
+- **WHEN** um processo em modo usuário invoca uma dessas chamadas com um
+  ponteiro cujo intervalo pedido toca pelo menos uma página não mapeada no
+  seu próprio espaço de endereçamento
+- **THEN** a chamada SHALL ser rejeitada com o código de erro `EFAULT`,
+  sem acessar nenhum byte dessa memória e sem causar nenhuma falta de
+  página
+
+#### Scenario: Ponteiro apontando para memória de kernel é rejeitado
+- **WHEN** um processo em modo usuário invoca uma dessas chamadas com um
+  ponteiro cujo intervalo pedido toca pelo menos uma página mapeada mas não
+  acessível a partir do modo usuário
+- **THEN** a chamada SHALL ser rejeitada com o código de erro `EFAULT`,
+  sem acessar nenhum byte dessa memória
+
+#### Scenario: Buffer de escrita apontando para memória só de leitura é rejeitado
+- **WHEN** um processo em modo usuário invoca uma chamada que escreve no
+  buffer do chamador (a chamada de leitura de arquivo) com um ponteiro cujo
+  intervalo pedido toca pelo menos uma página mapeada, acessível a partir do
+  modo usuário, mas não gravável
+- **THEN** a chamada SHALL ser rejeitada com o código de erro `EFAULT`,
+  sem escrever nenhum byte nessa memória
+
+#### Scenario: Tamanho zero é sempre válido, independentemente do ponteiro
+- **WHEN** um processo em modo usuário invoca uma dessas chamadas com
+  tamanho zero, qualquer que seja o valor do ponteiro
+- **THEN** a validação SHALL sempre aceitar, já que nenhum byte dessa
+  memória chega a ser tocado

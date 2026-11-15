@@ -513,7 +513,8 @@ extern "C" fn continue_boot() -> ! {
         // Validação de ponteiro de usuário (change
         // `kernel-user-pointer-validation`) — invoca `SYSCALL_WRITE`/
         // `SYSCALL_OPEN`/`SYSCALL_READ` com ponteiros deliberadamente
-        // inválidos e confirma `SYSCALL_EFAULT`, sem nenhuma exceção de CPU.
+        // inválidos e confirma `EFAULT` (change `kernel-syscall-errno`),
+        // sem nenhuma exceção de CPU.
         match kernel::fat32::mount_boot_partition() {
             Ok(fs) => match kernel::scheduler::spawn_from_elf(
                 &mut frame_allocator,

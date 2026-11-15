@@ -292,16 +292,49 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
   `SYSCALL_WRITE`/`SYSCALL_OPEN`, buffer de leitura inválido rejeitado sem
   consumir o cursor do arquivo em `SYSCALL_READ`), sem nenhuma exceção de CPU.
 
+### Esquema de erro granular estilo POSIX (`-errno`) em toda syscall
+- **Toda syscall que falha agora devolve um código de erro POSIX real**
+  (`kernel-syscall-errno`): `SYSCALL_ERROR`/`SYSCALL_TIMEOUT`/`SYSCALL_EFAULT`
+  (três sentinelas fixos ad-hoc) foram removidos e substituídos por
+  `kernel::syscall::syscall_err(errno)`, que codifica `-errno` como inteiro
+  de 64 bits assinado reinterpretado como `u64` — a mesma convenção das
+  *syscalls* reais do kernel Linux. Cada causa de falha já distinguível
+  internamente (`VmmError`/`Fat32Error`/`DylibError`) ganhou um código
+  específico (`EINVAL`/`ENOENT`/`EISDIR`/`ENOTDIR`/`EBADF`/`EBUSY`/
+  `ENOMEM`/`EIO`/`ENODEV`/`ELOOP`/`ENOEXEC`/`ETIMEDOUT`/`ENOSYS`/`EFAULT`),
+  catalogados em design.md da change, "Mapeamento de erro por syscall".
+  `userland_c/glue.c` propaga o valor real para `errno` em cada função,
+  corrigindo uma imprecisão real: `pthread_mutex_trylock` antes sempre
+  devolvia `EBUSY`, mesmo para um `handle` desconhecido (deveria ser
+  `EINVAL` — exatamente a distinção que o `pthread_mutex_trylock(3)` POSIX
+  real faz).
+- **Escopo deliberadamente mínimo quanto à granularidade de causas de baixo
+  nível**: as 11 variantes de `DylibError` que representam alguma forma de
+  "biblioteca ELF malformada" colapsam todas em `ENOEXEC` (nenhum errno
+  POSIX real distingue, por exemplo, "segmento `PT_DYNAMIC` fora dos
+  limites" de "tag obrigatória ausente" — ambas são só "não é uma
+  biblioteca válida").
+- **Achado real grave, corrigido durante a verificação em boot real**: a
+  convenção `-errno` só funciona de forma genérica ("qualquer retorno
+  negativo é erro") quando nenhum endereço de sucesso tem o bit 63 ligado —
+  verdade no Linux (memória de usuário na metade inferior), falsa neste
+  kernel, cuja janela de memória virtual anônima (`VMM_WINDOW_START =
+  0xffff_c000_0000_0000`) fica na metade superior por decisão de
+  `kernel-posix-virtual-memory`. A primeira versão de `glue.c` usava essa
+  checagem genérica e derrubava `malloc`/`fopen`/as cinco operações de
+  `javaos_vm_*` (todo endereço de sucesso da janela de VMM parecia um erro)
+  — corrigido para verificar a faixa estreita de verdade (`errno` sempre
+  < 300), não qualquer valor negativo. Registrado em `KNOW_ISSUES.md` com
+  o racional completo, já que é uma armadilha real para qualquer código C
+  futuro que inspecione o retorno bruto de uma *syscall* deste kernel.
+- Verificado em boot real: todo programa de teste já existente (`file_syscalls_demo`,
+  `javaos_vm_test_program`, `user_posix_demo`, `libc_test_program`,
+  `efault_test_program`, etc.) reporta exatamente o mesmo padrão de sucesso
+  de antes desta change.
+
 ## O que está previsto
 
 ### Próximo passo imediato
-- Esquema de erro granular (`errno`-like) mais amplo nas syscalls, ao estilo
-  POSIX (`ENOENT`/`EINVAL`/`EACCES`/etc. por chamada) — deliberadamente fora
-  do escopo de `kernel-user-pointer-validation` (ver acima); hoje toda
-  syscall ainda só distingue "erro genérico" (`SYSCALL_ERROR`) de "ponteiro
-  inválido" (`SYSCALL_EFAULT`).
-
-### Médio prazo
 - Parsing de ACPI/MADT, para hardware real além de QEMU/VirtualBox/VMware.
 
 ### Longo prazo

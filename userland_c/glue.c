@@ -87,14 +87,24 @@ extern int errno;
 #define SYS_EXIT 21
 #define SYS_MUTEX_TRYLOCK 22
 
-/* SYSCALL_ERROR do kernel é `u64::MAX`, que como `long` assinado de 64 bits
- * é exatamente -1. */
-#define SYSCALL_ERROR (-1L)
-
-/* SYSCALL_TIMEOUT do kernel é `u64::MAX - 1`, que como `long` assinado de 64
- * bits é exatamente -2 - devolvido por SYSCALL_COND_WAIT quando um prazo
- * pedido expira antes de qualquer notificação (change `kernel-timed-wait`). */
-#define SYSCALL_TIMEOUT (-2L)
+/* kernel::syscall::syscall_err codifica um erro POSIX como `-errno`
+ * (inteiro de 64 bits assinado, convenção do kernel Linux - ver design.md
+ * da change `kernel-syscall-errno`). Antes desta change, só três
+ * sentinelas fixos existiam (`SYSCALL_ERROR`/`SYSCALL_TIMEOUT`/
+ * `SYSCALL_EFAULT`, `-1`/`-2`/`-3`) - substituídos pelo valor real de
+ * `errno` devolvido pelo kernel em cada caso.
+ *
+ * Achado real durante a implementação: "qualquer retorno negativo é um
+ * erro" (`r < 0`) está ERRADO neste kernel - `SYSCALL_VM_RESERVE`/`sbrk`
+ * devolvem endereços dentro da janela de VMM (`VMM_WINDOW_START =
+ * 0xffff_c000_0000_0000`), que tem o bit 63 ligado e por isso também
+ * aparenta negativo como `long` assinado de 64 bits, mesmo sendo um
+ * endereço de sucesso perfeitamente válido. Só os últimos 300 valores
+ * antes de 0 (a mesma faixa reservada por `syscall_err`, `errno` sempre
+ * < 300) são de fato um código de erro - nunca um "qualquer negativo". */
+static inline int is_syscall_error(long r) {
+    return r <= -1L && r >= -300L;
+}
 
 static inline long javaos_syscall(long num, long a0, long a1, long a2, long a3) {
     long ret;
@@ -119,8 +129,8 @@ int read(int fd, void *buf, size_t cnt) {
         return -1;
     }
     long r = javaos_syscall(SYS_READ, fd - FD_OFFSET, (long)buf, (long)cnt, 0);
-    if (r == SYSCALL_ERROR) {
-        errno = EBADF;
+    if (is_syscall_error(r)) {
+        errno = (int)-r;
         return -1;
     }
     return (int)r;
@@ -128,7 +138,12 @@ int read(int fd, void *buf, size_t cnt) {
 
 int write(int fd, const void *buf, size_t cnt) {
     if (fd == 1 || fd == 2) {
-        return (int)javaos_syscall(SYS_WRITE, (long)buf, (long)cnt, 0, 0);
+        long r = javaos_syscall(SYS_WRITE, (long)buf, (long)cnt, 0, 0);
+        if (is_syscall_error(r)) {
+            errno = (int)-r;
+            return -1;
+        }
+        return (int)r;
     }
     errno = EBADF;
     return -1;
@@ -138,8 +153,8 @@ int open(const char *path, int flags, int mode) {
     (void)flags;
     (void)mode;
     long h = javaos_syscall(SYS_OPEN, (long)path, (long)strlen(path), 0, 0);
-    if (h == SYSCALL_ERROR) {
-        errno = ENOENT;
+    if (is_syscall_error(h)) {
+        errno = (int)-h;
         return -1;
     }
     return (int)(h + FD_OFFSET);
@@ -150,8 +165,8 @@ int close(int fd) {
         return 0; /* fechar stdin/stdout/stderr: sucesso trivial, sem efeito */
     }
     long r = javaos_syscall(SYS_CLOSE, fd - FD_OFFSET, 0, 0, 0);
-    if (r == SYSCALL_ERROR) {
-        errno = EBADF;
+    if (is_syscall_error(r)) {
+        errno = (int)-r;
         return -1;
     }
     return 0;
@@ -181,8 +196,8 @@ static long heap_cur = 0;
 void *sbrk(ptrdiff_t incr) {
     if (heap_base == 0) {
         long base = javaos_syscall(SYS_VM_RESERVE, (long)HEAP_WINDOW_SIZE, 0, 0, 0);
-        if (base == SYSCALL_ERROR) {
-            errno = ENOMEM;
+        if (is_syscall_error(base)) {
+            errno = (int)-base;
             return (void *)-1;
         }
         heap_base = base;
@@ -201,8 +216,8 @@ void *sbrk(ptrdiff_t incr) {
         long commit_len = commit_to - heap_committed_end;
         long prot = 1; /* bit0 = gravavel, ver kernel::syscall::prot_to_page_flags */
         long r = javaos_syscall(SYS_VM_COMMIT, heap_committed_end, commit_len, prot, 0);
-        if (r == SYSCALL_ERROR) {
-            errno = ENOMEM;
+        if (is_syscall_error(r)) {
+            errno = (int)-r;
             return (void *)-1;
         }
         heap_committed_end = commit_to;
@@ -247,9 +262,16 @@ int getpid(void) {
  * convenção que kernel::syscall::prot_to_page_flags espera (bit 0 =
  * gravável, bit 1 = executável), repassado sem tradução. */
 
+/* Cada uma destas também define `errno` com o código real devolvido pelo
+ * kernel em caso de erro (antes desta change, nenhuma definia `errno`
+ * nenhum) — o contrato de retorno (`NULL`/`-1`) não muda, mas um consumidor
+ * futuro (ex.: o porte `os_javaos`) pode inspecionar `errno` para mais
+ * detalhe, exatamente como as demais funções desta libc. */
+
 void *javaos_vm_reserve(size_t bytes) {
     long base = javaos_syscall(SYS_VM_RESERVE, (long)bytes, 0, 0, 0);
-    if (base == SYSCALL_ERROR) {
+    if (is_syscall_error(base)) {
+        errno = (int)-base;
         return NULL;
     }
     return (void *)base;
@@ -257,22 +279,38 @@ void *javaos_vm_reserve(size_t bytes) {
 
 int javaos_vm_commit(void *addr, size_t bytes, int prot) {
     long r = javaos_syscall(SYS_VM_COMMIT, (long)addr, (long)bytes, prot, 0);
-    return (r == SYSCALL_ERROR) ? -1 : 0;
+    if (is_syscall_error(r)) {
+        errno = (int)-r;
+        return -1;
+    }
+    return 0;
 }
 
 int javaos_vm_decommit(void *addr, size_t bytes) {
     long r = javaos_syscall(SYS_VM_DECOMMIT, (long)addr, (long)bytes, 0, 0);
-    return (r == SYSCALL_ERROR) ? -1 : 0;
+    if (is_syscall_error(r)) {
+        errno = (int)-r;
+        return -1;
+    }
+    return 0;
 }
 
 int javaos_vm_protect(void *addr, size_t bytes, int prot) {
     long r = javaos_syscall(SYS_VM_PROTECT, (long)addr, (long)bytes, prot, 0);
-    return (r == SYSCALL_ERROR) ? -1 : 0;
+    if (is_syscall_error(r)) {
+        errno = (int)-r;
+        return -1;
+    }
+    return 0;
 }
 
 int javaos_vm_release(void *addr) {
     long r = javaos_syscall(SYS_VM_RELEASE, (long)addr, 0, 0, 0);
-    return (r == SYSCALL_ERROR) ? -1 : 0;
+    if (is_syscall_error(r)) {
+        errno = (int)-r;
+        return -1;
+    }
+    return 0;
 }
 
 /* pthread_mutex_* e pthread_cond_* reais sobre as syscalls de mutex/condvar
@@ -293,7 +331,7 @@ int javaos_vm_release(void *addr) {
 static int pthread_mutex_resolve(pthread_mutex_t *mutex) {
     if (*mutex == (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER) {
         long h = javaos_syscall(SYS_MUTEX_CREATE, 0, 0, 0, 0);
-        if (h == SYSCALL_ERROR) {
+        if (is_syscall_error(h)) {
             return EAGAIN;
         }
         *mutex = (pthread_mutex_t)h;
@@ -304,7 +342,7 @@ static int pthread_mutex_resolve(pthread_mutex_t *mutex) {
 int pthread_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *attr) {
     (void)attr; /* sem suporte a atributos (recursivo, compartilhado entre processos, etc.) */
     long h = javaos_syscall(SYS_MUTEX_CREATE, 0, 0, 0, 0);
-    if (h == SYSCALL_ERROR) {
+    if (is_syscall_error(h)) {
         return EAGAIN;
     }
     *mutex = (pthread_mutex_t)h;
@@ -325,7 +363,7 @@ int pthread_mutex_lock(pthread_mutex_t *mutex) {
         return err;
     }
     long r = javaos_syscall(SYS_MUTEX_LOCK, (long)*mutex, 0, 0, 0);
-    return (r == SYSCALL_ERROR) ? EINVAL : 0;
+    return is_syscall_error(r) ? (int)-r : 0;
 }
 
 int pthread_mutex_trylock(pthread_mutex_t *mutex) {
@@ -333,19 +371,23 @@ int pthread_mutex_trylock(pthread_mutex_t *mutex) {
     if (err != 0) {
         return err;
     }
+    /* Devolve o errno real do kernel (EBUSY se já tomado, EINVAL se
+     * `handle` desconhecido) — antes da change `kernel-syscall-errno`, o
+     * kernel colapsava os dois casos no mesmo sentinela e esta função
+     * sempre devolvia EBUSY, mesmo para um handle desconhecido. */
     long r = javaos_syscall(SYS_MUTEX_TRYLOCK, (long)*mutex, 0, 0, 0);
-    return (r == SYSCALL_ERROR) ? EBUSY : 0;
+    return is_syscall_error(r) ? (int)-r : 0;
 }
 
 int pthread_mutex_unlock(pthread_mutex_t *mutex) {
     long r = javaos_syscall(SYS_MUTEX_UNLOCK, (long)*mutex, 0, 0, 0);
-    return (r == SYSCALL_ERROR) ? EINVAL : 0;
+    return is_syscall_error(r) ? (int)-r : 0;
 }
 
 static int pthread_cond_resolve(pthread_cond_t *cond) {
     if (*cond == (pthread_cond_t)PTHREAD_COND_INITIALIZER) {
         long h = javaos_syscall(SYS_COND_CREATE, 0, 0, 0, 0);
-        if (h == SYSCALL_ERROR) {
+        if (is_syscall_error(h)) {
             return EAGAIN;
         }
         *cond = (pthread_cond_t)h;
@@ -356,7 +398,7 @@ static int pthread_cond_resolve(pthread_cond_t *cond) {
 int pthread_cond_init(pthread_cond_t *cond, const pthread_condattr_t *attr) {
     (void)attr; /* sem suporte a atributos (clock, compartilhado entre processos) */
     long h = javaos_syscall(SYS_COND_CREATE, 0, 0, 0, 0);
-    if (h == SYSCALL_ERROR) {
+    if (is_syscall_error(h)) {
         return EAGAIN;
     }
     *cond = (pthread_cond_t)h;
@@ -375,7 +417,7 @@ int pthread_cond_signal(pthread_cond_t *cond) {
         return err;
     }
     long r = javaos_syscall(SYS_COND_NOTIFY_ONE, (long)*cond, 0, 0, 0);
-    return (r == SYSCALL_ERROR) ? EINVAL : 0;
+    return is_syscall_error(r) ? (int)-r : 0;
 }
 
 int pthread_cond_broadcast(pthread_cond_t *cond) {
@@ -384,7 +426,7 @@ int pthread_cond_broadcast(pthread_cond_t *cond) {
         return err;
     }
     long r = javaos_syscall(SYS_COND_NOTIFY_ALL, (long)*cond, 0, 0, 0);
-    return (r == SYSCALL_ERROR) ? EINVAL : 0;
+    return is_syscall_error(r) ? (int)-r : 0;
 }
 
 int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
@@ -397,7 +439,7 @@ int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex) {
         return err;
     }
     long r = javaos_syscall(SYS_COND_WAIT, (long)*cond, (long)*mutex, 0, 0);
-    return (r == SYSCALL_ERROR) ? EINVAL : 0;
+    return is_syscall_error(r) ? (int)-r : 0;
 }
 
 /* clock_gettime real sobre as syscalls de relogio ja existentes (change
@@ -450,9 +492,10 @@ int pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex,
         return ETIMEDOUT;
     }
 
+    /* O valor devolvido já é o próprio `ETIMEDOUT`/`EINVAL` real quando
+     * `r` é negativo — antes da change `kernel-syscall-errno`, era preciso
+     * um caso especial aqui para `SYSCALL_TIMEOUT` (distinto de
+     * `SYSCALL_ERROR`); agora os dois já chegam como o errno real. */
     long r = javaos_syscall(SYS_COND_WAIT, (long)*cond, (long)*mutex, delta, 0);
-    if (r == SYSCALL_TIMEOUT) {
-        return ETIMEDOUT;
-    }
-    return (r == SYSCALL_ERROR) ? EINVAL : 0;
+    return is_syscall_error(r) ? (int)-r : 0;
 }
