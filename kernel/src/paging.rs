@@ -125,6 +125,24 @@ fn decompose(virt: u64) -> VirtIndices {
     }
 }
 
+/// Primeira página alinhada e quantidade de páginas de `PAGE_SIZE` tocadas
+/// pelo intervalo `[ptr, ptr+len)` — `None` se `ptr + len` estourar `u64`
+/// (um comprimento que faria o intervalo "dar a volta" nunca é válido, em
+/// vez de ser silenciosamente truncado) ou se `len` for zero (precondição:
+/// quem chama trata `len == 0` como sempre válido antes de chamar esta
+/// função, sem nenhuma página para computar — ver
+/// `Mapper::validate_user_range`). Função pura, testável sem hardware.
+fn spanned_pages(ptr: u64, len: u64) -> Option<(u64, u64)> {
+    if len == 0 {
+        return None;
+    }
+    let last_byte = ptr.checked_add(len - 1)?;
+    let first_page = ptr & !(PAGE_SIZE - 1);
+    let last_page = last_byte & !(PAGE_SIZE - 1);
+    let page_count = (last_page - first_page) / PAGE_SIZE + 1;
+    Some((first_page, page_count))
+}
+
 fn read_cr3() -> u64 {
     let value: u64;
     unsafe {
@@ -244,13 +262,16 @@ impl<'a, S: FrameStore> Mapper<'a, S> {
         Ok(frame)
     }
 
-    /// Consulta somente-leitura: retorna o endereço físico mapeado para a
-    /// página virtual em `virt`, ou `None` se qualquer nível da caminhada
-    /// (PML4/PDPT/PD/PT) não estiver presente, ou se `virt` não for alinhado
-    /// a `PAGE_SIZE`. Ao contrário de [`unmap`], nunca cria nem remove
-    /// nenhuma tabela — usada para verificar que uma página (ex.: a guard
-    /// page de `kernel::stack`) permanece deliberadamente não mapeada.
-    pub fn translate(&self, virt: u64) -> Option<u64> {
+    /// Caminha as 4 tabelas (PML4→PDPT→PD→PT) e devolve a entrada folha de
+    /// `virt`, ou `None` se qualquer nível não estiver presente, ou se
+    /// `virt` não for alinhado a `PAGE_SIZE`. Compartilhada por [`translate`]
+    /// (só precisa do endereço físico) e [`validate_user_range`] (precisa
+    /// também das *flags* de permissão da entrada) — mesma caminhada, duas
+    /// necessidades diferentes.
+    ///
+    /// [`translate`]: Self::translate
+    /// [`validate_user_range`]: Self::validate_user_range
+    fn translate_pte(&self, virt: u64) -> Option<PageTableEntry> {
         if virt % PAGE_SIZE != 0 {
             return None;
         }
@@ -276,7 +297,51 @@ impl<'a, S: FrameStore> Mapper<'a, S> {
         if !pte.is_present() {
             return None;
         }
-        Some(pte.addr())
+        Some(pte)
+    }
+
+    /// Consulta somente-leitura: retorna o endereço físico mapeado para a
+    /// página virtual em `virt`, ou `None` se qualquer nível da caminhada
+    /// (PML4/PDPT/PD/PT) não estiver presente, ou se `virt` não for alinhado
+    /// a `PAGE_SIZE`. Ao contrário de [`unmap`], nunca cria nem remove
+    /// nenhuma tabela — usada para verificar que uma página (ex.: a guard
+    /// page de `kernel::stack`) permanece deliberadamente não mapeada.
+    pub fn translate(&self, virt: u64) -> Option<u64> {
+        self.translate_pte(virt).map(|pte| pte.addr())
+    }
+
+    /// Verifica se cada página de 4 KiB tocada pelo intervalo `[ptr, ptr+len)`
+    /// de modo usuário está mapeada, acessível a partir do modo usuário e (se
+    /// `require_writable`) gravável — usada para validar um ponteiro de
+    /// usuário antes de uma *syscall* desreferenciá-lo, nunca desreferenciando
+    /// um ponteiro inválido (ver design.md da change
+    /// `kernel-user-pointer-validation`). `len == 0` é sempre válido (nenhum
+    /// byte é tocado), independentemente de `ptr`. Mesma limitação de
+    /// testabilidade de [`translate`]: a caminhada real de tabelas só é
+    /// verificável em boot real.
+    ///
+    /// [`translate`]: Self::translate
+    pub fn validate_user_range(&self, ptr: u64, len: u64, require_writable: bool) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some((first_page, page_count)) = spanned_pages(ptr, len) else {
+            return false;
+        };
+        for i in 0..page_count {
+            let page = first_page + i * PAGE_SIZE;
+            let Some(pte) = self.translate_pte(page) else {
+                return false;
+            };
+            let flags = pte.flags();
+            if flags & PTE_USER == 0 {
+                return false;
+            }
+            if require_writable && flags & PTE_WRITABLE == 0 {
+                return false;
+            }
+        }
+        true
     }
 
     /// Desmapeia a página virtual em `virt`, retornando o frame físico que
@@ -528,6 +593,46 @@ mod tests {
     fn page_flags_user_accessible_sets_user_bit() {
         let flags = PageFlags { writable: true, user_accessible: true, executable: false };
         assert_eq!(flags.to_pte_bits() & PTE_USER, PTE_USER);
+    }
+
+    #[test]
+    fn spanned_pages_within_a_single_page() {
+        assert_eq!(spanned_pages(0x1000, 0x10), Some((0x1000, 1)));
+    }
+
+    #[test]
+    fn spanned_pages_crossing_a_page_boundary() {
+        // Começa 16 bytes antes do fim da página em 0x1000 e termina 16
+        // bytes depois do início da página seguinte — toca as duas.
+        assert_eq!(spanned_pages(0x1ff0, 0x20), Some((0x1000, 2)));
+    }
+
+    #[test]
+    fn spanned_pages_ending_exactly_at_the_start_of_the_next_page() {
+        // Último byte tocado é o primeiro da página seguinte.
+        assert_eq!(spanned_pages(0x1ff0, 0x11), Some((0x1000, 2)));
+    }
+
+    #[test]
+    fn spanned_pages_rejects_an_overflowing_range() {
+        assert_eq!(spanned_pages(u64::MAX - 10, 20), None);
+    }
+
+    #[test]
+    fn spanned_pages_rejects_zero_length() {
+        assert_eq!(spanned_pages(0x1000, 0), None);
+    }
+
+    #[test]
+    fn validate_user_range_with_zero_length_is_always_valid_without_touching_cr3() {
+        // `len == 0` retorna antes de qualquer acesso a CR3/HHDM (mesmo
+        // racional de `translate_rejects_misaligned_address_without_touching_cr3`),
+        // então é seguro chamar em host mesmo com um ponteiro nulo/inválido.
+        use crate::phys::{FrameAllocator, HhdmFrameStore};
+        let mut allocator = FrameAllocator::new(HhdmFrameStore);
+        let mapper = Mapper::new(&mut allocator);
+        assert!(mapper.validate_user_range(0, 0, false));
+        assert!(mapper.validate_user_range(u64::MAX, 0, true));
     }
 
     #[test]

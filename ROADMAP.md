@@ -270,11 +270,36 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
   a thread coordenadora de `kernel::safepoint_demo`, liberando sua página de
   poll reservada ao terminar).
 
+### Validação de ponteiro de usuário em argumentos de syscall
+- **Toda syscall que recebe um ponteiro de modo usuário (`SYSCALL_WRITE`,
+  `SYSCALL_DLOPEN`, `SYSCALL_DLSYM`, `SYSCALL_OPEN`, `SYSCALL_READ`) agora
+  valida essa memória antes de acessá-la** (`kernel-user-pointer-validation`):
+  nova `kernel::paging::Mapper::validate_user_range` confirma que toda página
+  tocada pelo intervalo está mapeada, acessível a partir do modo usuário e
+  (quando a chamada escreve nela) gravável — rejeitando com o novo sentinela
+  `SYSCALL_EFAULT` se não. Fecha um buraco real de `kernel-fault-isolation`:
+  antes, um ponteiro inválido causava `#PF` já em modo **kernel** (depois da
+  transição de `syscall`), fora do alcance daquele isolamento, derrubando o
+  kernel inteiro.
+- **Escopo deliberadamente mínimo**: só distingue "ponteiro inválido"
+  (`SYSCALL_EFAULT`) do sentinela genérico já existente (`SYSCALL_ERROR`) —
+  não é um esquema de erro granular ao estilo POSIX (`ENOENT`/`EINVAL`/
+  `EACCES`/etc. por chamada), que continua não implementado (a pedido
+  explícito do usuário, consultado diretamente — ver design.md da change,
+  "Alternativas consideradas").
+- Verificado em boot real: novo `/bin/efault.elf` reporta `resultado PPPP`
+  (ponteiro válido inalterado, ponteiro nulo/inválido rejeitado em
+  `SYSCALL_WRITE`/`SYSCALL_OPEN`, buffer de leitura inválido rejeitado sem
+  consumir o cursor do arquivo em `SYSCALL_READ`), sem nenhuma exceção de CPU.
+
 ## O que está previsto
 
 ### Próximo passo imediato
-- Esquema de erro granular (`errno`-like) nas syscalls, e validação de ponteiro de
-  usuário (hoje não validado, mesmo precedente de `sys_write`).
+- Esquema de erro granular (`errno`-like) mais amplo nas syscalls, ao estilo
+  POSIX (`ENOENT`/`EINVAL`/`EACCES`/etc. por chamada) — deliberadamente fora
+  do escopo de `kernel-user-pointer-validation` (ver acima); hoje toda
+  syscall ainda só distingue "erro genérico" (`SYSCALL_ERROR`) de "ponteiro
+  inválido" (`SYSCALL_EFAULT`).
 
 ### Médio prazo
 - Parsing de ACPI/MADT, para hardware real além de QEMU/VirtualBox/VMware.

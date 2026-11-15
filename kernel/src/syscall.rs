@@ -5,7 +5,7 @@ extern crate alloc;
 
 use crate::apic::{rdmsr, wrmsr};
 use crate::gdt::KERNEL_CODE_SELECTOR;
-use crate::paging::PageFlags;
+use crate::paging::{Mapper, PageFlags};
 use crate::vmm::VMM;
 
 const IA32_EFER: u32 = 0xC000_0080;
@@ -105,17 +105,37 @@ pub const SYSCALL_ERROR: u64 = u64::MAX;
 /// (notificada) — ver design.md da change `kernel-timed-wait`.
 pub const SYSCALL_TIMEOUT: u64 = u64::MAX - 1;
 
+/// Valor devolvido em `RAX` quando um ponteiro de modo usuário passado como
+/// argumento de uma *syscall* não está inteiramente mapeado, acessível a
+/// partir do modo usuário, ou (quando a chamada escreve nele) gravável —
+/// distinto de `SYSCALL_ERROR`/`SYSCALL_TIMEOUT` — ver design.md da change
+/// `kernel-user-pointer-validation`.
+pub const SYSCALL_EFAULT: u64 = u64::MAX - 2;
+
+/// Verifica se `[ptr, ptr+len)` está inteiramente mapeado no espaço de
+/// endereçamento do chamador, acessível a partir do modo usuário e (se
+/// `require_writable`) gravável — usada por toda *syscall* abaixo que recebe
+/// um ponteiro de memória do chamador, antes de desreferenciá-lo. Ver
+/// design.md da change `kernel-user-pointer-validation`.
+fn user_range_is_valid(ptr: u64, len: u64, require_writable: bool) -> bool {
+    let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
+    let mapper = Mapper::new(&mut frame_allocator);
+    mapper.validate_user_range(ptr, len, require_writable)
+}
+
 /// Escreve `len` bytes a partir de `ptr` (endereço do chamador, modo
 /// usuário) no console serial do kernel. Devolve a quantidade de bytes
-/// escritos.
+/// escritos, ou `SYSCALL_EFAULT` se `ptr`/`len` não corresponder a memória
+/// mapeada e acessível do chamador (ver `user_range_is_valid`).
 ///
 /// # Safety
-/// `ptr`/`len` vêm diretamente do chamador em modo usuário, sem validação —
-/// ver design.md (Non-Goals de `kernel-process-scheduler`/`kernel-syscalls`:
-/// uma exceção causada por um ponteiro inválido do chamador continua
-/// haltando o kernel inteiro nesta change, isolamento de falhas fica para
-/// uma change futura).
+/// `ptr`/`len` são validados via `user_range_is_valid` antes de qualquer
+/// acesso — a chamada nunca desreferencia um ponteiro que não passou nessa
+/// validação.
 unsafe fn sys_write(ptr: u64, len: u64) -> u64 {
+    if !user_range_is_valid(ptr, len, false) {
+        return SYSCALL_EFAULT;
+    }
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
     {
         let mut serial = crate::serial::SERIAL1.lock();
@@ -367,10 +387,13 @@ fn sys_clock_monotonic() -> u64 {
 /// padrão de custo já aceito por `kernel::fat32_demo`/`kernel_main`).
 ///
 /// # Safety
-/// `ptr`/`len` vêm diretamente do chamador em modo usuário, sem validação —
-/// mesmo precedente de `sys_write`; UTF-8 inválido é `SYSCALL_ERROR`, não um
+/// `ptr`/`len` são validados via `user_range_is_valid` antes de qualquer
+/// acesso (ver `sys_write`); UTF-8 inválido é `SYSCALL_ERROR`, não um
 /// pânico.
 unsafe fn sys_dlopen(ptr: u64, len: u64) -> u64 {
+    if !user_range_is_valid(ptr, len, false) {
+        return SYSCALL_EFAULT;
+    }
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
     let Ok(path) = core::str::from_utf8(bytes) else {
         return SYSCALL_ERROR;
@@ -404,9 +427,12 @@ unsafe fn sys_dlopen(ptr: u64, len: u64) -> u64 {
 /// endereçamento do chamador — cobre `SYSCALL_DLSYM`.
 ///
 /// # Safety
-/// `name_ptr`/`name_len` vêm diretamente do chamador em modo usuário, sem
-/// validação — mesmo precedente de `sys_write`.
+/// `name_ptr`/`name_len` são validados via `user_range_is_valid` antes de
+/// qualquer acesso (ver `sys_write`).
 unsafe fn sys_dlsym(handle: u64, name_ptr: u64, name_len: u64) -> u64 {
+    if !user_range_is_valid(name_ptr, name_len, false) {
+        return SYSCALL_EFAULT;
+    }
     let bytes = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
     let Ok(name) = core::str::from_utf8(bytes) else {
         return SYSCALL_ERROR;
@@ -425,9 +451,12 @@ unsafe fn sys_dlsym(handle: u64, name_ptr: u64, name_len: u64) -> u64 {
 /// sem esquema granular de erro, mesma disciplina das demais *syscalls*).
 ///
 /// # Safety
-/// `path_ptr`/`path_len` vêm diretamente do chamador em modo usuário, sem
-/// validação — mesmo precedente de `sys_write`/`sys_dlopen`.
+/// `path_ptr`/`path_len` são validados via `user_range_is_valid` antes de
+/// qualquer acesso (ver `sys_write`).
 unsafe fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
+    if !user_range_is_valid(path_ptr, path_len, false) {
+        return SYSCALL_EFAULT;
+    }
     let bytes = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
     let Ok(path) = core::str::from_utf8(bytes) else {
         return SYSCALL_ERROR;
@@ -452,12 +481,18 @@ unsafe fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
 /// usuário) — cobre `SYSCALL_READ`. Devolve a quantidade de bytes
 /// efetivamente copiada (`0` ao alcançar o fim do arquivo, o que não é um
 /// erro), ou `SYSCALL_ERROR` se `handle` não corresponder a nenhum arquivo
-/// atualmente aberto.
+/// atualmente aberto, ou `SYSCALL_EFAULT` se `buf_ptr`/`buf_len` não
+/// corresponder a um buffer de escrita válido do chamador — verificado
+/// antes de tocar o arquivo (nenhum byte é lido dele, nem o cursor avança,
+/// se a validação falhar).
 ///
 /// # Safety
-/// `buf_ptr`/`buf_len` vêm diretamente do chamador em modo usuário, sem
-/// validação — mesmo precedente de `sys_write`.
+/// `buf_ptr`/`buf_len` são validados via `user_range_is_valid` (exigindo
+/// permissão de escrita) antes de qualquer acesso.
 unsafe fn sys_read(handle: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    if !user_range_is_valid(buf_ptr, buf_len, true) {
+        return SYSCALL_EFAULT;
+    }
     let Some(bytes) = crate::file_handles::read(handle, buf_len as usize, crate::scheduler::current_process_id())
     else {
         return SYSCALL_ERROR;

@@ -510,6 +510,23 @@ extern "C" fn continue_boot() -> ! {
                 kernel::serial_println!("fault_isolation: falha ao montar sistema de arquivos: {:?}", e)
             }
         }
+        // Validação de ponteiro de usuário (change
+        // `kernel-user-pointer-validation`) — invoca `SYSCALL_WRITE`/
+        // `SYSCALL_OPEN`/`SYSCALL_READ` com ponteiros deliberadamente
+        // inválidos e confirma `SYSCALL_EFAULT`, sem nenhuma exceção de CPU.
+        match kernel::fat32::mount_boot_partition() {
+            Ok(fs) => match kernel::scheduler::spawn_from_elf(
+                &mut frame_allocator,
+                &fs,
+                "/bin/efault.elf",
+                kernel::scheduler::EFAULT_TEST_PROGRAM_STACK_VIRT,
+                kernel::scheduler::EFAULT_TEST_PROGRAM_STACK_SIZE,
+            ) {
+                Ok(_) => kernel::serial_println!("efault: /bin/efault.elf carregado e em execucao"),
+                Err(e) => kernel::serial_println!("efault: falha ao carregar /bin/efault.elf: {:?}", e),
+            },
+            Err(e) => kernel::serial_println!("efault: falha ao montar sistema de arquivos: {:?}", e),
+        }
         // Thread de demonstração do teclado (ver `design.md` da change
         // `kernel-keyboard`): compartilha o espaço de endereçamento da
         // thread de boot (não precisa de isolamento próprio), evitando uma

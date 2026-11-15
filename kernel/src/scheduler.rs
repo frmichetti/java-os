@@ -618,6 +618,14 @@ pub const TIMEDWAIT_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
 pub const FAULT_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_0d00_0000_0000;
 pub const FAULT_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
 
+/// Endereço virtual, na metade inferior, onde a stack de usuário do
+/// executável de teste de validação de ponteiro de usuário
+/// (`/bin/efault.elf`, change `kernel-user-pointer-validation`) é mapeada —
+/// mesmo papel de `FAULT_TEST_PROGRAM_STACK_VIRT`, endereço distinto só por
+/// clareza em despejos de depuração.
+pub const EFAULT_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_0e00_0000_0000;
+pub const EFAULT_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
+
 /// Endereços virtuais das duas variantes de `kernel::fpu_demo` (change
 /// `kernel-fpu-context-switch`) — mesma faixa baixa e mesmo racional de
 /// `EXIT_DEMO_CODE_VIRT`/`LIBC_TEST_PROGRAM_STACK_VIRT` (bem abaixo do
