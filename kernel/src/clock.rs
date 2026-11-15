@@ -61,13 +61,18 @@ pub fn civil_from_unix_seconds(total_seconds: i64) -> (i64, u32, u32, u32, u32, 
 }
 
 /// Converte ciclos de TSC decorridos em nanossegundos, dada a frequência
-/// calibrada do TSC — dividindo antes de multiplicar para nunca estourar
-/// `u64` (ver design.md, "Conversão de ciclos de TSC para nanossegundos sem
-/// overflow"). Função pura, testável sem hardware.
+/// calibrada do TSC. A multiplicação intermediária usa `u128` — dividir
+/// antes de multiplicar em `u64` (a técnica usada antes aqui) só evita
+/// overflow enquanto `frequency_hz < u64::MAX / 1_000_000_000 ≈ 18,44 GHz`;
+/// `frequency_hz` acima disso (uma calibração de TSC ruim, não uma CPU real
+/// — ver `KNOW_ISSUES.md`, "`calibrate_tsc()` pode medir uma frequência de
+/// TSC absurdamente inflada...") ainda estourava `remainder_cycles *
+/// 1_000_000_000` sozinho. Em `u128`, o produto de dois `u64` nunca estoura
+/// (`u128::MAX` > `u64::MAX²`), então o resultado é correto para qualquer
+/// `frequency_hz` representável em `u64`, não só para uma faixa plausível de
+/// CPU real. Função pura, testável sem hardware.
 pub fn cycles_to_nanos(elapsed_cycles: u64, frequency_hz: u64) -> u64 {
-    let whole_seconds = elapsed_cycles / frequency_hz;
-    let remainder_cycles = elapsed_cycles % frequency_hz;
-    whole_seconds * 1_000_000_000 + (remainder_cycles * 1_000_000_000) / frequency_hz
+    ((elapsed_cycles as u128 * 1_000_000_000) / frequency_hz as u128) as u64
 }
 
 // ---------------------------------------------------------------------
@@ -201,6 +206,11 @@ fn convert_raw_rtc_to_unix_seconds(raw: RawRtcReading) -> i64 {
 
 const CALIBRATION_MILLIS: u64 = 10;
 
+/// Quantas vezes a janela de calibração é repetida — ver
+/// [`least_biased_cycles_elapsed`] para o porquê de repetir em vez de medir
+/// uma única vez.
+const CALIBRATION_ROUNDS: usize = 5;
+
 fn read_tsc() -> u64 {
     let low: u32;
     let high: u32;
@@ -210,28 +220,51 @@ fn read_tsc() -> u64 {
     ((high as u64) << 32) | low as u64
 }
 
-/// Mede a frequência do TSC comparando contra o PIT 8254, e devolve também
-/// o valor do TSC capturado ao final da janela de calibração — usado
-/// diretamente como referência de boot por [`init`], evitando uma leitura
-/// adicional (e uma janela extra) depois da calibração.
+/// Escolhe, entre várias medições de ciclos de TSC decorridos durante
+/// janelas nominalmente idênticas de calibração, a menor — ver
+/// `KNOW_ISSUES.md`, "`calibrate_tsc()` pode medir uma frequência de TSC
+/// absurdamente inflada...": um atraso real do host durante o laço de
+/// polling do PIT (ex.: várias saídas custosas para o espaço de usuário do
+/// QEMU sob contenção) só pode fazer uma amostra parecer mais longa que a
+/// janela nominal de verdade — nunca mais curta. A amostra de menor valor é
+/// portanto a que menos sofreu esse viés, a estimativa mais confiável da
+/// frequência real. Função pura, testável sem hardware.
+fn least_biased_cycles_elapsed(samples: &[u64]) -> u64 {
+    samples.iter().copied().min().expect("pelo menos uma amostra de calibração")
+}
+
+/// Mede a frequência do TSC comparando contra o PIT 8254 ao longo de
+/// [`CALIBRATION_ROUNDS`] janelas independentes, e devolve também o valor do
+/// TSC capturado ao final da última janela — usado diretamente como
+/// referência de boot por [`init`], evitando uma leitura adicional (e uma
+/// janela extra) depois da calibração.
 fn calibrate_tsc() -> (u64, u64) {
-    let pit_count = crate::timer::pit_calibration_count(CALIBRATION_MILLIS);
+    let mut cycles_elapsed_per_round = [0u64; CALIBRATION_ROUNDS];
+    let mut last_end = 0u64;
 
-    unsafe { outb(crate::timer::PIT_COMMAND, crate::timer::PIT_CMD_CHANNEL0_MODE0) };
-    let start = read_tsc();
-    unsafe {
-        outb(crate::timer::PIT_CHANNEL0_DATA, (pit_count & 0xff) as u8);
-        outb(crate::timer::PIT_CHANNEL0_DATA, (pit_count >> 8) as u8);
+    for round in cycles_elapsed_per_round.iter_mut() {
+        let pit_count = crate::timer::pit_calibration_count(CALIBRATION_MILLIS);
+
+        unsafe { outb(crate::timer::PIT_COMMAND, crate::timer::PIT_CMD_CHANNEL0_MODE0) };
+        let start = read_tsc();
+        unsafe {
+            outb(crate::timer::PIT_CHANNEL0_DATA, (pit_count & 0xff) as u8);
+            outb(crate::timer::PIT_CHANNEL0_DATA, (pit_count >> 8) as u8);
+        }
+
+        // Modo 0 do PIT conta até 0 e para ali (não recarrega sozinho).
+        while crate::timer::read_pit_count() != 0 {
+            core::hint::spin_loop();
+        }
+        let end = read_tsc();
+
+        *round = end - start;
+        last_end = end;
     }
 
-    // Modo 0 do PIT conta até 0 e para ali (não recarrega sozinho).
-    while crate::timer::read_pit_count() != 0 {
-        core::hint::spin_loop();
-    }
-    let end = read_tsc();
-
-    let frequency_hz = crate::timer::measured_frequency_hz(end - start, CALIBRATION_MILLIS);
-    (frequency_hz, end)
+    let cycles_elapsed = least_biased_cycles_elapsed(&cycles_elapsed_per_round);
+    let frequency_hz = crate::timer::measured_frequency_hz(cycles_elapsed, CALIBRATION_MILLIS);
+    (frequency_hz, last_end)
 }
 
 // ---------------------------------------------------------------------
@@ -328,11 +361,36 @@ mod tests {
 
     #[test]
     fn cycles_to_nanos_does_not_overflow_where_naive_multiplication_would() {
-        // Multiplicar antes de dividir (elapsed_cycles * 1_000_000_000)
-        // estouraria u64 aqui: ~30 bilhões de ciclos * 1e9 > u64::MAX.
+        // Multiplicar antes de dividir em u64 (elapsed_cycles * 1_000_000_000)
+        // estouraria aqui: ~30 bilhões de ciclos * 1e9 > u64::MAX.
         let frequency_hz = 3_000_000_000u64; // 3 GHz
         let elapsed_cycles = frequency_hz * 10; // 10 segundos de uptime
         assert_eq!(cycles_to_nanos(elapsed_cycles, frequency_hz), 10_000_000_000);
+    }
+
+    #[test]
+    fn cycles_to_nanos_does_not_overflow_with_an_implausibly_high_frequency() {
+        // Valores reais observados em boot real (ver KNOW_ISSUES.md,
+        // "`calibrate_tsc()` pode medir uma frequência de TSC absurdamente
+        // inflada..."): uma calibração ruim produziu ~23,4 GHz, acima do
+        // limite (`u64::MAX / 1_000_000_000 ≈ 18,44 GHz`) em que a antiga
+        // técnica de "dividir antes de multiplicar" em u64 deixava de
+        // garantir ausência de overflow. Antes da correção, isto entrava em
+        // pânico com "attempt to multiply with overflow".
+        let frequency_hz = 23_419_611_300u64;
+        let elapsed_cycles = 46_599_945_179u64;
+        // ~1,99 segundos decorridos a essa frequência — resultado plausível,
+        // não um valor arbitrário de "não estourou".
+        assert_eq!(cycles_to_nanos(elapsed_cycles, frequency_hz), 1_989_783_031);
+    }
+
+    #[test]
+    fn least_biased_cycles_elapsed_picks_the_smallest_sample() {
+        // A menor amostra é a menos afetada por um atraso real do host
+        // durante a janela de calibração (que só pode alongar a janela,
+        // nunca encurtá-la) — ver documentação de `least_biased_cycles_elapsed`.
+        let samples = [30_123_456u64, 30_000_000, 35_999_999, 30_050_000];
+        assert_eq!(least_biased_cycles_elapsed(&samples), 30_000_000);
     }
 
     #[test]
