@@ -363,10 +363,14 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
 
 ## O que está previsto
 
-Nenhum item de endurecimento de infraestrutura pendente no momento — o
-próximo passo real é começar a examinar o código-fonte do HotSpot em si
-(ver "Destaque: o que falta para a JVM rodar", item 6, abaixo), que ainda
-não foi escopado em nenhuma change.
+### Próximo passo imediato
+- Criação de thread nativa em modo usuário (`pthread_create`) — nova
+  *syscall* de criação de thread + `os_javaos::pd_start_thread` real,
+  reaproveitando `kernel::scheduler`/`kernel::process` já existentes.
+  Bloqueio duro para o porte do HotSpot (ver "Destaque: o que falta para a
+  JVM rodar", item 6.1): nenhuma JVM liga sem conseguir criar as threads
+  nativas que ela mesma precisa (`VMThread`/`ServiceThread`/etc.), antes
+  mesmo de qualquer escolha de GC/interpretador.
 
 ### Longo prazo
 - Modelo híbrido de execução de JVM (runtime compartilhado vs. JVM isolada por
@@ -429,7 +433,51 @@ real (`os-javaos-memory-pd`), `PlatformMutex`/`PlatformMonitor` reais
    real fica para depois, mas não bloqueia mais nenhum teste de boot real que rode
    código de usuário com risco de falhar.
 6. Só depois disso: o próprio código-fonte do HotSpot (GC, JIT, interpretador,
-   carregamento de classes via o `ClassLoader`) — ainda não escopado em nenhuma change.
+   carregamento de classes via o `ClassLoader`) — mapeado por uma exploração
+   (`openspec explore`) contra a árvore real vendorizada (`vendor/jdk-27-ga/
+   src/hotspot`), ainda não implementado. Em ordem de dependência:
+   1. **Criação de thread nativa em modo usuário (`pthread_create`) —
+      próximo passo imediato**: nenhuma *syscall* de criação de thread em
+      modo usuário existe hoje (`kernel::scheduler::spawn_sharing_current_
+      address_space` só é usada internamente pelo próprio kernel), e
+      `os_javaos::pd_start_thread` continua `fatal()`/stub (ver item 1
+      acima). Bloqueio duro, não contornável por nenhuma escolha de GC/
+      interpretador: o HotSpot cria várias threads nativas (`VMThread`,
+      `ServiceThread`, `NotificationThread`, `MonitorDeflationThread`) só
+      para inicializar a VM, antes de `Main.main` sequer rodar
+      (`share/runtime/vmThread.cpp`/`serviceThread.cpp`/
+      `notificationThread.cpp`/`monitorDeflationThread.cpp`). Pré-requisito
+      puramente mecânico — reaproveita `kernel::scheduler`/`kernel::process`
+      já existentes, não exige entender GC/interpretador ainda.
+   2. **Escolha do coletor de lixo mais simples para o primeiro porte**:
+      `share/gc/epsilon` (~15 arquivos — nunca coleta, só aloca até o heap
+      estourar, zero lógica de marcação/compactação) é o candidato mais
+      óbvio para uma primeira integração, frente a `share/gc/serial` (~29
+      arquivos, o GC "de verdade" mais simples do HotSpot). `share/gc/
+      shared` (~209 arquivos) é a base comum inevitável com qualquer
+      escolha.
+   3. **Interpretador**: `share/interpreter` (~36 arquivos —
+      `templateInterpreter`/`templateTable`) é a infraestrutura do
+      interpretador **com geração de código de máquina**, usada pelos
+      ports com JIT (`cpu/x86`, etc.) — a variante Zero não usa essa
+      infraestrutura. O interpretador de verdade da variante Zero vive em
+      `cpu/zero` (~55 arquivos — `bytecodeInterpreter_zero.*`: um laço
+      `switch` gigante em C++ puro, sem geração de código de máquina;
+      `frame_zero`/`stack_zero`/`interpreterFrame_zero`: pilha de quadros
+      simulada em C++, já que não há quadros de pilha de máquina reais).
+   4. **`classfile`/`oops`** (parsing de `.class`/`ClassLoader`/verificador
+      de bytecode, ~83 arquivos; representação de objeto/classe em
+      memória, ~125 arquivos) — necessários independentemente da escolha
+      de GC ou interpretador.
+   5. **`runtime`** (~211 arquivos, o maior subsistema) — concentra
+      `Thread`/`JavaThread`/`Arguments`/a sequência de inicialização da VM
+      (`init.cpp`). A ordem exata de dependências internas (o que `init.cpp`
+      chama, em que ordem, o que cada `os::`/`pd_*` precisa estar pronto
+      antes) ainda não foi mapeada em detalhe — próxima exploração natural
+      depois do item 1 acima.
+   6. **`prims`** (JNI, ~95 arquivos) — escopo exato depende de quão mínimo
+      o primeiro "hello world" pode ser (quantos métodos nativos de
+      `java.base` um `System.out.println` mínimo realmente invoca).
 
 ## Destaque: o que falta para uma interface gráfica
 
