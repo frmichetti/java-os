@@ -708,6 +708,82 @@ fn build_efault_test_program(root: &Path) -> PathBuf {
     elf_path
 }
 
+/// Compila o programa C de verificação da nova syscall de criação de
+/// thread de usuário (`userland_c/sibling_thread_test_program.c`, change
+/// `kernel-user-thread-create`, design.md): mesmo mecanismo exato de
+/// [`build_efault_test_program`].
+fn build_sibling_thread_test_program(root: &Path) -> PathBuf {
+    let cross_gcc = root.join("scripts/cross/x86_64-elf-gcc");
+    let newlib_build = root.join("vendor/newlib-build/x86_64-elf/newlib");
+    let newlib_libc_a = newlib_build.join("libc.a");
+    if !newlib_libc_a.exists() {
+        panic!(
+            "newlib nao encontrado em {} — rode scripts/cross/build-newlib.sh primeiro (ver README, change `libc-minimal-port`)",
+            newlib_libc_a.display()
+        );
+    }
+    let newlib_src = vendored_newlib_src_dir(root);
+    let targ_include = newlib_build.join("targ-include");
+    let public_include = newlib_src.join("newlib/libc/include");
+
+    let userland_c = root.join("userland_c");
+    let out_dir = root.join("target/userland_c");
+    fs::create_dir_all(&out_dir).expect("falha ao criar target/userland_c");
+
+    let compile = |src: &str, obj_name: &str| {
+        let src_path = userland_c.join(src);
+        let obj_path = out_dir.join(obj_name);
+        run(Command::new(&cross_gcc).args([
+            "-ffreestanding",
+            "-nostdlib",
+            "-isystem",
+            targ_include.to_str().unwrap(),
+            "-isystem",
+            public_include.to_str().unwrap(),
+            "-c",
+            src_path.to_str().unwrap(),
+            "-o",
+            obj_path.to_str().unwrap(),
+        ]));
+        obj_path
+    };
+
+    let crt0_obj = {
+        let obj_path = out_dir.join("crt0.o");
+        run(Command::new(&cross_gcc).args([
+            "-ffreestanding",
+            "-nostdlib",
+            "-c",
+            userland_c.join("crt0.S").to_str().unwrap(),
+            "-o",
+            obj_path.to_str().unwrap(),
+        ]));
+        obj_path
+    };
+    let glue_obj = compile("glue.c", "sibling_thread_glue.o");
+    let program_obj = compile("sibling_thread_test_program.c", "sibling_thread_test_program.o");
+
+    let elf_path = out_dir.join("sibling_thread_test_program.elf");
+    run(Command::new(&cross_gcc).args([
+        "-ffreestanding",
+        "-nostdlib",
+        "-static",
+        "-no-pie",
+        "-T",
+        userland_c.join("linker.ld").to_str().unwrap(),
+        crt0_obj.to_str().unwrap(),
+        program_obj.to_str().unwrap(),
+        glue_obj.to_str().unwrap(),
+        "-L",
+        newlib_build.to_str().unwrap(),
+        "-lc",
+        "-o",
+        elf_path.to_str().unwrap(),
+    ]));
+
+    elf_path
+}
+
 /// Compila o programa C++ de verificação do runtime C++ mínimo
 /// (`userland_c/cxx_test_program.cpp`, change `cxx-minimal-runtime`): o
 /// runtime C++ (`cxx_runtime.cpp` — `operator new`/`delete`,
@@ -865,6 +941,7 @@ fn build_image(root: &Path) -> PathBuf {
     let timedwait_test_program = build_timedwait_test_program(root);
     let fault_test_program = build_fault_test_program(root);
     let efault_test_program = build_efault_test_program(root);
+    let sibling_thread_test_program = build_sibling_thread_test_program(root);
 
     run(Command::new("mcopy").args([
         "-i",
@@ -955,6 +1032,12 @@ fn build_image(root: &Path) -> PathBuf {
         &part,
         efault_test_program.to_str().unwrap(),
         "::/bin/efault.elf",
+    ]));
+    run(Command::new("mcopy").args([
+        "-i",
+        &part,
+        sibling_thread_test_program.to_str().unwrap(),
+        "::/bin/siblingt.elf",
     ]));
 
     eprintln!("Imagem gerada em {}", image_path.display());

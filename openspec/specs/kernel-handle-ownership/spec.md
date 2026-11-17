@@ -60,3 +60,18 @@ memória virtual anônima que esse processo possuía.
   termina
 - **THEN** cada uma dessas reservas SHALL ser liberada como se o próprio processo
   tivesse liberado cada uma antes de terminar
+
+#### Scenario: Processo com múltiplas threads só libera recursos quando a última termina
+- **WHEN** uma thread de um processo com mais de uma thread viva termina,
+  havendo ainda pelo menos outra thread viva nesse mesmo processo
+- **THEN** nenhum arquivo aberto nem reserva de memória virtual pertencente
+  a esse processo SHALL ser fechado ou liberado — eles permanecem
+  utilizáveis pela thread que continua viva, exatamente como antes do
+  término
+
+#### Scenario: Última thread de um processo com múltiplas threads libera os recursos do processo
+- **WHEN** a última thread viva de um processo que já teve mais de uma
+  thread termina
+- **THEN** o kernel SHALL fechar todo arquivo aberto e liberar toda reserva
+  de memória virtual que esse processo possuía, exatamente como no caso de
+  um processo de uma única thread

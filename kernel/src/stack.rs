@@ -184,6 +184,77 @@ pub fn alloc_thread_stack<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>
     Ok(stack_top)
 }
 
+/// Base da janela virtual reservada a stacks de usuário de threads
+/// adicionais criadas via `SYSCALL_THREAD_CREATE` — metade inferior do
+/// endereçamento (privada por processo, ao contrário do pool de stacks de
+/// kernel acima, que vive na metade superior compartilhada). Ver
+/// `design.md` da change `kernel-user-thread-create` — "Janela de stack de
+/// usuário dedicada a threads adicionais...".
+///
+/// **Achado real durante a implementação:** `design.md` originalmente
+/// propunha `0x0000_1000_0000_0000`, achando esse endereço livre — na
+/// verdade já é `USER_DEMO_CODE_VIRT` em `kernel::scheduler`. A faixa
+/// `0x0000_01xx` até `0x0000_7xxx` (incrementos de `0x0000_0100_0000_0000`)
+/// já está inteiramente ocupada por constantes `*_CODE_VIRT`/`*_STACK_VIRT`
+/// de programas de teste existentes. Usa-se aqui o primeiro incremento
+/// livre dessa mesma faixa, `0x0000_0f00_0000_0000` (entre
+/// `EFAULT_TEST_PROGRAM_STACK_VIRT = 0x0000_0e00_...` e
+/// `USER_DEMO_CODE_VIRT = 0x0000_1000_...`), com `USER_THREAD_STACK_SLOT_STRIDE`
+/// bytes de sobra antes do próximo endereço já em uso — espaço suficiente
+/// para um número de threads muito maior que o que este kernel cria hoje.
+pub const USER_THREAD_STACK_POOL_BASE: u64 = 0x0000_0f00_0000_0000;
+
+/// Tamanho máximo de stack de usuário que um slot desta janela reserva.
+/// `kernel::syscall::sys_thread_create` rejeita (`EINVAL`) um pedido maior
+/// que isto antes de alocar qualquer slot.
+pub const USER_THREAD_STACK_MAX_SIZE: u64 = 8 * 1024 * 1024;
+
+/// Distância entre o início de um slot desta janela e o do próximo: guard
+/// page (4 KiB) + o tamanho máximo reservado por slot.
+pub const USER_THREAD_STACK_SLOT_STRIDE: u64 = PAGE_SIZE + USER_THREAD_STACK_MAX_SIZE;
+
+/// Próximo índice de slot livre da janela de stacks de usuário de threads
+/// adicionais. Contador **global** (não por processo) — seguro porque dois
+/// processos diferentes têm `CR3`/PML4 diferentes, então o mesmo endereço
+/// virtual de slot nunca colide entre processos (ver design.md). Mesma
+/// política de "nunca recicla" que [`NEXT_THREAD_STACK_SLOT`] já usa para
+/// stacks de kernel.
+static NEXT_USER_THREAD_STACK_SLOT: AtomicU64 = AtomicU64::new(0);
+
+fn next_user_thread_stack_slot_index() -> u64 {
+    NEXT_USER_THREAD_STACK_SLOT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Endereço da guard page, do limite inferior e do topo da stack do slot
+/// `index` desta janela, para uma stack de `mapped_size` bytes (já
+/// arredondado para página). Função pura, testável sem hardware.
+fn user_thread_stack_slot_addresses(index: u64, mapped_size: u64) -> (u64, u64, u64) {
+    let slot_base = USER_THREAD_STACK_POOL_BASE + index * USER_THREAD_STACK_SLOT_STRIDE;
+    let guard_page = slot_base;
+    let stack_base = slot_base + PAGE_SIZE;
+    let stack_top = stack_base + mapped_size;
+    (guard_page, stack_base, stack_top)
+}
+
+/// Reserva o endereço virtual base do próximo slot livre da janela de
+/// stacks de usuário de threads adicionais, deixando a guard page do slot
+/// deliberadamente sem mapear — sem mapear nada além disso.
+///
+/// Deliberadamente não mapeia a stack em si, ao contrário de
+/// [`alloc_thread_stack`] (stacks de kernel): esta janela vive na metade
+/// inferior do endereçamento — privada por processo — e mapear exigiria a
+/// `root` (PML4) do processo específico, que esta função não recebe. Quem
+/// chama [`next_user_thread_stack_base`] (`kernel::syscall::sys_thread_create`)
+/// repassa o endereço devolvido para `Process::spawn_user_thread`, que já
+/// mapeia a stack de usuário via `Mapper::for_root` — ver `design.md` da
+/// change `kernel-user-thread-create`, "Resultado real da implementação"
+/// (evita mapear a mesma stack duas vezes).
+pub fn next_user_thread_stack_base() -> u64 {
+    let index = next_user_thread_stack_slot_index();
+    let (_guard_page, stack_base, _stack_top) = user_thread_stack_slot_addresses(index, 0);
+    stack_base
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +278,45 @@ mod tests {
         let a = next_slot_index();
         let b = next_slot_index();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn user_thread_stack_pool_base_is_distinct_from_kernel_pools() {
+        assert_ne!(USER_THREAD_STACK_POOL_BASE, KERNEL_STACK_BASE);
+        assert_ne!(USER_THREAD_STACK_POOL_BASE, THREAD_STACK_POOL_BASE);
+    }
+
+    #[test]
+    fn user_thread_stack_slot_guard_page_sits_immediately_below_its_stack() {
+        let (guard_page, stack_base, stack_top) = user_thread_stack_slot_addresses(0, PAGE_SIZE * 4);
+        assert_eq!(guard_page + PAGE_SIZE, stack_base);
+        assert_eq!(stack_base + PAGE_SIZE * 4, stack_top);
+    }
+
+    #[test]
+    fn user_thread_stack_consecutive_slots_never_overlap_even_at_max_size() {
+        // O slot usa sempre a mesma distância fixa (USER_THREAD_STACK_MAX_SIZE),
+        // mesmo quando a alocação real pede menos — o próximo slot nunca pode
+        // se sobrepor, mesmo no caso de o slot anterior ter sido mapeado com o
+        // tamanho máximo permitido.
+        let (_, _, top0) = user_thread_stack_slot_addresses(0, USER_THREAD_STACK_MAX_SIZE);
+        let (guard1, _, _) = user_thread_stack_slot_addresses(1, PAGE_SIZE);
+        assert_eq!(top0, guard1, "o fim do slot 0 (tamanho máximo) deve coincidir exatamente com a guard page do slot 1");
+    }
+
+    #[test]
+    fn successive_user_thread_stack_slot_allocations_are_distinct() {
+        let a = next_user_thread_stack_slot_index();
+        let b = next_user_thread_stack_slot_index();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn successive_user_thread_stack_bases_are_distinct_and_page_aligned() {
+        let a = next_user_thread_stack_base();
+        let b = next_user_thread_stack_base();
+        assert_ne!(a, b);
+        assert_eq!(a % PAGE_SIZE, 0);
+        assert_eq!(b % PAGE_SIZE, 0);
     }
 }

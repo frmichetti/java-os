@@ -364,10 +364,24 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
 ## O que está previsto
 
 ### Próximo passo imediato
-- Criação de thread nativa em modo usuário (`pthread_create`) — nova
-  *syscall* de criação de thread + `os_javaos::pd_start_thread` real,
-  reaproveitando `kernel::scheduler`/`kernel::process` já existentes.
-  Bloqueio duro para o porte do HotSpot (ver "Destaque: o que falta para a
+- ~~Criação de thread nativa em modo usuário~~ — **primitivo de kernel
+  concluído** (`kernel-user-thread-create`): nova *syscall*
+  `SYSCALL_THREAD_CREATE` cria uma thread-irmã de usuário dentro de um
+  processo já existente, compartilhando seu espaço de endereçamento e seus
+  handles de mutex/arquivo/VMM (posse por processo, não por thread — ver
+  `kernel-handle-ownership`), reaproveitando `kernel::scheduler`/
+  `kernel::process` já existentes. A limpeza de término de thread em
+  `schedule_next` foi corrigida para só liberar memória/handles quando a
+  thread terminada é a última viva do seu processo — necessário porque,
+  antes desta change, isso só era seguro por não existir nenhuma forma de
+  um processo ter mais de uma thread. Verificado em boot real via
+  `/bin/siblingt.elf` (ver `design.md` da change, "Resultado real da
+  implementação").
+- **Novo próximo passo**: `os_javaos::pd_start_thread` real + `pthread_create`
+  da libc sobre essa nova *syscall* (mesmo padrão de `os-javaos-platform-sync`
+  sobre `kernel-thread-sync`) — deliberadamente fora do escopo de
+  `kernel-user-thread-create` (ver seu `design.md`, Non-Goals). Continua
+  bloqueio duro para o porte do HotSpot (ver "Destaque: o que falta para a
   JVM rodar", item 6.1): nenhuma JVM liga sem conseguir criar as threads
   nativas que ela mesma precisa (`VMThread`/`ServiceThread`/etc.), antes
   mesmo de qualquer escolha de GC/interpretador.
@@ -436,19 +450,18 @@ real (`os-javaos-memory-pd`), `PlatformMutex`/`PlatformMonitor` reais
    carregamento de classes via o `ClassLoader`) — mapeado por uma exploração
    (`openspec explore`) contra a árvore real vendorizada (`vendor/jdk-27-ga/
    src/hotspot`), ainda não implementado. Em ordem de dependência:
-   1. **Criação de thread nativa em modo usuário (`pthread_create`) —
-      próximo passo imediato**: nenhuma *syscall* de criação de thread em
-      modo usuário existe hoje (`kernel::scheduler::spawn_sharing_current_
-      address_space` só é usada internamente pelo próprio kernel), e
-      `os_javaos::pd_start_thread` continua `fatal()`/stub (ver item 1
-      acima). Bloqueio duro, não contornável por nenhuma escolha de GC/
-      interpretador: o HotSpot cria várias threads nativas (`VMThread`,
-      `ServiceThread`, `NotificationThread`, `MonitorDeflationThread`) só
-      para inicializar a VM, antes de `Main.main` sequer rodar
+   1. ~~Criação de thread nativa em modo usuário~~ — **primitivo de kernel
+      concluído** (`kernel-user-thread-create`, ver "Próximo passo
+      imediato" acima): `SYSCALL_THREAD_CREATE` já existe e foi verificada
+      em boot real. **Ainda falta** `os_javaos::pd_start_thread` real +
+      `pthread_create` da libc sobre essa *syscall* (continua `fatal()`/
+      stub) — **novo próximo passo imediato**. Bloqueio duro, não
+      contornável por nenhuma escolha de GC/interpretador: o HotSpot cria
+      várias threads nativas (`VMThread`, `ServiceThread`,
+      `NotificationThread`, `MonitorDeflationThread`) só para inicializar a
+      VM, antes de `Main.main` sequer rodar
       (`share/runtime/vmThread.cpp`/`serviceThread.cpp`/
-      `notificationThread.cpp`/`monitorDeflationThread.cpp`). Pré-requisito
-      puramente mecânico — reaproveita `kernel::scheduler`/`kernel::process`
-      já existentes, não exige entender GC/interpretador ainda.
+      `notificationThread.cpp`/`monitorDeflationThread.cpp`).
    2. **Escolha do coletor de lixo mais simples para o primeiro porte**:
       `share/gc/epsilon` (~15 arquivos — nunca coleta, só aloca até o heap
       estourar, zero lógica de marcação/compactação) é o candidato mais

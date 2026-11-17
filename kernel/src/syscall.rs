@@ -99,6 +99,15 @@ pub const SYSCALL_EXIT: u64 = 21;
 /// nunca bloqueia a thread chamadora, ao contrário de `SYSCALL_MUTEX_LOCK`.
 pub const SYSCALL_MUTEX_TRYLOCK: u64 = 22;
 
+/// Ver design.md da change `kernel-user-thread-create`. `arg0` = ponto de
+/// entrada (endereço virtual, dentro de uma página executável e acessível
+/// a partir do modo usuário no processo chamador); `arg1` = tamanho
+/// pedido para a stack de usuário da nova thread (`0 < arg1 <=
+/// kernel::stack::USER_THREAD_STACK_MAX_SIZE`); retorno = identificador da
+/// nova thread (`ThreadId.0`), ou um código de erro. A nova thread
+/// compartilha o mesmo espaço de endereçamento do processo chamador.
+pub const SYSCALL_THREAD_CREATE: u64 = 23;
+
 // ---------------------------------------------------------------------
 // Códigos de erro POSIX devolvidos por uma syscall que falha — ver
 // design.md da change `kernel-syscall-errno`, "Mapeamento de erro por
@@ -571,6 +580,49 @@ fn sys_close(handle: u64) -> u64 {
     if crate::file_handles::close(handle, crate::scheduler::current_process_id()) { 0 } else { syscall_err(EBADF) }
 }
 
+/// Cria uma nova thread de usuário dentro do processo chamador,
+/// compartilhando seu espaço de endereçamento — cobre
+/// `SYSCALL_THREAD_CREATE`. `EFAULT` se `entry` não corresponder a uma
+/// página executável e acessível a partir do modo usuário já mapeada no
+/// processo chamador; `EINVAL` se `stack_size` for zero ou maior que
+/// `kernel::stack::USER_THREAD_STACK_MAX_SIZE`. Ver design.md da change
+/// `kernel-user-thread-create`.
+fn sys_thread_create(entry: u64, stack_size: u64) -> u64 {
+    if stack_size == 0 || stack_size > crate::stack::USER_THREAD_STACK_MAX_SIZE {
+        return syscall_err(EINVAL);
+    }
+
+    let entry_is_valid = {
+        let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
+        Mapper::new(&mut frame_allocator).validate_user_executable(entry)
+    };
+    if !entry_is_valid {
+        return syscall_err(EFAULT);
+    }
+
+    // Arredonda para página, mesma convenção de `sys_vm_reserve`/`sys_vm_commit`
+    // — `Process::spawn_user_thread` espera um tamanho já múltiplo de
+    // `PAGE_SIZE` (divisão exata ao calcular quantas páginas mapear).
+    let aligned_stack_size =
+        (stack_size + crate::paging::PAGE_SIZE - 1) & !(crate::paging::PAGE_SIZE - 1);
+    let stack_base = crate::stack::next_user_thread_stack_base();
+    let caller = crate::scheduler::current_process_id();
+
+    let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
+    match crate::scheduler::spawn_user_thread_in_process(&mut frame_allocator, caller, entry, stack_base, aligned_stack_size) {
+        Some(Ok(thread_id)) => thread_id.0,
+        // Falha de mapeamento (ex.: sem frames físicos livres) — nenhum dos
+        // dois casos de `ProcessError` (`AddressSpace`/`Stack`) corresponde a
+        // um argumento inválido do chamador, então `ENOMEM`, mesma convenção
+        // já usada por `sys_vm_commit` para falta de memória física.
+        Some(Err(_)) => syscall_err(ENOMEM),
+        // Defensivo: nunca deveria acontecer para um chamador real (todo
+        // processo é registrado antes de sua primeira thread poder fazer
+        // qualquer syscall) — ver design.md.
+        None => syscall_err(EINVAL),
+    }
+}
+
 /// Termina a thread chamadora — cobre `SYSCALL_EXIT`. Delega inteiramente a
 /// `kernel::scheduler::terminate_current_thread` (mesmo laço `mark_terminated`
 /// + `sti`/`hlt` também usado pelo encerramento involuntário por exceção de
@@ -615,6 +667,7 @@ unsafe extern "C" fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg
         SYSCALL_CLOSE => sys_close(arg0),
         SYSCALL_EXIT => sys_exit(),
         SYSCALL_MUTEX_TRYLOCK => sys_mutex_trylock(arg0),
+        SYSCALL_THREAD_CREATE => sys_thread_create(arg0, arg1),
         _ => syscall_err(ENOSYS),
     }
 }
@@ -727,6 +780,20 @@ mod tests {
     fn unknown_syscall_number_returns_enosys() {
         let result = unsafe { dispatch(0xdead_beef, 0, 0, 0, 0) };
         assert_eq!(result, syscall_err(ENOSYS));
+    }
+
+    #[test]
+    fn thread_create_with_zero_stack_size_returns_einval() {
+        // Curto-circuita antes de tocar `FRAME_ALLOCATOR`/`PROCESSES` —
+        // nenhum lock compartilhado precisa de serialização aqui (ao
+        // contrário dos testes de VM acima, que usam `VM_TEST_LOCK`).
+        assert_eq!(unsafe { dispatch(SYSCALL_THREAD_CREATE, 0x1000, 0, 0, 0) }, syscall_err(EINVAL));
+    }
+
+    #[test]
+    fn thread_create_with_oversized_stack_returns_einval_distinct_from_efault() {
+        let oversized = crate::stack::USER_THREAD_STACK_MAX_SIZE + crate::paging::PAGE_SIZE;
+        assert_eq!(unsafe { dispatch(SYSCALL_THREAD_CREATE, 0x1000, oversized, 0, 0) }, syscall_err(EINVAL));
     }
 
     #[test]

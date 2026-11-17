@@ -344,6 +344,25 @@ impl<'a, S: FrameStore> Mapper<'a, S> {
         true
     }
 
+    /// Verifica se a página que contém `entry` está mapeada, acessível a
+    /// partir do modo usuário, e executável — usada para validar o ponto de
+    /// entrada de uma nova thread (`kernel::syscall::sys_thread_create`)
+    /// antes de permitir que o escalonador a retome ali. Ao contrário de
+    /// [`validate_user_range`], que não verifica a *flag* de execução (seus
+    /// chamadores sempre validam buffers de dados, nunca código), esta
+    /// função existe especificamente para checar essa *flag*. Ver
+    /// `design.md` da change `kernel-user-thread-create`.
+    ///
+    /// [`validate_user_range`]: Self::validate_user_range
+    pub fn validate_user_executable(&self, entry: u64) -> bool {
+        let page = entry & !(PAGE_SIZE - 1);
+        let Some(pte) = self.translate_pte(page) else {
+            return false;
+        };
+        let flags = pte.flags();
+        flags & PTE_USER != 0 && flags & PTE_NO_EXECUTE == 0
+    }
+
     /// Desmapeia a página virtual em `virt`, retornando o frame físico que
     /// estava mapeado. `Err(MapError::NotMapped)` se não houver mapeamento.
     pub fn unmap(&mut self, virt: u64) -> Result<u64, MapError> {

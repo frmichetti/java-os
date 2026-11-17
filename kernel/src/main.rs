@@ -542,6 +542,26 @@ extern "C" fn continue_boot() -> ! {
             },
             Err(e) => kernel::serial_println!("efault: falha ao montar sistema de arquivos: {:?}", e),
         }
+        // Criação de thread de usuário adicional (change
+        // `kernel-user-thread-create`) — invoca `SYSCALL_THREAD_CREATE` para
+        // criar uma thread-irmã real dentro deste mesmo processo de teste,
+        // provando compartilhamento de espaço de endereçamento e de handles
+        // (mutex/arquivo) por processo, e que o gate de "última thread" em
+        // `kernel::scheduler::schedule_next` não destrói os recursos do
+        // processo enquanto uma de suas threads ainda está viva.
+        match kernel::fat32::mount_boot_partition() {
+            Ok(fs) => match kernel::scheduler::spawn_from_elf(
+                &mut frame_allocator,
+                &fs,
+                "/bin/siblingt.elf",
+                kernel::scheduler::SIBLING_THREAD_TEST_PROGRAM_STACK_VIRT,
+                kernel::scheduler::SIBLING_THREAD_TEST_PROGRAM_STACK_SIZE,
+            ) {
+                Ok(_) => kernel::serial_println!("sibling_thread: /bin/siblingt.elf carregado e em execucao"),
+                Err(e) => kernel::serial_println!("sibling_thread: falha ao carregar /bin/siblingt.elf: {:?}", e),
+            },
+            Err(e) => kernel::serial_println!("sibling_thread: falha ao montar sistema de arquivos: {:?}", e),
+        }
         // Thread de demonstração do teclado (ver `design.md` da change
         // `kernel-keyboard`): compartilha o espaço de endereçamento da
         // thread de boot (não precisa de isolamento próprio), evitando uma

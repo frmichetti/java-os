@@ -184,6 +184,39 @@ pub(crate) fn terminate_current_thread() -> ! {
 /// criação, não por `ProcessId` diretamente.
 pub(crate) static PROCESSES: Spinlock<Vec<Process>> = Spinlock::new(Vec::new());
 
+/// Procura, em [`PROCESSES`], o `Process` cujo `id` é `process_id`, e
+/// aplica `f` a ele sob o mesmo lock — `None` se nenhum processo com esse
+/// id estiver registrado. Busca linear, aceitável dado o número pequeno de
+/// processos simultâneos deste kernel (não um SO multiusuário de propósito
+/// geral) — mesma política já aceita para buscas por `ProcessId` em
+/// `kernel::file_handles`/`kernel::vmm`. Ver `design.md` da change
+/// `kernel-user-thread-create`.
+///
+/// Deliberadamente sem `with_interrupts_disabled` próprio: todo chamador
+/// já está dentro de uma seção crítica existente que também toca
+/// `PROCESSES` (`schedule_next`, ou `sys_thread_create` por cima de
+/// `current_process_id()`), então chamar de novo aqui seria redundante —
+/// `with_interrupts_disabled` já tolera chamadas aninhadas (cada uma só
+/// restaura `IF` ao seu próprio estado anterior), mas evitá-las mantém o
+/// ponto de `cli`/`sti` explícito no chamador.
+pub(crate) fn with_process_mut<R>(process_id: ProcessId, f: impl FnOnce(&mut Process) -> R) -> Option<R> {
+    let mut processes = PROCESSES.lock();
+    let process = processes.iter_mut().find(|p| p.id == process_id)?;
+    Some(f(process))
+}
+
+/// Remove `thread` de `threads` e devolve se isso o esvaziou — lógica pura
+/// do gate de "última thread do processo" em [`schedule_next`] (change
+/// `kernel-user-thread-create`), separada de [`with_process_mut`] para ser
+/// testável em host sem precisar construir um `Process`/`AddressSpace` real
+/// (que exigiria `read_cr3`, instrução privilegiada — crasharia em anel 3,
+/// mesmo motivo já documentado para `with_interrupts_disabled` em
+/// [`CURRENT_PROCESS_ID`]).
+fn remove_thread_and_check_if_last(threads: &mut Vec<ThreadId>, thread: ThreadId) -> bool {
+    threads.retain(|&t| t != thread);
+    threads.is_empty()
+}
+
 /// Único ponto que atualiza a stack de kernel confiável da thread corrente
 /// — `TSS.rsp0` (consultado automaticamente pela CPU em interrupções com
 /// troca de privilégio) e `CURRENT_KERNEL_STACK_TOP` (consultado
@@ -370,6 +403,28 @@ pub fn spawn_sharing_current_address_space<S: FrameStore>(
     let root = crate::paging::current_root();
     let thread = process::create_kernel_thread(frame_allocator, process, root, entry)?;
     Ok(register_thread(thread))
+}
+
+/// Cria uma nova thread de usuário dentro do processo `process_id`
+/// (`kernel::syscall::sys_thread_create`, `SYSCALL_THREAD_CREATE`),
+/// compartilhando o mesmo espaço de endereçamento desse processo —
+/// reaproveita `Process::spawn_user_thread` (já existente, até esta change
+/// nunca chamado) via [`with_process_mut`]. `None` se `process_id` não
+/// corresponder a nenhum processo registrado em [`PROCESSES`] — nunca
+/// deveria acontecer para um chamador real (todo processo é registrado
+/// antes de sua primeira thread poder fazer qualquer *syscall*). Ver
+/// `design.md` da change `kernel-user-thread-create`.
+pub(crate) fn spawn_user_thread_in_process<S: FrameStore>(
+    frame_allocator: &mut FrameAllocator<S>,
+    process_id: ProcessId,
+    entry: u64,
+    user_stack_virt_base: u64,
+    user_stack_size: u64,
+) -> Option<Result<ThreadId, ProcessError>> {
+    with_process_mut(process_id, |process| {
+        process.spawn_user_thread(frame_allocator, entry, user_stack_virt_base, user_stack_size)
+    })
+    .map(|result| result.map(register_thread))
 }
 
 /// Endereço virtual, na metade inferior, onde o código do programa de teste
@@ -626,6 +681,19 @@ pub const FAULT_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
 pub const EFAULT_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_0e00_0000_0000;
 pub const EFAULT_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
 
+/// Endereço virtual, na metade inferior, onde a stack de usuário (da
+/// thread **principal**, não da thread-irmã — essa é alocada
+/// dinamicamente pela própria `SYSCALL_THREAD_CREATE`, na janela de
+/// `kernel::stack::USER_THREAD_STACK_POOL_BASE`) do executável de teste de
+/// criação de thread de usuário (`/bin/siblingt.elf`, change
+/// `kernel-user-thread-create`) é mapeada — mesmo papel de
+/// `EFAULT_TEST_PROGRAM_STACK_VIRT`, endereço distinto só por clareza em
+/// despejos de depuração. Deliberadamente fora da faixa de incrementos de
+/// `0x0000_0100_0000_0000` já totalmente ocupada por este arquivo (ver
+/// achado em `kernel::stack::USER_THREAD_STACK_POOL_BASE`).
+pub const SIBLING_THREAD_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_1100_0000_0000;
+pub const SIBLING_THREAD_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
+
 /// Endereços virtuais das duas variantes de `kernel::fpu_demo` (change
 /// `kernel-fpu-context-switch`) — mesma faixa baixa e mesmo racional de
 /// `EXIT_DEMO_CODE_VIRT`/`LIBC_TEST_PROGRAM_STACK_VIRT` (bem abaixo do
@@ -793,44 +861,64 @@ fn schedule_next(current_rsp: u64) -> u64 {
         // isto só roda exatamente uma vez por thread (ela nunca mais é
         // escolhida como `was_running` depois de não voltar à `ReadyQueue`).
         if is_terminated(was_running) {
-            let mut allocator = crate::phys::FRAME_ALLOCATOR.lock();
-            let free_before = allocator.free_frames();
-            crate::paging::AddressSpace::free_user_mappings(
-                contexts[was_running.0 as usize].address_space_root,
-                &mut allocator,
-            );
-            // Achado real ao verificar em boot real (change
-            // `kernel-process-cleanup`): medir "antes"/"depois" em pontos
-            // distantes no tempo (ex.: antes de carregar este processo vs.
-            // logo antes de `idle_loop()`) não funciona — nada é de fato
-            // escalonado antes de `idle_loop()` chamar `sti` pela primeira
-            // vez (nenhuma troca de contexto acontece com interrupções
-            // desabilitadas), então qualquer falta/limpeza real só acontece
-            // bem depois, em plena rotação já com `sti`. A medição confiável
-            // é esta: imediatamente antes/depois desta própria liberação.
-            crate::serial_println!(
-                "kernel_process_cleanup: thread {} liberou {} frames (livres: {} -> {})",
-                was_running.0,
-                allocator.free_frames() - free_before,
-                free_before,
-                allocator.free_frames()
-            );
-            // Posse de handles/reservas (change `kernel-handle-ownership`):
-            // mesmo ponto, mesmo racional — fecha todo arquivo e libera toda
-            // reserva de memória virtual que só esta thread (processo)
-            // possuía. `pthread_handles` fica deliberadamente de fora (ver
-            // design.md, "Por que `pthread_handles` continua sem destruição
-            // real").
             let owner = contexts[was_running.0 as usize].process;
-            let files_closed = crate::file_handles::close_all_owned_by(owner);
-            let regions_released = crate::vmm::VMM.lock().release_all_owned_by(&mut allocator, owner);
-            if files_closed > 0 || regions_released > 0 {
-                crate::serial_println!(
-                    "kernel_handle_ownership: thread {} fechou {} arquivo(s) e liberou {} reserva(s) de memoria virtual",
-                    was_running.0,
-                    files_closed,
-                    regions_released
+            // Gate "última thread do processo" (change
+            // `kernel-user-thread-create`, ver design.md): sem isto, uma
+            // thread terminando liberaria incondicionalmente a memória e os
+            // handles do processo inteiro, mesmo com uma thread-irmã ainda
+            // viva no mesmo processo (compartilhando o mesmo espaço de
+            // endereçamento desde que `SYSCALL_THREAD_CREATE` existe) — o que
+            // destruiria a memória/handles dela por baixo dos pés. Remove
+            // `was_running` de `process.threads` e só libera quando isso
+            // esvazia a lista. `with_process_mut` só devolve `None` se
+            // `owner` já não estiver mais em `PROCESSES`, o que nunca deveria
+            // acontecer (nenhum processo é removido dela — ver comentário de
+            // `PROCESSES` acima); trata-se como "última thread" nesse caso
+            // defensivo, preservando a liberação que já acontecia antes desta
+            // change.
+            let is_last_thread_of_process =
+                with_process_mut(owner, |process| remove_thread_and_check_if_last(&mut process.threads, was_running))
+                    .unwrap_or(true);
+
+            if is_last_thread_of_process {
+                let mut allocator = crate::phys::FRAME_ALLOCATOR.lock();
+                let free_before = allocator.free_frames();
+                crate::paging::AddressSpace::free_user_mappings(
+                    contexts[was_running.0 as usize].address_space_root,
+                    &mut allocator,
                 );
+                // Achado real ao verificar em boot real (change
+                // `kernel-process-cleanup`): medir "antes"/"depois" em pontos
+                // distantes no tempo (ex.: antes de carregar este processo vs.
+                // logo antes de `idle_loop()`) não funciona — nada é de fato
+                // escalonado antes de `idle_loop()` chamar `sti` pela primeira
+                // vez (nenhuma troca de contexto acontece com interrupções
+                // desabilitadas), então qualquer falta/limpeza real só acontece
+                // bem depois, em plena rotação já com `sti`. A medição confiável
+                // é esta: imediatamente antes/depois desta própria liberação.
+                crate::serial_println!(
+                    "kernel_process_cleanup: thread {} liberou {} frames (livres: {} -> {})",
+                    was_running.0,
+                    allocator.free_frames() - free_before,
+                    free_before,
+                    allocator.free_frames()
+                );
+                // Posse de handles/reservas (change `kernel-handle-ownership`):
+                // mesmo ponto, mesmo racional — fecha todo arquivo e libera toda
+                // reserva de memória virtual que só este processo possuía.
+                // `pthread_handles` fica deliberadamente de fora (ver
+                // design.md, "Por que `pthread_handles` continua sem destruição
+                // real").
+                let files_closed = crate::file_handles::close_all_owned_by(owner);
+                let regions_released = crate::vmm::VMM.lock().release_all_owned_by(&mut allocator, owner);
+                if files_closed > 0 || regions_released > 0 {
+                    crate::serial_println!(
+                        "kernel_handle_ownership: thread {} fechou {} arquivo(s) e liberou {} reserva(s) de memoria virtual",
+                        was_running.0,
+                        files_closed,
+                        regions_released
+                    );
+                }
             }
         }
         next_rsp
@@ -1139,5 +1227,43 @@ mod tests {
         let next = advance_unless_terminated(&mut queue, |_| true);
         assert_eq!(next, None);
         assert_eq!(queue.front(), None);
+    }
+
+    // -------------------------------------------------------------
+    // Gate "última thread do processo" na limpeza de término (change
+    // `kernel-user-thread-create`) — ver design.md.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn removing_the_only_thread_reports_the_process_as_last() {
+        let mut threads = alloc::vec![ThreadId(0)];
+        assert!(remove_thread_and_check_if_last(&mut threads, ThreadId(0)));
+        assert!(threads.is_empty());
+    }
+
+    #[test]
+    fn removing_one_of_several_threads_reports_the_process_as_not_last() {
+        let mut threads = alloc::vec![ThreadId(0), ThreadId(1)];
+        assert!(!remove_thread_and_check_if_last(&mut threads, ThreadId(0)));
+        assert_eq!(threads, alloc::vec![ThreadId(1)], "so a thread terminada deve ser removida, a thread-irma continua na lista");
+    }
+
+    #[test]
+    fn removing_the_last_remaining_thread_reports_the_process_as_last() {
+        // Reproduz o caso real: a thread-irma ja terminou antes (removida
+        // numa chamada anterior), e agora a ultima tambem termina.
+        let mut threads = alloc::vec![ThreadId(1)];
+        assert!(remove_thread_and_check_if_last(&mut threads, ThreadId(1)));
+    }
+
+    #[test]
+    fn with_process_mut_finds_nothing_for_an_unknown_process_id() {
+        // Nao precisa construir nenhum `Process`/`AddressSpace` real (ver
+        // comentario de `remove_thread_and_check_if_last`): `PROCESSES` so
+        // precisa estar vazio para este caso, e o gate em `schedule_next`
+        // trata `None` como "ultima thread" (`unwrap_or(true)`), preservando
+        // o comportamento anterior a esta change.
+        let unknown = ProcessId(u64::MAX);
+        assert_eq!(with_process_mut(unknown, |_process| ()), None);
     }
 }

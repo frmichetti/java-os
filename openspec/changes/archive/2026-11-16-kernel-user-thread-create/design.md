@@ -103,11 +103,9 @@ limpeza abaixo.
 ### Janela de stack de usuário dedicada a threads adicionais, com contador global monotônico
 Nova constante (análoga a `THREAD_STACK_POOL_BASE` em `kernel::stack`, mas
 na metade inferior do endereçamento, privada por processo):
-`USER_THREAD_STACK_POOL_BASE = 0x0000_1000_0000_0000` — um endereço
-claramente distinto de toda constante de stack de programa de teste já
-existente hoje (`JAVAOS_VM_TEST_PROGRAM_STACK_VIRT`,
-`EFAULT_TEST_PROGRAM_STACK_VIRT`, etc., todas em faixas mais baixas
-dispersas em `scheduler.rs`).
+`USER_THREAD_STACK_POOL_BASE = 0x0000_0f00_0000_0000` — ver "Resultado real
+da implementação" abaixo para o porquê deste valor exato, distinto do
+`0x0000_1000_0000_0000` originalmente cogitado aqui.
 
 Um único contador `AtomicU64` **global** (não por processo) numera os
 slots. Isso é seguro mesmo sendo global: dois processos diferentes têm
@@ -189,3 +187,47 @@ compatibilidade retroativa a preservar além da já garantida pelo gate de
 
 Nenhuma — todas as decisões técnicas necessárias para esta change foram
 resolvidas acima.
+
+## Resultado real da implementação
+
+- **`stack::next_user_thread_stack_base` não mapeia nada, só reserva o
+  endereço:** a primeira versão desta função mapeava a stack diretamente
+  (como `kernel::stack::alloc_thread_stack` faz para stacks de kernel), mas
+  isso duplicava o mapeamento já feito por `Process::spawn_user_thread`/
+  `create_user_thread` (já existente, ver "Context" acima) — a segunda
+  tentativa de mapear a mesma página falharia (`map_new` com
+  `allow_replace: false`). Corrigido para `next_user_thread_stack_base`
+  devolver só o endereço virtual base do próximo slot (sem tocar
+  `FrameAllocator`/`Mapper`), que `sys_thread_create` repassa para
+  `Process::spawn_user_thread` mapear como já fazia antes desta change.
+- **`0x0000_1000_0000_0000` não estava livre:** a suposição original desta
+  seção ("Janela de stack de usuário...") de que esse endereço era
+  "claramente distinto de toda constante já existente" estava errada — é
+  exatamente `USER_DEMO_CODE_VIRT` em `kernel::scheduler`. Inspecionar
+  todas as constantes `*_CODE_VIRT`/`*_STACK_VIRT` de `scheduler.rs` mostrou
+  que a faixa inteira de incrementos de `0x0000_0100_0000_0000` entre
+  `0x0000_0100_...` e `0x0000_7000_...` já está ocupada por programas de
+  teste existentes. Corrigido para `USER_THREAD_STACK_POOL_BASE =
+  0x0000_0f00_0000_0000` — o primeiro incremento livre dessa mesma faixa
+  (entre `EFAULT_TEST_PROGRAM_STACK_VIRT = 0x0000_0e00_...` e
+  `USER_DEMO_CODE_VIRT = 0x0000_1000_...`), com `USER_THREAD_STACK_SLOT_STRIDE`
+  (~8 MiB) de sobra antes do próximo endereço já em uso.
+- **Verificação em boot real (QEMU/OVMF) confirmou o cenário completo**:
+  `/bin/siblingt.elf` reportou `sibling_thread_test_program: resultado
+  PPPPPPPP (ordem: mutex_create,file_open,thread_create,join_poll,
+  irma_leu_primeiro_byte,mutex_apos_irma,arquivo_cursor_compartilhado,
+  file_close)` — a thread-irmã criada por `SYSCALL_THREAD_CREATE` realmente
+  executa (compartilhando o espaço de endereçamento e os handles de
+  mutex/arquivo do processo), e depois que ela termina via `SYSCALL_EXIT`,
+  a thread principal continua usando normalmente o mesmo mutex e o mesmo
+  arquivo (cursor realmente avançado pela leitura da thread-irmã), sem
+  nenhum travamento ao encerrar por último. Todos os demais programas de
+  teste já existentes (`file_syscalls_demo`, `libc_test_program`,
+  `cxx_test_program`, `javaos_vm_test_program`,
+  `javaos_pthread_test_program`, `libm_test_program`,
+  `timedwait_test_program`, `efault_test_program`, `user_posix_demo`,
+  `fpu_demo_a`/`fpu_demo_b`, `safepoint`, `wait_queue`, `pthread`)
+  reportaram exatamente as mesmas strings P/F de antes desta change, e o
+  único `#PF` real do boot continua sendo o deliberado de
+  `fault_test_program.c` — confirmando que o gate de "última thread" não
+  alterou nenhum comportamento de processo de uma única thread.
