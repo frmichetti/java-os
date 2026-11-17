@@ -388,17 +388,68 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
   segmento `PT_TLS`; cada thread de modo usuário ganha seu próprio bloco
   de TLS. Verificado em boot real via `/bin/tls.elf` (ver `design.md` da
   change, "Resultado real da implementação").
-- **Novo próximo passo**: `os_javaos::pd_start_thread` real + `pthread_create`
-  da libc sobre `SYSCALL_THREAD_CREATE` (mesmo padrão de
-  `os-javaos-platform-sync` sobre `kernel-thread-sync`), agora que a TLS
-  real necessária para `Thread::current()` existe — mais o lock de
-  `malloc`/`_sbrk` em `userland_c/glue.c` (hoje sem nenhuma sincronização;
-  o HotSpot cria várias threads nativas que fazem `malloc`/`free`
-  concorrentemente). Deliberadamente fora do escopo de
-  `kernel-user-thread-create`/`kernel-thread-local-storage` (ver seus
-  `design.md`, Non-Goals). Continua bloqueio duro para o porte do HotSpot
-  (ver "Destaque: o que falta para a JVM rodar", item 6.1): nenhuma JVM
-  liga sem conseguir criar as threads nativas que ela mesma precisa
+- **Novo próximo passo — explorado em duas changes, nesta ordem** (achados
+  reais da exploração, não suposições — cada um revisou uma suposição
+  anterior mais simples assim que o código real foi inspecionado):
+
+  1. **`libc-retargetable-locking`** (primeiro): o lock de `malloc`/
+     `_sbrk` em `userland_c/glue.c` (hoje sem nenhuma sincronização — o
+     HotSpot cria várias threads nativas que fazem `malloc`/`free`
+     concorrentemente) acabou não sendo "duas funções de lock" — é
+     implementar o contrato inteiro de *locking* retargetável do newlib:
+     - **Achado 1**: `MALLOC_LOCK`/`MALLOC_UNLOCK` já são chamadas de
+       verdade por `newlib/libc/stdlib/_mallocr.c`, e o newlib já vem com
+       uma implementação padrão delas (`mlock.c`) que chama a API
+       genérica de lock (`__lock_acquire_recursive`/etc.).
+     - **Achado 2**: o problema real está em
+       `newlib/libc/include/sys/lock.h` — sem a flag de configure
+       `_RETARGETABLE_LOCKING` (que `scripts/cross/build-newlib.sh` nunca
+       passou), essa API inteira vira no-op em tempo de pré-processador
+       (`#define __lock_acquire_recursive(lock) ((void) 0)`).
+     - **Achado 3**: ativar isso exige implementar `struct __lock`, as
+       ~10 funções `__retarget_lock_*` (init/acquire/release/close/
+       try_acquire, cada uma com variante recursiva), e definir as 8
+       instâncias `extern struct __lock` que o próprio newlib referencia
+       internamente — não só para `malloc`
+       (`__malloc_recursive_mutex`/`__sfp_recursive_mutex`
+       [stdio]/`__env_recursive_mutex`/`__atexit_recursive_mutex`,
+       recursivas; `__dd_hash_mutex`/`__at_quick_exit_mutex`/`__tz_mutex`/
+       `__arc4random_mutex`, não-recursivas) — corrigindo isso de uma vez
+       destrava vários pontos internos do newlib, não só `malloc`.
+     - **Achado 4**: as variantes recursivas precisam saber "esta thread
+       já é dona deste lock?" para não se auto-travar — o que exige uma
+       nova *syscall* pequena, `SYSCALL_GET_THREAD_ID` (devolve
+       `kernel::scheduler::current_thread_id()`, mesmo padrão trivial de
+       `SYSCALL_GET_TICKS`), já que hoje nenhuma thread tem como
+       perguntar sua própria `ThreadId` ao kernel.
+  2. **`pthread_create`/`os::create_thread` real** (depois, reaproveitando
+     o *locking* real já pronto): `os_javaos::pd_start_thread` continua
+     `fatal()`/stub, mas o gap maior é `os::create_thread`/`os::free_thread`
+     (não declarados em nenhum arquivo do esqueleto, apesar de
+     `share/runtime/os.hpp` exigi-los) — mecânico de resolver, já que
+     `OSThread`/`Monitor`/`ThreadState` já existem prontos do esqueleto
+     (`os-javaos-skeleton`), só falta replicar `os_bsd.cpp` sem sinais/
+     `os_posix` (já uma decisão registrada daquela change). Verificado só
+     por `-fsyntax-only` contra os headers reais, nunca linkado/executado —
+     mesma disciplina de toda mudança em `os_javaos.cpp` até hoje; a
+     verificação real em boot continua sendo via um programa C que chama
+     `pthread_create` diretamente. **Achado da exploração**: a
+     `SYSCALL_THREAD_CREATE` (`kernel-user-thread-create`) não passa
+     nenhum argumento ao ponto de entrada da nova thread — insuficiente
+     para `pthread_create(start_routine, arg)`. Rastreado o slot exato
+     onde um argumento extra precisa ser escrito: `RDI`, índice 5 do laço
+     de 15 registradores zerados em `kernel::process::init_stack`
+     (confirmado pela ordem real de `push`/`pop` em `timer_entry`,
+     `scheduler.rs`) — mudança pequena e cirúrgica, ~4 pontos de chamada
+     afetados. **Deliberadamente fora de escopo**:
+     `os::create_main_thread`/`os::create_attached_thread` (anexar a
+     thread primordial a um `JavaThread` — um problema diferente, de
+     sequenciamento de inicialização da VM, não de criação de thread; fica
+     para o item 6.5 abaixo, "próxima exploração natural").
+
+  Ambas continuam bloqueio duro para o porte do HotSpot (ver "Destaque: o
+  que falta para a JVM rodar", item 6.1): nenhuma JVM liga sem conseguir
+  criar as threads nativas que ela mesma precisa
   (`VMThread`/`ServiceThread`/etc.), antes mesmo de qualquer escolha de
   GC/interpretador.
 
@@ -473,11 +524,16 @@ real (`os-javaos-memory-pd`), `PlatformMutex`/`PlatformMonitor` reais
       **também concluída** (`kernel-thread-local-storage`): achado durante
       a tentativa de escopar `pthread_create`/`os::create_thread` —
       `Thread::current()` do próprio HotSpot usa `__thread`, e nenhuma
-      segunda thread do HotSpot existiria sem isso. **Ainda falta**
-      `os_javaos::pd_start_thread` real + `pthread_create` da libc sobre
-      essa *syscall* (continua `fatal()`/stub), mais o lock de
-      `malloc`/`_sbrk` em `userland_c/glue.c` (sem nenhuma sincronização
-      hoje) — **novo próximo passo imediato**. Bloqueio duro, não
+      segunda thread do HotSpot existiria sem isso. **Ainda falta**, em
+      duas changes nesta ordem (ver "Próximo passo imediato" acima para
+      os achados completos da exploração): primeiro
+      `libc-retargetable-locking` (destrava o lock real de
+      `malloc`/outros internos do newlib — hoje sem nenhuma sincronização,
+      e a causa raiz acabou sendo a flag `_RETARGETABLE_LOCKING` do
+      newlib nunca ativada, não só "faltam duas funções"); depois
+      `os::create_thread`/`os::free_thread`/`os_javaos::pd_start_thread`
+      real + `pthread_create` da libc sobre `SYSCALL_THREAD_CREATE`
+      (continua `fatal()`/stub). Bloqueio duro, não
       contornável por nenhuma escolha de GC/interpretador: o HotSpot cria
       várias threads nativas (`VMThread`, `ServiceThread`,
       `NotificationThread`, `MonitorDeflationThread`) só para inicializar a
