@@ -30,6 +30,21 @@ SECTIONS
         *(COMMON)
     }
 
+    /* Segmento PT_TLS (change kernel-thread-local-storage) — ALIGN
+     * explicito antes de .tdata, mesmo racional ja documentado acima para
+     * .rodata/.bss: sem isso, o comportamento padrao de "orphan section"
+     * do ld para .tdata/.tbss nao e controlado por este projeto, podendo
+     * produzir um p_align inesperado ou nenhum PT_TLS. */
+    . = ALIGN(0x1000);
+
+    .tdata : {
+        *(.tdata*)
+    }
+
+    .tbss : {
+        *(.tbss*)
+    }
+
     /DISCARD/ : {
         *(.comment)
         *(.eh_frame*)

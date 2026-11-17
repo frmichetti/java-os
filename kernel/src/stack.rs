@@ -255,6 +255,81 @@ pub fn next_user_thread_stack_base() -> u64 {
     stack_base
 }
 
+/// Base da janela virtual reservada a blocos de TLS (armazenamento local de
+/// thread) de threads de usuário — metade inferior do endereçamento
+/// (privada por processo, mesmo racional de
+/// [`USER_THREAD_STACK_POOL_BASE`]). Primeiro incremento livre da mesma
+/// faixa de `0x0000_0100_0000_0000` depois de
+/// `SIBLING_THREAD_TEST_PROGRAM_STACK_VIRT = 0x0000_1100_...`
+/// (`kernel::scheduler`), ver `design.md` da change
+/// `kernel-thread-local-storage`.
+pub const TLS_BLOCK_POOL_BASE: u64 = 0x0000_1200_0000_0000;
+
+/// Distância entre o início de um slot desta janela e o do próximo — um
+/// único slot por página (4 KiB): ao contrário das janelas de stack acima,
+/// um bloco de TLS não precisa de guard page (tamanho fixo, nunca cresce
+/// dinamicamente como uma stack).
+pub const TLS_BLOCK_POOL_STRIDE: u64 = PAGE_SIZE;
+
+/// Offset fixo, dentro de um slot, onde o TCB (bloco de controle de thread —
+/// uma palavra de 8 bytes com um ponteiro para si mesma, convenção do
+/// modelo ELF TLS "Variant II") fica. `FS.base` da thread = endereço do TCB.
+/// `2048` (meio da página) é múltiplo de qualquer alinhamento prático
+/// (8/16/32/64), então `TLS_TCB_OFFSET - round_up(memsz, align)` (o início
+/// da imagem de `.tdata`/`.tbss`) sempre cai alinhado corretamente, sem
+/// nenhuma lógica de arredondamento de endereço adicional. Ver design.md —
+/// "Modelo ELF TLS "Variant II" com TCB em offset fixo dentro do slot".
+pub const TLS_TCB_OFFSET: u64 = 2048;
+
+/// Tamanho máximo (`memsz`) de um bloco de TLS que um slot desta janela
+/// comporta — ver design.md, "Limite de tamanho". Quem extrai o segmento
+/// `PT_TLS` de um executável (`kernel::scheduler::spawn_from_elf`) rejeita
+/// um `memsz` maior que isto antes de chegar a alocar qualquer slot.
+pub const TLS_BLOCK_MAX_MEMSZ: u64 = TLS_TCB_OFFSET;
+
+/// Próximo índice de slot livre da janela de blocos de TLS. Contador
+/// **global** (não por processo) — mesmo racional de
+/// [`NEXT_USER_THREAD_STACK_SLOT`]: endereços virtuais de processos
+/// diferentes nunca colidem (PML4s diferentes).
+static NEXT_TLS_BLOCK_SLOT: AtomicU64 = AtomicU64::new(0);
+
+fn next_tls_block_slot_index() -> u64 {
+    NEXT_TLS_BLOCK_SLOT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Endereço base do slot `index` desta janela. Função pura, testável sem
+/// hardware.
+fn tls_block_slot_base(index: u64) -> u64 {
+    TLS_BLOCK_POOL_BASE + index * TLS_BLOCK_POOL_STRIDE
+}
+
+/// Dado o endereço base de um slot e o `memsz`/`align` de um bloco de TLS,
+/// devolve o endereço do TCB (`FS.base` da thread) e o endereço onde a
+/// imagem de `.tdata`/`.tbss` começa (`tcb_addr - round_up(memsz,
+/// align)`). Função pura, testável sem hardware — ver design.md.
+///
+/// `align` é tratado como `1` se for `0` (nenhum alinhamento declarado —
+/// `round_up` com divisor `0` seria divisão por zero).
+pub(crate) fn tls_block_addresses(slot_base: u64, memsz: u64, align: u64) -> (u64, u64) {
+    let align = if align == 0 { 1 } else { align };
+    let tcb_addr = slot_base + TLS_TCB_OFFSET;
+    let module_size = memsz.div_ceil(align) * align;
+    let image_start = tcb_addr - module_size;
+    (tcb_addr, image_start)
+}
+
+/// Reserva o endereço base do próximo slot livre da janela de blocos de
+/// TLS, sem mapear nada — mesmo racional de [`next_user_thread_stack_base`]:
+/// mapear exigiria a `root` do processo específico, que esta função não
+/// recebe. Quem chama [`next_tls_block_slot_base`]
+/// (`kernel::process::init_tls_block`) mapeia a página e escreve o
+/// conteúdo do bloco via `Mapper::for_root` + o alias HHDM, mesmo padrão já
+/// usado por `kernel::elf::load_segment`.
+pub fn next_tls_block_slot_base() -> u64 {
+    let index = next_tls_block_slot_index();
+    tls_block_slot_base(index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +393,49 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a % PAGE_SIZE, 0);
         assert_eq!(b % PAGE_SIZE, 0);
+    }
+
+    #[test]
+    fn tls_block_pool_base_is_distinct_from_every_other_window() {
+        assert_ne!(TLS_BLOCK_POOL_BASE, KERNEL_STACK_BASE);
+        assert_ne!(TLS_BLOCK_POOL_BASE, THREAD_STACK_POOL_BASE);
+        assert_ne!(TLS_BLOCK_POOL_BASE, USER_THREAD_STACK_POOL_BASE);
+    }
+
+    #[test]
+    fn tls_tcb_offset_is_a_multiple_of_every_practical_alignment() {
+        for align in [8u64, 16, 32, 64] {
+            assert_eq!(TLS_TCB_OFFSET % align, 0);
+        }
+    }
+
+    #[test]
+    fn tls_block_addresses_image_start_is_aligned_and_below_tcb() {
+        let (tcb_addr, image_start) = tls_block_addresses(0, 8, 16);
+        assert_eq!(tcb_addr, TLS_TCB_OFFSET);
+        assert_eq!(image_start % 16, 0, "inicio da imagem deve respeitar o alinhamento pedido");
+        assert!(image_start < tcb_addr, "imagem deve ficar em offset negativo em relacao ao TCB");
+        assert_eq!(tcb_addr - image_start, 16, "memsz=8 arredondado para align=16 ocupa 16 bytes");
+    }
+
+    #[test]
+    fn tls_block_addresses_rounds_memsz_up_to_alignment() {
+        // memsz=10, align=8 -> arredonda para 16 (proximo multiplo de 8).
+        let (tcb_addr, image_start) = tls_block_addresses(0, 10, 8);
+        assert_eq!(tcb_addr - image_start, 16);
+    }
+
+    #[test]
+    fn tls_block_addresses_treats_zero_alignment_as_one() {
+        let (tcb_addr, image_start) = tls_block_addresses(0, 5, 0);
+        assert_eq!(tcb_addr - image_start, 5);
+    }
+
+    #[test]
+    fn successive_tls_block_slots_do_not_overlap() {
+        let a = next_tls_block_slot_base();
+        let b = next_tls_block_slot_base();
+        assert_ne!(a, b);
+        assert_eq!(b - a, TLS_BLOCK_POOL_STRIDE);
     }
 }

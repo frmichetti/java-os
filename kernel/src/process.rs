@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::gdt::{KERNEL_CODE_SELECTOR, KERNEL_DATA_SELECTOR, USER_CODE_SELECTOR, USER_DATA_SELECTOR};
+use crate::hhdm;
 use crate::paging::{Mapper, PageFlags};
 use crate::paging::{AddressSpace, MapError};
 use crate::phys::{FrameAllocator, FrameStore};
@@ -113,6 +114,14 @@ pub struct Context {
     /// qual processo é o chamador, sem precisar consultar `Process`/
     /// `PROCESSES` — ver design.md da change `kernel-handle-ownership`.
     pub process: ProcessId,
+    /// Endereço do bloco de TLS desta thread (`FS.base`) — `0` se ela não
+    /// precisar de nenhum (executável sem segmento `PT_TLS`, ou thread de
+    /// modo kernel). Trocado por `kernel::scheduler::schedule_next` a cada
+    /// troca de contexto, mesmo ponto onde `address_space_root`/
+    /// `kernel_stack_top` já são trocados — ver spec `kernel-processes`
+    /// ("Bloco de Armazenamento Local de Thread (TLS) por Thread") e
+    /// `design.md` da change `kernel-thread-local-storage`.
+    pub tls_base: u64,
 }
 
 /// Uma thread: unidade de escalonamento dentro de um `Process`, com seu
@@ -227,6 +236,12 @@ pub struct Process {
     pub id: ProcessId,
     pub address_space: AddressSpace,
     pub threads: Vec<ThreadId>,
+    /// Imagem de TLS do executável deste processo, extraída uma única vez
+    /// por `Process::finish_new_user` — `None` para um processo de modo
+    /// kernel (`Process::new`), ou cujo executável não declara nenhum
+    /// segmento `PT_TLS`. Reaproveitada por toda thread adicional criada
+    /// depois (`Process::spawn_user_thread`).
+    pub(crate) tls_template: Option<TlsTemplate>,
 }
 
 /// Aloca a stack de kernel de uma nova thread e sintetiza seu frame de
@@ -241,7 +256,7 @@ pub(crate) fn create_kernel_thread<S: FrameStore>(
     let stack_top = stack::alloc_thread_stack(frame_allocator)?;
     let rsp = unsafe { init_kernel_stack(stack_top, entry) };
     let id = next_thread_id();
-    Ok(Thread { id, process, context: Context { rsp, kernel_stack_top: stack_top, address_space_root: root, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false, process } })
+    Ok(Thread { id, process, context: Context { rsp, kernel_stack_top: stack_top, address_space_root: root, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false, process, tls_base: 0 } })
 }
 
 /// Aloca a stack de kernel (para troca de contexto/`syscall`) e a stack de
@@ -254,6 +269,53 @@ pub(crate) fn create_kernel_thread<S: FrameStore>(
 /// `entry` é um endereço (`RIP`) dentro de uma página já mapeada em `root`
 /// como acessível por usuário e executável — nunca uma função Rust comum
 /// (código do kernel nunca é acessível por usuário).
+/// Imagem de TLS de um processo, extraída uma única vez do segmento
+/// `PT_TLS` do seu executável (se existir) por
+/// `kernel::scheduler::spawn_from_elf`, e guardada em `Process::tls_template`
+/// para reutilização por toda thread adicional criada depois
+/// (`Process::spawn_user_thread`) — que não tem mais acesso ao buffer
+/// original do arquivo. `image` é uma cópia própria (não um empréstimo do
+/// buffer do executável, que não sobrevive além de `spawn_from_elf`). Ver
+/// spec `kernel-processes` ("Bloco de Armazenamento Local de Thread (TLS)
+/// por Thread") e `design.md` da change `kernel-thread-local-storage`.
+#[derive(Clone)]
+pub(crate) struct TlsTemplate {
+    pub memsz: u64,
+    pub align: u64,
+    pub image: alloc::vec::Vec<u8>,
+}
+
+/// Aloca e inicializa o bloco de TLS de uma nova thread a partir de
+/// `template`: mapeia sua página (`Mapper::for_root`, janela de
+/// `kernel::stack::next_tls_block_slot_base`) e escreve seu conteúdo via o
+/// alias HHDM — mesmo padrão exato de `kernel::elf::load_segment` (mapear,
+/// depois escrever através do endereço físico, não do virtual recém
+/// mapeado, que só é válido quando `root` é a PML4 ativa). Devolve o
+/// endereço do TCB (`FS.base`/`Context::tls_base` da nova thread).
+fn init_tls_block<S: FrameStore>(
+    frame_allocator: &mut FrameAllocator<S>,
+    root: u64,
+    template: &TlsTemplate,
+) -> Result<u64, ProcessError> {
+    let slot_base = stack::next_tls_block_slot_base();
+    let frame = Mapper::for_root(frame_allocator, root)
+        .map_new(slot_base, PageFlags { writable: true, user_accessible: true, executable: false }, false)
+        .map_err(ProcessError::AddressSpace)?;
+    let dest = hhdm::phys_to_virt(hhdm::offset(), frame) as *mut u8;
+    unsafe { core::ptr::write_bytes(dest, 0, crate::paging::PAGE_SIZE as usize) };
+
+    let (tcb_addr, image_start) = stack::tls_block_addresses(slot_base, template.memsz, template.align);
+    let image_offset_in_page = (image_start - slot_base) as usize;
+    unsafe {
+        core::ptr::copy_nonoverlapping(template.image.as_ptr(), dest.add(image_offset_in_page), template.image.len());
+    }
+    // Auto-ponteiro do TCB — convenção do modelo ELF TLS "Variant II".
+    let tcb_offset_in_page = (tcb_addr - slot_base) as usize;
+    unsafe { (dest.add(tcb_offset_in_page) as *mut u64).write_unaligned(tcb_addr) };
+
+    Ok(tcb_addr)
+}
+
 fn create_user_thread<S: FrameStore>(
     frame_allocator: &mut FrameAllocator<S>,
     root: u64,
@@ -261,6 +323,7 @@ fn create_user_thread<S: FrameStore>(
     entry: u64,
     user_stack_virt_base: u64,
     user_stack_size: u64,
+    tls_template: Option<&TlsTemplate>,
 ) -> Result<Thread, ProcessError> {
     let kernel_stack_top = stack::alloc_thread_stack(frame_allocator)?;
 
@@ -274,11 +337,16 @@ fn create_user_thread<S: FrameStore>(
     }
     let user_stack_top = user_stack_virt_base + user_stack_size;
 
+    let tls_base = match tls_template {
+        Some(template) => init_tls_block(frame_allocator, root, template)?,
+        None => 0,
+    };
+
     let rsp = unsafe {
         init_stack(kernel_stack_top, entry, USER_CODE_SELECTOR, USER_DATA_SELECTOR, user_stack_top - ABI_ALIGNMENT_PAD)
     };
     let id = next_thread_id();
-    Ok(Thread { id, process, context: Context { rsp, kernel_stack_top, address_space_root: root, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false, process } })
+    Ok(Thread { id, process, context: Context { rsp, kernel_stack_top, address_space_root: root, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false, process, tls_base } })
 }
 
 impl Process {
@@ -293,7 +361,7 @@ impl Process {
         let process_id = next_process_id();
         let root = address_space.root();
         let thread = create_kernel_thread(frame_allocator, process_id, root, entry)?;
-        let process = Process { id: process_id, address_space, threads: alloc::vec![thread.id] };
+        let process = Process { id: process_id, address_space, threads: alloc::vec![thread.id], tls_template: None };
         Ok((process, thread))
     }
 
@@ -315,18 +383,29 @@ impl Process {
     /// acessível por usuário e executável), cria o processo e sua primeira
     /// thread, em modo usuário, com uma stack de usuário própria mapeada em
     /// `[user_stack_virt_base, user_stack_virt_base + user_stack_size)`.
+    /// `tls_template`, quando presente (executável com segmento `PT_TLS`),
+    /// é guardado no `Process` resultante para toda thread adicional
+    /// criada depois (ver [`Process::spawn_user_thread`]).
     pub fn finish_new_user<S: FrameStore>(
         frame_allocator: &mut FrameAllocator<S>,
         address_space: AddressSpace,
         entry: u64,
         user_stack_virt_base: u64,
         user_stack_size: u64,
+        tls_template: Option<TlsTemplate>,
     ) -> Result<(Process, Thread), ProcessError> {
         let process_id = next_process_id();
         let root = address_space.root();
-        let thread =
-            create_user_thread(frame_allocator, root, process_id, entry, user_stack_virt_base, user_stack_size)?;
-        let process = Process { id: process_id, address_space, threads: alloc::vec![thread.id] };
+        let thread = create_user_thread(
+            frame_allocator,
+            root,
+            process_id,
+            entry,
+            user_stack_virt_base,
+            user_stack_size,
+            tls_template.as_ref(),
+        )?;
+        let process = Process { id: process_id, address_space, threads: alloc::vec![thread.id], tls_template };
         Ok((process, thread))
     }
 
@@ -355,8 +434,15 @@ impl Process {
         user_stack_size: u64,
     ) -> Result<Thread, ProcessError> {
         let root = self.address_space.root();
-        let thread =
-            create_user_thread(frame_allocator, root, self.id, entry, user_stack_virt_base, user_stack_size)?;
+        let thread = create_user_thread(
+            frame_allocator,
+            root,
+            self.id,
+            entry,
+            user_stack_virt_base,
+            user_stack_size,
+            self.tls_template.as_ref(),
+        )?;
         self.threads.push(thread.id);
         Ok(thread)
     }

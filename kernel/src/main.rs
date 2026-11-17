@@ -562,6 +562,24 @@ extern "C" fn continue_boot() -> ! {
             },
             Err(e) => kernel::serial_println!("sibling_thread: falha ao montar sistema de arquivos: {:?}", e),
         }
+        // TLS por thread (change `kernel-thread-local-storage`) — cria uma
+        // thread-irmã que escreve na sua própria cópia de uma variável
+        // `__thread`, provando que `FS.base` é trocado corretamente por
+        // `kernel::scheduler::schedule_next` e que a cópia da thread
+        // principal nunca é afetada.
+        match kernel::fat32::mount_boot_partition() {
+            Ok(fs) => match kernel::scheduler::spawn_from_elf(
+                &mut frame_allocator,
+                &fs,
+                "/bin/tls.elf",
+                kernel::scheduler::TLS_TEST_PROGRAM_STACK_VIRT,
+                kernel::scheduler::TLS_TEST_PROGRAM_STACK_SIZE,
+            ) {
+                Ok(_) => kernel::serial_println!("tls: /bin/tls.elf carregado e em execucao"),
+                Err(e) => kernel::serial_println!("tls: falha ao carregar /bin/tls.elf: {:?}", e),
+            },
+            Err(e) => kernel::serial_println!("tls: falha ao montar sistema de arquivos: {:?}", e),
+        }
         // Thread de demonstração do teclado (ver `design.md` da change
         // `kernel-keyboard`): compartilha o espaço de endereçamento da
         // thread de boot (não precisa de isolamento próprio), evitando uma

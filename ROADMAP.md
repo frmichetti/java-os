@@ -377,14 +377,30 @@ Atualizado em 2026-11-07, após `kernel-file-syscalls`, `libc-minimal-port`,
   um processo ter mais de uma thread. Verificado em boot real via
   `/bin/siblingt.elf` (ver `design.md` da change, "Resultado real da
   implementação").
+- ~~TLS (armazenamento local de thread) por thread~~ — **concluído**
+  (`kernel-thread-local-storage`): achado durante a exploração do passo
+  seguinte — `Thread::current()` do próprio HotSpot usa `__thread`
+  (`THREAD_LOCAL` = `__thread` em `globalDefinitions_gcc.hpp`), e nenhuma
+  segunda thread do HotSpot conseguiria sequer existir sem isso, mesmo já
+  tendo `SYSCALL_THREAD_CREATE`. `FS.base` agora é trocado por
+  `kernel::scheduler::schedule_next` a cada troca de contexto
+  (mesmo ponto que já troca `CR3`/`TSS.rsp0`); `kernel::elf` reconhece o
+  segmento `PT_TLS`; cada thread de modo usuário ganha seu próprio bloco
+  de TLS. Verificado em boot real via `/bin/tls.elf` (ver `design.md` da
+  change, "Resultado real da implementação").
 - **Novo próximo passo**: `os_javaos::pd_start_thread` real + `pthread_create`
-  da libc sobre essa nova *syscall* (mesmo padrão de `os-javaos-platform-sync`
-  sobre `kernel-thread-sync`) — deliberadamente fora do escopo de
-  `kernel-user-thread-create` (ver seu `design.md`, Non-Goals). Continua
-  bloqueio duro para o porte do HotSpot (ver "Destaque: o que falta para a
-  JVM rodar", item 6.1): nenhuma JVM liga sem conseguir criar as threads
-  nativas que ela mesma precisa (`VMThread`/`ServiceThread`/etc.), antes
-  mesmo de qualquer escolha de GC/interpretador.
+  da libc sobre `SYSCALL_THREAD_CREATE` (mesmo padrão de
+  `os-javaos-platform-sync` sobre `kernel-thread-sync`), agora que a TLS
+  real necessária para `Thread::current()` existe — mais o lock de
+  `malloc`/`_sbrk` em `userland_c/glue.c` (hoje sem nenhuma sincronização;
+  o HotSpot cria várias threads nativas que fazem `malloc`/`free`
+  concorrentemente). Deliberadamente fora do escopo de
+  `kernel-user-thread-create`/`kernel-thread-local-storage` (ver seus
+  `design.md`, Non-Goals). Continua bloqueio duro para o porte do HotSpot
+  (ver "Destaque: o que falta para a JVM rodar", item 6.1): nenhuma JVM
+  liga sem conseguir criar as threads nativas que ela mesma precisa
+  (`VMThread`/`ServiceThread`/etc.), antes mesmo de qualquer escolha de
+  GC/interpretador.
 
 ### Longo prazo
 - Modelo híbrido de execução de JVM (runtime compartilhado vs. JVM isolada por
@@ -453,9 +469,15 @@ real (`os-javaos-memory-pd`), `PlatformMutex`/`PlatformMonitor` reais
    1. ~~Criação de thread nativa em modo usuário~~ — **primitivo de kernel
       concluído** (`kernel-user-thread-create`, ver "Próximo passo
       imediato" acima): `SYSCALL_THREAD_CREATE` já existe e foi verificada
-      em boot real. **Ainda falta** `os_javaos::pd_start_thread` real +
-      `pthread_create` da libc sobre essa *syscall* (continua `fatal()`/
-      stub) — **novo próximo passo imediato**. Bloqueio duro, não
+      em boot real. ~~TLS (armazenamento local de thread) por thread~~ —
+      **também concluída** (`kernel-thread-local-storage`): achado durante
+      a tentativa de escopar `pthread_create`/`os::create_thread` —
+      `Thread::current()` do próprio HotSpot usa `__thread`, e nenhuma
+      segunda thread do HotSpot existiria sem isso. **Ainda falta**
+      `os_javaos::pd_start_thread` real + `pthread_create` da libc sobre
+      essa *syscall* (continua `fatal()`/stub), mais o lock de
+      `malloc`/`_sbrk` em `userland_c/glue.c` (sem nenhuma sincronização
+      hoje) — **novo próximo passo imediato**. Bloqueio duro, não
       contornável por nenhuma escolha de GC/interpretador: o HotSpot cria
       várias threads nativas (`VMThread`, `ServiceThread`,
       `NotificationThread`, `MonitorDeflationThread`) só para inicializar a

@@ -50,6 +50,11 @@ impl ReadyQueue {
 
 static READY_QUEUE: Spinlock<ReadyQueue> = Spinlock::new(ReadyQueue::new());
 
+/// MSR que guarda `FS.base` — trocado a cada troca de contexto (change
+/// `kernel-thread-local-storage`), mesmo mecanismo de `crate::apic::wrmsr`
+/// já usado por `kernel::syscall` para `IA32_STAR`/`IA32_LSTAR`.
+const IA32_FS_BASE: u32 = 0xC000_0100;
+
 /// Topo da stack de kernel da thread corrente — mesma informação que
 /// `TSS.rsp0`, mas acessível diretamente pela rotina de entrada de
 /// `syscall` (`kernel::syscall`), que não passa pela troca automática de
@@ -260,7 +265,7 @@ fn register_thread(thread: Thread) -> ThreadId {
             let mut contexts = CONTEXTS.lock();
             let index = id.0 as usize;
             if contexts.len() <= index {
-                contexts.resize_with(index + 1, || Context { rsp: 0, kernel_stack_top: 0, address_space_root: 0, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false, process: ProcessId(0) });
+                contexts.resize_with(index + 1, || Context { rsp: 0, kernel_stack_top: 0, address_space_root: 0, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false, process: ProcessId(0), tls_base: 0 });
             }
             contexts[index] = thread.context;
             // Área de FXSAVE própria desta thread, alocada aqui (único ponto
@@ -345,7 +350,7 @@ pub fn register_boot_thread() -> ThreadId {
     let boot_process = process::next_process_id_for_scheduler();
     let kernel_stack_top = crate::stack::KERNEL_STACK_BASE + crate::stack::KERNEL_STACK_SIZE;
     let address_space_root = crate::paging::current_root();
-    let thread = Thread { id, process: boot_process, context: Context { rsp: 0, kernel_stack_top, address_space_root, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false, process: boot_process } };
+    let thread = Thread { id, process: boot_process, context: Context { rsp: 0, kernel_stack_top, address_space_root, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false, process: boot_process, tls_base: 0 } };
     // A stack de kernel confiável precisa estar correta desde já — não dá
     // para esperar o primeiro tick do timer, já que uma troca de privilégio
     // pode, em tese, acontecer antes dele (ver design.md da change
@@ -469,6 +474,7 @@ pub fn spawn_user_demo<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>) -
         USER_DEMO_CODE_VIRT,
         USER_DEMO_STACK_VIRT,
         USER_DEMO_STACK_SIZE,
+        None,
     )?;
     let thread_id = register_thread(thread);
     with_interrupts_disabled(|| PROCESSES.lock().push(process));
@@ -511,6 +517,7 @@ pub fn spawn_user_posix_demo<S: FrameStore>(frame_allocator: &mut FrameAllocator
         USER_POSIX_DEMO_CODE_VIRT,
         USER_POSIX_DEMO_STACK_VIRT,
         USER_POSIX_DEMO_STACK_SIZE,
+        None,
     )?;
     let thread_id = register_thread(thread);
     with_interrupts_disabled(|| PROCESSES.lock().push(process));
@@ -551,6 +558,7 @@ pub fn spawn_file_syscalls_demo<S: FrameStore>(frame_allocator: &mut FrameAlloca
         FILE_SYSCALLS_DEMO_CODE_VIRT,
         FILE_SYSCALLS_DEMO_STACK_VIRT,
         FILE_SYSCALLS_DEMO_STACK_SIZE,
+        None,
     )?;
     let thread_id = register_thread(thread);
     with_interrupts_disabled(|| PROCESSES.lock().push(process));
@@ -601,6 +609,7 @@ pub fn spawn_exit_demo<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>) -
         EXIT_DEMO_CODE_VIRT,
         EXIT_DEMO_STACK_VIRT,
         EXIT_DEMO_STACK_SIZE,
+        None,
     )?;
     let thread_id = register_thread(thread);
     with_interrupts_disabled(|| PROCESSES.lock().push(process));
@@ -694,6 +703,19 @@ pub const EFAULT_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
 pub const SIBLING_THREAD_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_1100_0000_0000;
 pub const SIBLING_THREAD_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
 
+/// Endereço virtual, na metade inferior, onde a stack de usuário (da
+/// thread **principal**) do executável de teste de TLS por thread
+/// (`/bin/tls.elf`, change `kernel-thread-local-storage`) é mapeada —
+/// mesmo papel de `SIBLING_THREAD_TEST_PROGRAM_STACK_VIRT`, endereço
+/// distinto só por clareza em despejos de depuração. Deliberadamente fora
+/// da faixa de incrementos de `0x0000_0100_0000_0000` já ocupada por este
+/// arquivo (depois de `SIBLING_THREAD_TEST_PROGRAM_STACK_VIRT =
+/// 0x0000_1100_...`, a mais recente antes desta, e distinto também de
+/// `kernel::stack::TLS_BLOCK_POOL_BASE = 0x0000_1200_...`, a janela de
+/// blocos de TLS em si).
+pub const TLS_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_1300_0000_0000;
+pub const TLS_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
+
 /// Endereços virtuais das duas variantes de `kernel::fpu_demo` (change
 /// `kernel-fpu-context-switch`) — mesma faixa baixa e mesmo racional de
 /// `EXIT_DEMO_CODE_VIRT`/`LIBC_TEST_PROGRAM_STACK_VIRT` (bem abaixo do
@@ -726,7 +748,7 @@ pub fn spawn_fpu_demo<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>) ->
         unsafe { copy_fn(code_hhdm_addr) };
 
         let (process, thread) =
-            Process::finish_new_user(frame_allocator, address_space, code_virt, stack_virt, FPU_DEMO_STACK_SIZE)?;
+            Process::finish_new_user(frame_allocator, address_space, code_virt, stack_virt, FPU_DEMO_STACK_SIZE, None)?;
         let thread_id = register_thread(thread);
         with_interrupts_disabled(|| PROCESSES.lock().push(process));
         Ok(thread_id)
@@ -773,14 +795,35 @@ pub fn spawn_from_elf<S: FrameStore>(
         return Err(crate::elf::ElfError::UnsupportedExecutable);
     }
     let segments = crate::elf::load_program_headers(&file, &header)?;
+    // Segmento de TLS (change `kernel-thread-local-storage`): extraído aqui
+    // (único ponto com acesso ao buffer `file`) e copiado para um
+    // `TlsTemplate` próprio, guardado no `Process` resultante para toda
+    // thread adicional criada depois — ver design.md da change.
+    let tls_template = match crate::elf::load_tls_segment(&file, &header)? {
+        Some(seg) if seg.memsz > crate::stack::TLS_BLOCK_MAX_MEMSZ => {
+            return Err(crate::elf::ElfError::InvalidSegment);
+        }
+        Some(seg) => {
+            let start = seg.offset as usize;
+            let end = start + seg.filesz as usize;
+            Some(crate::process::TlsTemplate { memsz: seg.memsz, align: seg.align, image: file[start..end].to_vec() })
+        }
+        None => None,
+    };
 
     let address_space = Process::begin_new_user(frame_allocator).map_err(crate::elf::ElfError::Process)?;
     let root = address_space.root();
     crate::elf::load_segments(frame_allocator, root, &file, &segments)?;
 
-    let (process, thread) =
-        Process::finish_new_user(frame_allocator, address_space, header.entry, user_stack_virt_base, user_stack_size)
-            .map_err(crate::elf::ElfError::Process)?;
+    let (process, thread) = Process::finish_new_user(
+        frame_allocator,
+        address_space,
+        header.entry,
+        user_stack_virt_base,
+        user_stack_size,
+        tls_template,
+    )
+    .map_err(crate::elf::ElfError::Process)?;
     let thread_id = register_thread(thread);
     with_interrupts_disabled(|| PROCESSES.lock().push(process));
     Ok(thread_id)
@@ -834,6 +877,14 @@ fn schedule_next(current_rsp: u64) -> u64 {
         // inferior (ex.: código/stack de uma thread de usuário) — sem isso,
         // a CPU continuaria com a PML4 de outro processo ativa.
         unsafe { crate::paging::switch_address_space(contexts[next.0 as usize].address_space_root) };
+        // TLS por thread (change `kernel-thread-local-storage`): mesmo
+        // trecho que já troca CR3/TSS.rsp0 acima — `FS.base` precisa já
+        // apontar para o bloco de TLS de `next` antes de `schedule_next`
+        // retornar, já que `next` pode retomar executando código compilado
+        // com `__thread` imediatamente. `tls_base == 0` (nenhum bloco de
+        // TLS) é um valor de `FS.base` inofensivo — só importa para
+        // threads que de fato desreferenciam `%fs:`.
+        unsafe { crate::apic::wrmsr(IA32_FS_BASE, contexts[next.0 as usize].tls_base) };
         // Mesmo trecho que já atualiza TSS.rsp0/CR3 acima — ver design.md da
         // change `kernel-fpu-context-switch`: `timer_entry`/`block_entry`
         // fazem `FXRSTOR [CURRENT_FPU_AREA]` logo depois de trocar `RSP`,

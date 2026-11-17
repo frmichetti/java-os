@@ -45,6 +45,9 @@ const EM_X86_64: u16 = 62;
 
 /// `p_type` de um segmento carregável.
 const PT_LOAD: u32 = 1;
+/// `p_type` de um segmento de armazenamento local de thread (TLS) — ver
+/// [`load_tls_segment`] e `design.md` da change `kernel-thread-local-storage`.
+const PT_TLS: u32 = 7;
 /// Bit de `p_flags` que marca um segmento gravável.
 const PF_W: u32 = 2;
 /// Bit de `p_flags` que marca um segmento executável.
@@ -67,8 +70,9 @@ pub enum ElfError {
     /// A tabela de program headers (`e_phoff`/`e_phnum`/`e_phentsize`)
     /// aponta, ao menos em parte, para fora do buffer do arquivo.
     ProgramHeaderTableOutOfBounds,
-    /// Um segmento `PT_LOAD` declara `p_offset`/`p_filesz` fora do buffer do
-    /// arquivo, ou `p_memsz` menor que `p_filesz` (segmento malformado).
+    /// Um segmento `PT_LOAD` ou `PT_TLS` declara `p_offset`/`p_filesz` fora
+    /// do buffer do arquivo, ou `p_memsz` menor que `p_filesz` (segmento
+    /// malformado).
     InvalidSegment,
     /// Dois segmentos `PT_LOAD` ocupam, ao menos em parte, a mesma página de
     /// memória.
@@ -189,6 +193,66 @@ pub fn load_program_headers(buf: &[u8], header: &ElfHeader) -> Result<Vec<Progra
         result.push(ProgramHeader { flags: p_flags, offset: p_offset, vaddr: p_vaddr, filesz: p_filesz, memsz: p_memsz });
     }
     Ok(result)
+}
+
+/// Campos de um program header `PT_TLS` relevantes para inicializar o bloco
+/// de TLS de uma thread — ver spec `kernel-processes` ("Bloco de
+/// Armazenamento Local de Thread (TLS) por Thread") e `design.md` da change
+/// `kernel-thread-local-storage`. Deliberadamente sem `vaddr` (a imagem de
+/// TLS nunca é mapeada no endereço virtual declarado pelo executável — cada
+/// thread tem seu próprio bloco, num endereço escolhido pelo kernel, nunca
+/// pelo executável) nem acesso à memória do arquivo (mesmo racional de
+/// [`ProgramHeader`]: só metadados, puro, sem efeito colateral).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct TlsProgramHeader {
+    pub offset: u64,
+    pub align: u64,
+    pub filesz: u64,
+    pub memsz: u64,
+}
+
+/// Devolve o único program header do tipo `PT_TLS` descrito por `header`
+/// dentro de `buf`, ou `None` se o executável não declarar nenhum — cobre
+/// "Reconhecimento do Segmento de Armazenamento Local de Thread (TLS)" da
+/// spec `kernel-elf-loader`. Mesma validação de limites de
+/// [`load_program_headers`] (offset/tamanho dentro de `buf`, `p_memsz >=
+/// p_filesz`), rejeitando com `ElfError::InvalidSegment` em vez de indexar
+/// `buf` fora dos limites. Um executável real nunca declara mais de um
+/// `PT_TLS` (exigência do próprio formato ELF) — a primeira ocorrência
+/// encontrada é a devolvida.
+pub fn load_tls_segment(buf: &[u8], header: &ElfHeader) -> Result<Option<TlsProgramHeader>, ElfError> {
+    let phentsize = header.phentsize as usize;
+    let phnum = header.phnum as usize;
+    let table_len = phentsize.checked_mul(phnum).ok_or(ElfError::ProgramHeaderTableOutOfBounds)?;
+    let table_start = usize::try_from(header.phoff).map_err(|_| ElfError::ProgramHeaderTableOutOfBounds)?;
+    let table_end = table_start.checked_add(table_len).ok_or(ElfError::ProgramHeaderTableOutOfBounds)?;
+    let table = buf.get(table_start..table_end).ok_or(ElfError::ProgramHeaderTableOutOfBounds)?;
+
+    for entry in table.chunks_exact(phentsize) {
+        let raw = entry.get(0..PHDR_SIZE).ok_or(ElfError::ProgramHeaderTableOutOfBounds)?;
+        let p_type = u32::from_le_bytes(raw[0..4].try_into().unwrap());
+        if p_type != PT_TLS {
+            continue;
+        }
+
+        let p_offset = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+        let p_filesz = u64::from_le_bytes(raw[32..40].try_into().unwrap());
+        let p_memsz = u64::from_le_bytes(raw[40..48].try_into().unwrap());
+        let p_align = u64::from_le_bytes(raw[48..56].try_into().unwrap());
+
+        if p_memsz < p_filesz {
+            return Err(ElfError::InvalidSegment);
+        }
+        let seg_start = usize::try_from(p_offset).map_err(|_| ElfError::InvalidSegment)?;
+        let seg_len = usize::try_from(p_filesz).map_err(|_| ElfError::InvalidSegment)?;
+        let seg_end = seg_start.checked_add(seg_len).ok_or(ElfError::InvalidSegment)?;
+        if seg_end > buf.len() {
+            return Err(ElfError::InvalidSegment);
+        }
+
+        return Ok(Some(TlsProgramHeader { offset: p_offset, align: p_align, filesz: p_filesz, memsz: p_memsz }));
+    }
+    Ok(None)
 }
 
 /// Soma `base` ao `vaddr` de cada segmento, preservando os demais campos —
@@ -466,6 +530,57 @@ mod tests {
     }
 
     const PF_R_FLAG: u32 = 4;
+
+    // -------------------------------------------------------------
+    // load_tls_segment (tarefa 1.1 da change kernel-thread-local-storage)
+    // -------------------------------------------------------------
+
+    /// Mesmo papel de [`write_phdr`], mas também escreve `p_align` (bytes
+    /// 48-56), que `write_phdr` não cobre — só `PT_TLS` precisa dele hoje.
+    fn write_phdr_with_align(buf: &mut [u8], offset: usize, p_type: u32, p_offset: u64, p_filesz: u64, p_memsz: u64, p_align: u64) {
+        write_phdr(buf, offset, p_type, 0, p_offset, 0, p_filesz, p_memsz);
+        buf[offset + 48..offset + 56].copy_from_slice(&p_align.to_le_bytes());
+    }
+
+    #[test]
+    fn executable_without_pt_tls_returns_none() {
+        let phoff = EHDR_SIZE as u64;
+        let mut buf = build_header(0, phoff, PHDR_SIZE as u16, 1, EHDR_SIZE + PHDR_SIZE);
+        write_phdr(&mut buf, EHDR_SIZE, PT_LOAD, PF_X, 0, 0x1000, 16, 16);
+        let header = ElfHeader::parse(&buf).unwrap();
+
+        assert_eq!(load_tls_segment(&buf, &header), Ok(None));
+    }
+
+    #[test]
+    fn pt_tls_segment_is_extracted() {
+        let phoff = EHDR_SIZE as u64;
+        let mut buf = build_header(0, phoff, PHDR_SIZE as u16, 2, EHDR_SIZE + 2 * PHDR_SIZE);
+        write_phdr(&mut buf, EHDR_SIZE, PT_LOAD, PF_W, 0, 0x2000, 8, 8);
+        write_phdr_with_align(&mut buf, EHDR_SIZE + PHDR_SIZE, PT_TLS, 0, 4, 8, 16);
+        let header = ElfHeader::parse(&buf).unwrap();
+
+        let tls = load_tls_segment(&buf, &header).expect("segmento PT_TLS valido deveria ser aceito");
+        assert_eq!(tls, Some(TlsProgramHeader { offset: 0, align: 16, filesz: 4, memsz: 8 }));
+    }
+
+    #[test]
+    fn pt_tls_offset_past_end_of_file_is_rejected() {
+        let phoff = EHDR_SIZE as u64;
+        let mut buf = build_header(0, phoff, PHDR_SIZE as u16, 1, EHDR_SIZE + PHDR_SIZE);
+        write_phdr_with_align(&mut buf, EHDR_SIZE, PT_TLS, 1000, 4, 8, 8);
+        let header = ElfHeader::parse(&buf).unwrap();
+        assert_eq!(load_tls_segment(&buf, &header), Err(ElfError::InvalidSegment));
+    }
+
+    #[test]
+    fn pt_tls_memsz_smaller_than_filesz_is_rejected() {
+        let phoff = EHDR_SIZE as u64;
+        let mut buf = build_header(0, phoff, PHDR_SIZE as u16, 1, EHDR_SIZE + PHDR_SIZE);
+        write_phdr_with_align(&mut buf, EHDR_SIZE, PT_TLS, 0, 32, 16, 8);
+        let header = ElfHeader::parse(&buf).unwrap();
+        assert_eq!(load_tls_segment(&buf, &header), Err(ElfError::InvalidSegment));
+    }
 
     // -------------------------------------------------------------
     // rebase_segments (tarefa 1.3 da change kernel-dynamic-linker)
