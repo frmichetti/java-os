@@ -572,13 +572,8 @@ Atualizado em 2026-11-21, após `kernel-file-syscalls`, `libc-minimal-port`,
     compilável.
   - **Dois achados novos, cada um seu próprio subsistema**: (1)
     ~~`jimage.hpp`~~ — **resolvido** (`jimage-header-vendoring`, ver
-    abaixo); (2) `jfrfiles/jfrEventClasses.hpp` — outra família de
-    arquivo gerado, para JFR (Java Flight Recorder), incluída
-    **incondicionalmente** por `jfr/jfrEvents.hpp` (independente da
-    flag `-DINCLUDE_JFR=0` já usada desde `os-javaos-skeleton`) —
-    bloqueia `thread.cpp`/`javaThread.cpp` e 2 dos 3 `jvmti*.cpp`
-    restantes. Subsistema inteiramente novo, nunca antes mapeado em
-    nenhum lugar deste roadmap — continua em aberto.
+    abaixo); (2) ~~`jfrfiles/jfrEventClasses.hpp`~~ — **resolvido**
+    (`jfr-generated-headers`, ver abaixo).
 - ~~Vendorizar `jimage.hpp` de `src/java.base`~~ — **concluído**
   (`jimage-header-vendoring`): investigação do arquivo real (buscado do
   repositório oficial `openjdk/jdk` na tag `jdk-27-ga`) revelou que é um
@@ -595,11 +590,36 @@ Atualizado em 2026-11-21, após `kernel-file-syscalls`, `libc-minimal-port`,
   temido, isso **não** puxou o resto do roadmap item 4 (`classfile`/`oops`,
   ~83+125 arquivos) atrás de si; era literalmente um arquivo faltando,
   não o início de uma cascata.
-- **Próximo passo imediato**: mapear e gerar os arquivos JFR
-  (`jfrfiles/jfrEventClasses.hpp` e o que mais `jfr/jfrEvents.hpp`
-  exigir) para desbloquear `thread.cpp`/`javaThread.cpp` — subsistema
-  ainda não investigado em profundidade (gerador/spec do JFR não
-  conferidos ainda). Nenhuma exploração ainda, nenhuma change aberta.
+- ~~Gerar os headers JFR (`jfrfiles/jfrEventClasses.hpp` e demais)~~ —
+  **concluído** (`jfr-generated-headers`): `jfr/jfrEvents.hpp` inclui
+  `jfrfiles/jfrEventClasses.hpp` **incondicionalmente** (independente de
+  `-DINCLUDE_JFR=0`) — achado registrado por `jvmti-generated-headers`.
+  Investigação revelou que, assim como `jvmti.h`/`jvmtiEnv.hpp`, é um
+  arquivo **gerado**, mas desta vez pelo gerador
+  `build.tools.jfr.GenerateJfrFiles`, que vive **fora** de `src/hotspot`
+  (`make/src/classes/build/tools/jfr/`, nunca vendorizado antes —
+  primeira vendorização deste projeto fora de `src/hotspot`/
+  `src/java.base`), contra o spec real `share/jfr/metadata/metadata.xml`/
+  `metadata.xsd` (já vendorizados desde que `src/hotspot` foi
+  vendorizado). Novo `scripts/jfr/generate-jfr-headers.sh` (mesma
+  convenção de `scripts/jvmti/generate-jvmti-headers.sh`) roda o gerador
+  real, produzindo os 5 headers de `--mode headers`
+  (`jfrEventClasses.hpp`/`jfrEventControl.hpp`/`jfrEventIds.hpp`/
+  `jfrPeriodic.hpp`/`jfrTypes.hpp`) vendorizados (não versionados no
+  Git). **Achado real sobre o impacto**: com eles presentes (mais uma
+  entrada de `-I`), **toda a cadeia de 26 arquivos** antes bloqueada por
+  `jvmti-generated-headers`/`jimage-header-vendoring` passa a compilar
+  limpo via `g++ -fsyntax-only` — os 21 `share/prims/jvmti*.cpp` por
+  completo (antes 18/21, agora 21/21) e `share/runtime/thread.cpp`/
+  `javaThread.cpp`/`threads.cpp`. Nenhuma integração real de JFR
+  (`-DINCLUDE_JFR=1`, gravação de eventos) — JFR continua desligado em
+  tempo de execução, só os headers precisavam existir para o `#include`
+  incondicional resolver.
+- **Próximo passo imediato**: nenhum bloqueio de compilação conhecido
+  restante na cadeia `jvmti-generated-headers`/`jimage-header-vendoring`/
+  `jfr-generated-headers`. Retomar a exploração do roadmap item 4
+  (`classfile`/`oops`, ~83+125 arquivos) ou do próximo subsistema a
+  mapear.
 
 ### Longo prazo
 - Modelo híbrido de execução de JVM (runtime compartilhado vs. JVM isolada por
