@@ -746,6 +746,14 @@ pub const RECURSIVE_LOCK_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE
 pub const PTHREAD_CREATE_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_1600_0000_0000;
 pub const PTHREAD_CREATE_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
 
+/// Endereço virtual, na metade inferior, onde a stack de usuário (da
+/// thread **principal**) do executável de teste de `pthread_self` real
+/// (`/bin/pthreads.elf`, change `os-javaos-attach-thread`) é mapeada —
+/// mesmo papel de `PTHREAD_CREATE_TEST_PROGRAM_STACK_VIRT`, endereço
+/// distinto só por clareza em despejos de depuração.
+pub const PTHREAD_SELF_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_1700_0000_0000;
+pub const PTHREAD_SELF_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
+
 /// Endereços virtuais das duas variantes de `kernel::fpu_demo` (change
 /// `kernel-fpu-context-switch`) — mesma faixa baixa e mesmo racional de
 /// `EXIT_DEMO_CODE_VIRT`/`LIBC_TEST_PROGRAM_STACK_VIRT` (bem abaixo do

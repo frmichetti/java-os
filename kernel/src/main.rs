@@ -633,6 +633,24 @@ extern "C" fn continue_boot() -> ! {
             },
             Err(e) => kernel::serial_println!("pthread_create: falha ao montar sistema de arquivos: {:?}", e),
         }
+        // Verificação de `pthread_self` real (change
+        // `os-javaos-attach-thread`) — prova que cada thread descobre seu
+        // próprio identificador nativo, batendo com o `pthread_t` que a
+        // thread criadora recebeu, e que threads distintas nunca se
+        // confundem entre si.
+        match kernel::fat32::mount_boot_partition() {
+            Ok(fs) => match kernel::scheduler::spawn_from_elf(
+                &mut frame_allocator,
+                &fs,
+                "/bin/pthreads.elf",
+                kernel::scheduler::PTHREAD_SELF_TEST_PROGRAM_STACK_VIRT,
+                kernel::scheduler::PTHREAD_SELF_TEST_PROGRAM_STACK_SIZE,
+            ) {
+                Ok(_) => kernel::serial_println!("pthread_self: /bin/pthreads.elf carregado e em execucao"),
+                Err(e) => kernel::serial_println!("pthread_self: falha ao carregar /bin/pthreads.elf: {:?}", e),
+            },
+            Err(e) => kernel::serial_println!("pthread_self: falha ao montar sistema de arquivos: {:?}", e),
+        }
         // Thread de demonstração do teclado (ver `design.md` da change
         // `kernel-keyboard`): compartilha o espaço de endereçamento da
         // thread de boot (não precisa de isolamento próprio), evitando uma

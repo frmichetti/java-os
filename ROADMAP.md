@@ -14,7 +14,8 @@ prazo — rodar uma JVM e ter uma interface gráfica. Para profundidade técnica
 Atualizado em 2026-11-21, após `kernel-file-syscalls`, `libc-minimal-port`,
 `kernel-fpu-context-switch`, `cxx-minimal-runtime`, `os-javaos-skeleton`,
 `os-javaos-memory-pd`, `os-javaos-platform-sync`, `libc-float-math`,
-`libc-retargetable-locking` e `pthread-create-thread`.
+`libc-retargetable-locking`, `pthread-create-thread` e
+`os-javaos-attach-thread`.
 
 ## O que já está implementado (verificado em boot real)
 
@@ -497,12 +498,60 @@ Atualizado em 2026-11-21, após `kernel-file-syscalls`, `libc-minimal-port`,
   completo: toda a base de primitivas de kernel que o HotSpot precisa para
   criar suas threads nativas (`VMThread`/`ServiceThread`/etc.) está pronta
   e verificada.
-- **Próximo passo imediato**: mapear `os::create_main_thread`/
-  `os::create_attached_thread` (anexar a thread primordial, que já existe,
-  a um `JavaThread` — problema de sequenciamento de inicialização da VM,
-  não de criação de thread) e a sequência real de `share/runtime/init.cpp`
-  — ainda não explorado em detalhe (ver item 6.5 abaixo, "próxima
-  exploração natural"); nenhuma change aberta ainda para isso.
+- ~~`os::create_main_thread`/`os::create_attached_thread` real~~ —
+  **concluído** (`os-javaos-attach-thread`): replicam `os_bsd.cpp:754-798`
+  (lido diretamente da árvore vendorizada) — `create_main_thread` só delega
+  para `create_attached_thread`, que aloca `OSThread`, grava nele o
+  identificador nativo da própria thread chamadora e marca `RUNNABLE`.
+  **Achado real da exploração**: nenhuma função deste porte expunha "qual é
+  o meu próprio identificador nativo" a partir de C — `javaos_get_thread_id`
+  (`libc-retargetable-locking`) já embrulhava a `SYSCALL_GET_THREAD_ID`
+  necessária, mas era `static`, uso interno das variantes recursivas de
+  `__retarget_lock_*`. Nova `pthread_self()` real em `userland_c/glue.c`
+  (função pública independente, chama a mesma syscall diretamente, sem
+  mudar a visibilidade daquela) resolve isso — usada por
+  `create_attached_thread` no lugar do equivalente a `os::Bsd::gettid()`.
+  Sem `PosixSignals::hotspot_sigmask`/estado de FPU específico de BSD/macOS
+  (mesmos Non-Goals já aceitos por `os::create_thread`,
+  `pthread-create-thread`).
+  - **Achado real sobre o escopo**: `Threads::create_vm()`
+    (`share/runtime/threads.cpp`) chama `os::create_main_thread` logo após
+    alocar o `JavaThread` primordial, **antes** de `vm_init_globals()`/
+    `init_globals()`/`init_globals2()` (`share/runtime/init.cpp`) rodarem
+    — ou seja, estes dois hooks não dependiam de nenhuma das ~40 chamadas
+    de `init_globals`/`init_globals2` (GC, code cache, interpretador,
+    compilador, JVMTI), ao contrário do que a formulação anterior deste
+    roadmap sugeria ao tratar "mapear `init.cpp`" como um único passo —
+    eram dois problemas de tamanhos bem diferentes.
+  - Verificado por compilação real (`g++ -fsyntax-only -std=gnu++17`,
+    mesma invocação de `os-javaos-skeleton`/`os-javaos-memory-pd`/
+    `os-javaos-park-sync`/`pthread-create-thread`) — `os_javaos.cpp`
+    (com o novo `#include "runtime/javaThread.hpp"`), `mutex_javaos.cpp` e
+    `park_javaos.cpp` (regressão) continuam compilando, mesmos avisos
+    pré-existentes e alheios. Nunca linkado nem executado.
+  - Verificado em boot real por um programa C dedicado
+    (`userland_c/pthread_self_test_program.c`, carregado como
+    `/bin/pthreads.elf`): duas threads criadas via `pthread_create`
+    confirmam, cada uma via `pthread_self()`, que seu próprio identificador
+    bate com o `pthread_t` que a criadora recebeu — e que os dois nunca se
+    confundem entre si (`resultado PPPP`). Nenhum programa de teste já
+    existente regrediu; `cargo test -p kernel --lib -- --test-threads=1`:
+    338 testes, 0 falhas.
+  - **Fora de escopo, deliberadamente**: o outro uso real de
+    `create_attached_thread` no HotSpot (JNI `AttachCurrentThread`,
+    `share/prims/jni.cpp`) — `prims`/JNI é item 6 do roadmap, ainda não
+    explorado; implementado só o suficiente para servir `create_main_thread`.
+- **Próximo passo imediato**: a sequência real de `vm_init_globals()`/
+  `init_globals()`/`init_globals2()` (`share/runtime/init.cpp`) — lida
+  diretamente durante a exploração desta change: ~40 subsistemas
+  encadeados (GC/heap via `universe_init`, *code cache*, geração de stubs
+  do interpretador/*runtime* compartilhado, `classLoader_init1`,
+  `compileBroker_init`, JVMTI, etc.), nenhum ainda mapeado em detalhe nem
+  escolhido. Antes de mapear essa sequência inteira, a decisão mais
+  urgente e mais barata de reverter é a escolha do coletor de lixo (item
+  6.2 abaixo, "Escolha do coletor de lixo mais simples") — `universe_init`
+  já depende dela logo na primeira chamada de `init_globals()`. Nenhuma
+  exploração ainda, nenhuma change aberta.
 
 ### Longo prazo
 - Modelo híbrido de execução de JVM (runtime compartilhado vs. JVM isolada por
@@ -589,10 +638,16 @@ real (`os-javaos-memory-pd`), `PlatformMutex`/`PlatformMonitor` reais
       `ServiceThread`, `NotificationThread`, `MonitorDeflationThread`) só
       para inicializar a VM, antes de `Main.main` sequer rodar
       (`share/runtime/vmThread.cpp`/`serviceThread.cpp`/
-      `notificationThread.cpp`/`monitorDeflationThread.cpp`). O que falta
-      agora é diferente em natureza — não mais primitiva de kernel/libc, e
-      sim sequenciamento de inicialização da VM em si (item 5 abaixo,
-      "runtime"/`init.cpp` — "próxima exploração natural").
+      `notificationThread.cpp`/`monitorDeflationThread.cpp`). ~~`os::create_main_thread`/
+      `os::create_attached_thread` real~~ — **também concluído**
+      (`os-javaos-attach-thread`, ver "Próximo passo imediato" acima):
+      anexam a thread primordial (já existente) a um `JavaThread`, com uma
+      nova `pthread_self()` real na libc para descobrir o identificador
+      nativo da própria thread chamadora. O que falta agora é diferente em
+      natureza — não mais primitiva de kernel/libc, e sim a sequência de
+      `vm_init_globals()`/`init_globals()`/`init_globals2()`
+      (`share/runtime/init.cpp`) em si, que começa pela escolha de GC
+      (item 2 abaixo).
    2. **Escolha do coletor de lixo mais simples para o primeiro porte**:
       `share/gc/epsilon` (~15 arquivos — nunca coleta, só aloca até o heap
       estourar, zero lógica de marcação/compactação) é o candidato mais

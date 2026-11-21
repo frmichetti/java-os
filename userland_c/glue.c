@@ -711,3 +711,14 @@ void pthread_exit(void *value_ptr) {
     for (;;) {
     } /* nunca alcançado: SYSCALL_EXIT nunca retorna */
 }
+
+/* pthread_self() real - change `os-javaos-attach-thread`, design.md. Chama
+ * SYS_GET_THREAD_ID diretamente, em vez de reaproveitar
+ * javaos_get_thread_id (static, uso interno das variantes recursivas de
+ * __retarget_lock_* de libc-retargetable-locking) - função pública nova e
+ * independente, sem mudar a visibilidade daquela. Usada por
+ * os::create_attached_thread (os_javaos.cpp) para descobrir o identificador
+ * nativo da própria thread chamadora, nunca criada via pthread_create. */
+pthread_t pthread_self(void) {
+    return (pthread_t)javaos_syscall(SYS_GET_THREAD_ID, 0, 0, 0, 0);
+}
