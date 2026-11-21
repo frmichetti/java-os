@@ -580,6 +580,41 @@ extern "C" fn continue_boot() -> ! {
             },
             Err(e) => kernel::serial_println!("tls: falha ao montar sistema de arquivos: {:?}", e),
         }
+        // Verificação de `malloc`/`free` concorrentes reais entre duas
+        // threads do mesmo processo (change `libc-retargetable-locking`) —
+        // prova que o locking retargetável real do newlib protege o heap
+        // contra corrupção sob acesso concorrente.
+        match kernel::fat32::mount_boot_partition() {
+            Ok(fs) => match kernel::scheduler::spawn_from_elf(
+                &mut frame_allocator,
+                &fs,
+                "/bin/mallocct.elf",
+                kernel::scheduler::MALLOC_CONCURRENCY_TEST_PROGRAM_STACK_VIRT,
+                kernel::scheduler::MALLOC_CONCURRENCY_TEST_PROGRAM_STACK_SIZE,
+            ) {
+                Ok(_) => kernel::serial_println!("malloc_concurrency: /bin/mallocct.elf carregado e em execucao"),
+                Err(e) => kernel::serial_println!("malloc_concurrency: falha ao carregar /bin/mallocct.elf: {:?}", e),
+            },
+            Err(e) => kernel::serial_println!("malloc_concurrency: falha ao montar sistema de arquivos: {:?}", e),
+        }
+        // Verificação de reentrância real de um lock interno recursivo do
+        // newlib (change `libc-retargetable-locking`) — prova que a mesma
+        // thread adquire o mesmo lock recursivo duas vezes sem bloquear a
+        // si mesma, e que outra thread só o adquire depois da liberação
+        // correspondente à segunda aquisição.
+        match kernel::fat32::mount_boot_partition() {
+            Ok(fs) => match kernel::scheduler::spawn_from_elf(
+                &mut frame_allocator,
+                &fs,
+                "/bin/reclock.elf",
+                kernel::scheduler::RECURSIVE_LOCK_TEST_PROGRAM_STACK_VIRT,
+                kernel::scheduler::RECURSIVE_LOCK_TEST_PROGRAM_STACK_SIZE,
+            ) {
+                Ok(_) => kernel::serial_println!("recursive_lock: /bin/reclock.elf carregado e em execucao"),
+                Err(e) => kernel::serial_println!("recursive_lock: falha ao carregar /bin/reclock.elf: {:?}", e),
+            },
+            Err(e) => kernel::serial_println!("recursive_lock: falha ao montar sistema de arquivos: {:?}", e),
+        }
         // Thread de demonstração do teclado (ver `design.md` da change
         // `kernel-keyboard`): compartilha o espaço de endereçamento da
         // thread de boot (não precisa de isolamento próprio), evitando uma

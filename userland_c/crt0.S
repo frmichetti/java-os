@@ -23,15 +23,24 @@
  * #GP imediato. Corrigido alinhando explicitamente aqui, mesma convencao
  * de crt0 real (glibc, musl): funciona independente do RSP exato entregue
  * pelo kernel.
+ *
+ * Achado real (change libc-retargetable-locking): __javaos_init_internal_locks
+ * (userland_c/glue.c) precisa rodar antes de "call main" - ponto em que o
+ * processo garantidamente so tem uma thread (nenhuma SYSCALL_THREAD_CREATE
+ * pode ter acontecido ainda), unica forma de inicializar os 8 mutexes
+ * internos do newlib sem precisar de uma secao critica para proteger a
+ * propria criacao do mutex - ver design.md daquela change.
  */
 .global _start
 .extern main
 .extern _exit
+.extern __javaos_init_internal_locks
 
 .text
 _start:
     xor %ebp, %ebp      /* fim da cadeia de frame pointers (convenção comum) */
     and $-16, %rsp      /* garante RSP alinhado a 16 bytes antes do "call" abaixo */
+    call __javaos_init_internal_locks
     call main
     mov %eax, %edi      /* valor de retorno de main -> argumento de _exit */
     call _exit

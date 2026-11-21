@@ -32,6 +32,16 @@
 #    `vendor/newlib-build` antes) expõe o bug. Corrigido exigindo que o
 #    nome comece com um dígito após `newlib-` (só a árvore de versão
 #    baixada bate com isso).
+#
+# Change `libc-retargetable-locking`: passa a configurar com
+# `--enable-newlib-retargetable-locking` (`_RETARGETABLE_LOCKING` no
+# `newlib.h` gerado), exigida pelos `__retarget_lock_*` reais de
+# `userland_c/glue.c`. **Importante**: este script só roda `configure`
+# quando `$BUILD_DIR/Makefile` ainda não existe — uma `vendor/newlib-build`
+# de uma execução anterior a esta change (sem a flag) fica "presa" com a
+# configuração antiga. Apague `vendor/newlib-build` (e `vendor/newlib-install`,
+# por consistência) antes de rodar este script pela primeira vez depois
+# desta change, para forçar uma reconfiguração do zero.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -56,7 +66,8 @@ if [ ! -f Makefile ]; then
     --disable-newlib-io-float \
     --disable-newlib-io-long-double \
     --disable-multilib \
-    --disable-nls
+    --disable-nls \
+    --enable-newlib-retargetable-locking
 fi
 
 # `-k`: deixa passar o erro esperado de `libgloss` (achado 2 acima, não

@@ -188,3 +188,71 @@ erro já existente do script, se ainda não cobrir esse caso.
 
 Nenhuma — todas as decisões técnicas necessárias para esta change foram
 resolvidas acima.
+
+## Resultado real da implementação
+
+Implementado exatamente conforme planejado acima, sem nenhuma revisão de
+design necessária. Achados reais durante a implementação e a verificação
+em boot:
+
+- **Reconstrução do newlib confirmada**: `scripts/cross/build-newlib.sh`
+  com `--enable-newlib-retargetable-locking` gera um `newlib.h` com
+  `#define _RETARGETABLE_LOCKING 1` (confirmado por `grep` no
+  `newlib.h` real gerado em `vendor/newlib-build/x86_64-elf/newlib/`), e o
+  `libc.a` final continua arquivando `libc`+`libm` normalmente (1071
+  objetos) — a falha esperada e já documentada de `libgloss`/`makeinfo`
+  (não relacionada a esta change) continua ocorrendo e continua inofensiva
+  (`make -k ... || true`).
+- **`vendor/newlib-build`/`vendor/newlib-install` de uma execução anterior
+  (sem a flag) precisaram ser apagados manualmente** antes da primeira
+  reconstrução desta change — confirma na prática o aviso já registrado em
+  `scripts/cross/build-newlib.sh` (o script só roda `configure` quando
+  `Makefile` ainda não existe).
+- **Achado real de um comentário C que fechava um bloco `/* */` cedo
+  demais**: o primeiro rascunho do cabeçalho de
+  `userland_c/recursive_lock_test_program.c` continha a sequência literal
+  `__retarget_lock_*/struct __lock` dentro do comentário — o `*/` no meio
+  do texto (não uma fronteira de comentário real) fechou o comentário
+  antecipadamente, quebrando a compilação com erros de sintaxe aparentemente
+  não relacionados (`expected '=', ',', ';' ... before '*' token`) várias
+  linhas depois. Corrigido reescrevendo para `__retarget_lock_* e struct
+  __lock` (sem a sequência `*/` literal). Nota para qualquer comentário C
+  futuro que mencione `__retarget_lock_*` seguido de uma barra ou de
+  `struct`.
+- **Achado real de orçamento de tempo de boot**: a carga de trabalho
+  original dos dois programas de teste de boot real (tarefa 4) — 4000
+  iterações de `malloc`/`free` por thread em
+  `malloc_concurrency_test_program.c`, e laços de espera fixos de até 50
+  milhões de iterações em `recursive_lock_test_program.c` — ultrapassava a
+  janela padrão de boot de 15s usada por `cargo xtask test`, mesmo com a
+  implementação correta e sem nenhum travamento real (confirmado rodando o
+  QEMU manualmente com uma janela estendida de 60s: ambos os programas
+  reportam `resultado PPPPP`, e nenhum outro programa de teste já existente
+  regride). Causa: cada iteração de `malloc`/`free` concorrente envolve
+  pelo menos um `SYSCALL_MUTEX_LOCK`/`SYSCALL_MUTEX_UNLOCK` real — caro sob
+  o escalonador de 100 Hz/QEMU TCG quando multiplicado por milhares de
+  iterações em duas threads disputando o mesmo lock. Reduzido para 300
+  iterações por thread em `malloc_concurrency_test_program.c` (mantendo o
+  ring de alocações vivas simultâneas, ainda genuinamente concorrente) e
+  separados os dois laços de `recursive_lock_test_program.c` em duas
+  constantes distintas (`DELAY_ITERATIONS = 3_000_000`, o atraso fixo sem
+  `break` antecipado que prova "uma liberação não basta"; `JOIN_POLL_ITERATIONS
+  = 50_000_000`, o limite superior do laço de espera pela thread-irmã, que
+  quebra assim que ela termina — seu valor não custa tempo real no caminho
+  de sucesso) — ambos cabem confortavelmente na janela padrão de 15s depois
+  do ajuste, verificado via `cargo xtask test`.
+- **Verificação em boot real sem regressão**: todo programa de teste já
+  existente antes desta change (`cxx_test_program`, `javaos_pthread_test_program`,
+  `libm_test_program`, `file_syscalls_demo`, `libc_test_program`,
+  `sibling_thread_test_program`, `timedwait_test_program`,
+  `tls_test_program`, `user_posix_demo`, `DLOPEN/DLSYM`,
+  `javaos_vm_test_program`, `efault_test_program`) reporta exatamente a
+  mesma string P/F de antes da reconstrução do newlib e das mudanças de
+  `glue.c`/`crt0.S` — nenhuma regressão da reconstrução com
+  `_RETARGETABLE_LOCKING`.
+- `cargo test -p kernel --lib`: 337 testes passando (nenhuma regressão;
+  `SYSCALL_GET_THREAD_ID`/`sys_get_thread_id` não é testado em host pelo
+  mesmo motivo já documentado para `SYSCALL_WRITE` — delega a
+  `scheduler::current_thread_id`, que usa `with_interrupts_disabled`
+  (`cli`/`sti`, instruções privilegiadas que crasham um processo de teste
+  em anel 3); verificado só em boot real.

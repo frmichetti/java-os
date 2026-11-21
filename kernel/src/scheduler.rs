@@ -716,6 +716,23 @@ pub const SIBLING_THREAD_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE
 pub const TLS_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_1300_0000_0000;
 pub const TLS_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
 
+/// Endereço virtual, na metade inferior, onde a stack de usuário (da
+/// thread **principal**) do executável de teste de `malloc`/`free`
+/// concorrentes (`/bin/mallocct.elf`, change `libc-retargetable-locking`) é
+/// mapeada — mesmo papel de `TLS_TEST_PROGRAM_STACK_VIRT`, endereço
+/// distinto só por clareza em despejos de depuração. Primeiro incremento
+/// livre depois de `TLS_TEST_PROGRAM_STACK_VIRT = 0x0000_1300_...`.
+pub const MALLOC_CONCURRENCY_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_1400_0000_0000;
+pub const MALLOC_CONCURRENCY_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
+
+/// Endereço virtual, na metade inferior, onde a stack de usuário (da
+/// thread **principal**) do executável de teste de reentrância de lock
+/// recursivo (`/bin/reclock.elf`, change `libc-retargetable-locking`) é
+/// mapeada — mesmo papel de `MALLOC_CONCURRENCY_TEST_PROGRAM_STACK_VIRT`,
+/// endereço distinto só por clareza em despejos de depuração.
+pub const RECURSIVE_LOCK_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_1500_0000_0000;
+pub const RECURSIVE_LOCK_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
+
 /// Endereços virtuais das duas variantes de `kernel::fpu_demo` (change
 /// `kernel-fpu-context-switch`) — mesma faixa baixa e mesmo racional de
 /// `EXIT_DEMO_CODE_VIRT`/`LIBC_TEST_PROGRAM_STACK_VIRT` (bem abaixo do

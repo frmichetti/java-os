@@ -46,7 +46,9 @@
 
 #include <pthread.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/lock.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -86,6 +88,7 @@ extern int errno;
 #define SYS_CLOSE 20
 #define SYS_EXIT 21
 #define SYS_MUTEX_TRYLOCK 22
+#define SYS_GET_THREAD_ID 24
 
 /* kernel::syscall::syscall_err codifica um erro POSIX como `-errno`
  * (inteiro de 64 bits assinado, convenção do kernel Linux - ver design.md
@@ -498,4 +501,148 @@ int pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex,
      * `SYSCALL_ERROR`); agora os dois já chegam como o errno real. */
     long r = javaos_syscall(SYS_COND_WAIT, (long)*cond, (long)*mutex, delta, 0);
     return is_syscall_error(r) ? (int)-r : 0;
+}
+
+/* __retarget_lock_* reais sobre o mutex do kernel já existente (mesmas
+ * SYS_MUTEX_* usadas por pthread_mutex_* acima) — ver change
+ * `libc-retargetable-locking`, design.md. Infraestrutura interna do
+ * retarget do newlib (`<sys/lock.h>`), nunca exposta como API pública nova
+ * para programas C deste projeto usarem diretamente — mesmo racional de
+ * `pthread_mutex_t` nunca expor o handle cru do kernel.
+ *
+ * `struct __lock` único para os casos recursivos e não-recursivos (ver
+ * design.md, "Um único struct __lock para os 8 casos") — `owner_tid`/
+ * `depth` simplesmente nunca são tocados pelas variantes não-recursivas. */
+struct __lock {
+    long mutex_handle; /* handle de SYSCALL_MUTEX_CREATE */
+    long owner_tid;    /* -1 se livre; só usado pelas variantes recursivas */
+    int depth;          /* só usado pelas variantes recursivas */
+};
+
+static long javaos_get_thread_id(void) {
+    return javaos_syscall(SYS_GET_THREAD_ID, 0, 0, 0, 0);
+}
+
+/* As 8 instâncias `extern` que o próprio newlib referencia (expandidas por
+ * `__LOCK_INIT(_RECURSIVE)` em `<sys/lock.h>`, nome do símbolo sempre
+ * `__lock_<nome>`): `__malloc_recursive_mutex` (mlock.c),
+ * `__sfp_recursive_mutex` (stdio/findfp.c), `__env_recursive_mutex`
+ * (stdlib/envlock.c), `__atexit_recursive_mutex` (stdlib/__call_atexit.c) —
+ * recursivas; `__dd_hash_mutex` (posix/telldir.c), `__at_quick_exit_mutex`
+ * (stdlib/quick_exit.c), `__tz_mutex` (time/tzlock.c), `__arc4random_mutex`
+ * (stdlib/arc4random.h) — não recursivas. `mutex_handle` preenchido por
+ * `__javaos_init_internal_locks`, chamada por `crt0.S` antes de
+ * "call main" — ver design.md, "Inicialização dos 8 struct __lock no boot
+ * do processo". */
+struct __lock __lock___malloc_recursive_mutex = {0, -1, 0};
+struct __lock __lock___sfp_recursive_mutex = {0, -1, 0};
+struct __lock __lock___env_recursive_mutex = {0, -1, 0};
+struct __lock __lock___atexit_recursive_mutex = {0, -1, 0};
+struct __lock __lock___dd_hash_mutex = {0, -1, 0};
+struct __lock __lock___at_quick_exit_mutex = {0, -1, 0};
+struct __lock __lock___tz_mutex = {0, -1, 0};
+struct __lock __lock___arc4random_mutex = {0, -1, 0};
+
+/* Chamada por crt0.S antes de "call main" — ponto em que o processo
+ * garantidamente só tem uma thread (nenhuma SYSCALL_THREAD_CREATE pode ter
+ * acontecido ainda), eliminando por construção o problema de "quem cria o
+ * lock que protege a própria criação do lock" (ver design.md, alternativa
+ * de inicialização sob demanda rejeitada). */
+void __javaos_init_internal_locks(void) {
+    struct __lock *internal_locks[] = {
+        &__lock___malloc_recursive_mutex, &__lock___sfp_recursive_mutex,
+        &__lock___env_recursive_mutex,    &__lock___atexit_recursive_mutex,
+        &__lock___dd_hash_mutex,          &__lock___at_quick_exit_mutex,
+        &__lock___tz_mutex,               &__lock___arc4random_mutex,
+    };
+    for (size_t i = 0; i < sizeof(internal_locks) / sizeof(internal_locks[0]); i++) {
+        internal_locks[i]->mutex_handle = javaos_syscall(SYS_MUTEX_CREATE, 0, 0, 0, 0);
+    }
+}
+
+/* Variantes não-recursivas: delegam direto para o mutex do kernel, sem
+ * nenhuma lógica de reentrância — usadas pelos 4 locks internos
+ * não-recursivos acima, e por qualquer `_LOCK_T` que código de aplicação
+ * declare via `__LOCK_INIT`/`__lock_init` (fora de escopo de uso real
+ * nesta change, mas precisa compilar e funcionar corretamente). */
+
+void __retarget_lock_init(_LOCK_T *lock) {
+    struct __lock *l = malloc(sizeof(struct __lock));
+    l->mutex_handle = javaos_syscall(SYS_MUTEX_CREATE, 0, 0, 0, 0);
+    l->owner_tid = -1;
+    l->depth = 0;
+    *lock = l;
+}
+
+void __retarget_lock_close(_LOCK_T lock) {
+    /* Sem liberação real do handle do kernel nem do bloco alocado — mesma
+     * disciplina de `pthread_mutex_destroy`/`kernel::pthread_handles`
+     * (Non-Goal documentado em design.md). */
+    (void)lock;
+}
+
+void __retarget_lock_acquire(_LOCK_T lock) {
+    javaos_syscall(SYS_MUTEX_LOCK, lock->mutex_handle, 0, 0, 0);
+}
+
+int __retarget_lock_try_acquire(_LOCK_T lock) {
+    long r = javaos_syscall(SYS_MUTEX_TRYLOCK, lock->mutex_handle, 0, 0, 0);
+    return is_syscall_error(r) ? 0 : 1;
+}
+
+void __retarget_lock_release(_LOCK_T lock) {
+    javaos_syscall(SYS_MUTEX_UNLOCK, lock->mutex_handle, 0, 0, 0);
+}
+
+/* Variantes recursivas: a mesma thread pode adquirir o mesmo lock
+ * repetidamente sem bloquear a si mesma — ver design.md, "Reentrância via
+ * SYSCALL_GET_THREAD_ID, não um contador por-lock ingênuo". A checagem
+ * `owner_tid == me` precisa acontecer ANTES de qualquer chamada ao mutex
+ * do kernel, que não é recursivo (a mesma thread chamando lock duas vezes
+ * bloquearia esperando a si mesma para sempre). */
+
+void __retarget_lock_init_recursive(_LOCK_T *lock) {
+    struct __lock *l = malloc(sizeof(struct __lock));
+    l->mutex_handle = javaos_syscall(SYS_MUTEX_CREATE, 0, 0, 0, 0);
+    l->owner_tid = -1;
+    l->depth = 0;
+    *lock = l;
+}
+
+void __retarget_lock_close_recursive(_LOCK_T lock) {
+    (void)lock;
+}
+
+void __retarget_lock_acquire_recursive(_LOCK_T lock) {
+    long me = javaos_get_thread_id();
+    if (lock->owner_tid == me) {
+        lock->depth++;
+        return;
+    }
+    javaos_syscall(SYS_MUTEX_LOCK, lock->mutex_handle, 0, 0, 0);
+    lock->owner_tid = me;
+    lock->depth = 1;
+}
+
+int __retarget_lock_try_acquire_recursive(_LOCK_T lock) {
+    long me = javaos_get_thread_id();
+    if (lock->owner_tid == me) {
+        lock->depth++;
+        return 1;
+    }
+    long r = javaos_syscall(SYS_MUTEX_TRYLOCK, lock->mutex_handle, 0, 0, 0);
+    if (is_syscall_error(r)) {
+        return 0;
+    }
+    lock->owner_tid = me;
+    lock->depth = 1;
+    return 1;
+}
+
+void __retarget_lock_release_recursive(_LOCK_T lock) {
+    lock->depth--;
+    if (lock->depth == 0) {
+        lock->owner_tid = -1;
+        javaos_syscall(SYS_MUTEX_UNLOCK, lock->mutex_handle, 0, 0, 0);
+    }
 }

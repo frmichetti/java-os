@@ -108,6 +108,11 @@ pub const SYSCALL_MUTEX_TRYLOCK: u64 = 22;
 /// compartilha o mesmo espaço de endereçamento do processo chamador.
 pub const SYSCALL_THREAD_CREATE: u64 = 23;
 
+/// Ver design.md da change `libc-retargetable-locking`. Sem argumentos;
+/// retorno = identificador da própria thread chamadora (`ThreadId.0`),
+/// distinto do de qualquer outra thread já criada — nunca falha.
+pub const SYSCALL_GET_THREAD_ID: u64 = 24;
+
 // ---------------------------------------------------------------------
 // Códigos de erro POSIX devolvidos por uma syscall que falha — ver
 // design.md da change `kernel-syscall-errno`, "Mapeamento de erro por
@@ -632,6 +637,13 @@ fn sys_exit() -> ! {
     crate::scheduler::terminate_current_thread()
 }
 
+/// Devolve o identificador da própria thread chamadora — cobre
+/// `SYSCALL_GET_THREAD_ID`. Nunca falha (toda thread que chega a executar
+/// uma syscall já está registrada no escalonador).
+fn sys_get_thread_id() -> u64 {
+    crate::scheduler::current_thread_id().0
+}
+
 /// Despacha uma chamada de sistema pelo número (`RAX` na entrada de
 /// `syscall`), com até quatro argumentos. Devolve o valor de retorno (`RAX`
 /// na saída) — `ENOSYS` para um número não reconhecido. `extern "C"`
@@ -668,6 +680,7 @@ unsafe extern "C" fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg
         SYSCALL_EXIT => sys_exit(),
         SYSCALL_MUTEX_TRYLOCK => sys_mutex_trylock(arg0),
         SYSCALL_THREAD_CREATE => sys_thread_create(arg0, arg1),
+        SYSCALL_GET_THREAD_ID => sys_get_thread_id(),
         _ => syscall_err(ENOSYS),
     }
 }
@@ -808,6 +821,13 @@ mod tests {
     // causaria um crash do próprio processo de teste, mesma limitação já
     // documentada para `Mapper::map`/`AddressSpace::new` (que tocam
     // `CR3`/HHDM reais). Verificado em boot real na tarefa 6.1.
+
+    // `SYSCALL_GET_THREAD_ID` não é testado aqui, por limitação análoga:
+    // `sys_get_thread_id` delega a `scheduler::current_thread_id`, que usa
+    // `with_interrupts_disabled` (`cli`/`sti`, instruções privilegiadas) —
+    // executá-la em host (anel 3) causaria o mesmo crash do processo de
+    // teste. Verificado em boot real pelos programas de teste desta change
+    // (tarefa 4).
 
     #[test]
     fn prot_to_page_flags_always_forces_user_accessible() {
