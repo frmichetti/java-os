@@ -15,7 +15,8 @@ Atualizado em 2026-11-21, após `kernel-file-syscalls`, `libc-minimal-port`,
 `kernel-fpu-context-switch`, `cxx-minimal-runtime`, `os-javaos-skeleton`,
 `os-javaos-memory-pd`, `os-javaos-platform-sync`, `libc-float-math`,
 `libc-retargetable-locking`, `pthread-create-thread`,
-`os-javaos-attach-thread` e `jvmti-generated-headers`.
+`os-javaos-attach-thread`, `jvmti-generated-headers` e
+`jimage-header-vendoring`.
 
 ## O que já está implementado (verificado em boot real)
 
@@ -569,29 +570,36 @@ Atualizado em 2026-11-21, após `kernel-file-syscalls`, `libc-minimal-port`,
     Nenhuma integração real a `GCConfig`/`universe_init()` ainda — só a
     decisão registrada e o código-fonte já existente confirmado
     compilável.
-  - **Dois achados novos, cada um seu próprio subsistema, documentados
-    como bloqueios separados** (nenhum resolvido nesta change): (1)
-    `jimage.hpp` — nunca vendorizado de `src/java.base`, bloqueia
-    `classLoader.hpp`/`universe.cpp`/`threads.cpp` e 1 dos 3
-    `jvmti*.cpp` restantes — pertence ao roadmap item 4
-    (`classfile`/`oops`); (2) `jfrfiles/jfrEventClasses.hpp` — outra
-    família de arquivo gerado, para JFR (Java Flight Recorder), incluída
+  - **Dois achados novos, cada um seu próprio subsistema**: (1)
+    ~~`jimage.hpp`~~ — **resolvido** (`jimage-header-vendoring`, ver
+    abaixo); (2) `jfrfiles/jfrEventClasses.hpp` — outra família de
+    arquivo gerado, para JFR (Java Flight Recorder), incluída
     **incondicionalmente** por `jfr/jfrEvents.hpp` (independente da
     flag `-DINCLUDE_JFR=0` já usada desde `os-javaos-skeleton`) —
-    bloqueia `thread.cpp`/`javaThread.cpp` e os outros 2
-    `jvmti*.cpp` restantes. Subsistema inteiramente novo, nunca antes
-    mapeado em nenhum lugar deste roadmap.
-- **Próximo passo imediato**: nenhuma exploração ainda, nenhuma change
-  aberta. Dois caminhos abertos pelos achados acima, de tamanhos
-  parecidos: (1) vendorizar `jimage.hpp` de `src/java.base` (acrescenta
-  a mais um arquivo pontual já vendorizado de lá, mesma convenção de
-  `os-javaos-skeleton`) — desbloqueia `classLoader.hpp`/`universe.cpp`/
-  `threads.cpp`, mas `classLoader.hpp` puxa o resto do roadmap item 4
-  (`classfile`/`oops`, ~83+125 arquivos) atrás de si; (2) mapear e gerar
-  os arquivos JFR (`jfrfiles/jfrEventClasses.hpp` e o que mais
-  `jfr/jfrEvents.hpp` exigir) — desbloqueia `thread.cpp`/`javaThread.cpp`,
-  subsistema menor e mais isolado, mas ainda não investigado em
-  profundidade (gerador/spec do JFR não conferidos nesta exploração).
+    bloqueia `thread.cpp`/`javaThread.cpp` e 2 dos 3 `jvmti*.cpp`
+    restantes. Subsistema inteiramente novo, nunca antes mapeado em
+    nenhum lugar deste roadmap — continua em aberto.
+- ~~Vendorizar `jimage.hpp` de `src/java.base`~~ — **concluído**
+  (`jimage-header-vendoring`): investigação do arquivo real (buscado do
+  repositório oficial `openjdk/jdk` na tag `jdk-27-ga`) revelou que é um
+  header pequeno e autocontido (~170 linhas) — só depende de `jni.h`
+  (já vendorizado), declara `JImageFile` como classe opaca e 4
+  `typedef`s de ponteiro de função. **Achado real**: o HotSpot nunca
+  linka contra uma implementação real de `libjimage` em tempo de
+  compilação — carrega as 4 funções em runtime via
+  `os::lookup_function`/`dll_load` (`ClassLoader::load_jimage_library`,
+  confirmado por leitura de código) — então vendorizar só o header
+  bastou, nenhuma implementação nativa necessária. Com ele presente
+  (mais uma entrada de `-I`), **`classLoader.cpp` e `universe.cpp`
+  passaram a compilar limpo** via `g++ -fsyntax-only` — ao contrário do
+  temido, isso **não** puxou o resto do roadmap item 4 (`classfile`/`oops`,
+  ~83+125 arquivos) atrás de si; era literalmente um arquivo faltando,
+  não o início de uma cascata.
+- **Próximo passo imediato**: mapear e gerar os arquivos JFR
+  (`jfrfiles/jfrEventClasses.hpp` e o que mais `jfr/jfrEvents.hpp`
+  exigir) para desbloquear `thread.cpp`/`javaThread.cpp` — subsistema
+  ainda não investigado em profundidade (gerador/spec do JFR não
+  conferidos ainda). Nenhuma exploração ainda, nenhuma change aberta.
 
 ### Longo prazo
 - Modelo híbrido de execução de JVM (runtime compartilhado vs. JVM isolada por
