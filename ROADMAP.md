@@ -14,8 +14,8 @@ prazo — rodar uma JVM e ter uma interface gráfica. Para profundidade técnica
 Atualizado em 2026-11-21, após `kernel-file-syscalls`, `libc-minimal-port`,
 `kernel-fpu-context-switch`, `cxx-minimal-runtime`, `os-javaos-skeleton`,
 `os-javaos-memory-pd`, `os-javaos-platform-sync`, `libc-float-math`,
-`libc-retargetable-locking`, `pthread-create-thread` e
-`os-javaos-attach-thread`.
+`libc-retargetable-locking`, `pthread-create-thread`,
+`os-javaos-attach-thread` e `jvmti-generated-headers`.
 
 ## O que já está implementado (verificado em boot real)
 
@@ -541,17 +541,57 @@ Atualizado em 2026-11-21, após `kernel-file-syscalls`, `libc-minimal-port`,
     `create_attached_thread` no HotSpot (JNI `AttachCurrentThread`,
     `share/prims/jni.cpp`) — `prims`/JNI é item 6 do roadmap, ainda não
     explorado; implementado só o suficiente para servir `create_main_thread`.
-- **Próximo passo imediato**: a sequência real de `vm_init_globals()`/
-  `init_globals()`/`init_globals2()` (`share/runtime/init.cpp`) — lida
-  diretamente durante a exploração desta change: ~40 subsistemas
-  encadeados (GC/heap via `universe_init`, *code cache*, geração de stubs
-  do interpretador/*runtime* compartilhado, `classLoader_init1`,
-  `compileBroker_init`, JVMTI, etc.), nenhum ainda mapeado em detalhe nem
-  escolhido. Antes de mapear essa sequência inteira, a decisão mais
-  urgente e mais barata de reverter é a escolha do coletor de lixo (item
-  6.2 abaixo, "Escolha do coletor de lixo mais simples") — `universe_init`
-  já depende dela logo na primeira chamada de `init_globals()`. Nenhuma
-  exploração ainda, nenhuma change aberta.
+- ~~Geração real dos headers JVMTI + escolha do coletor de lixo~~ —
+  **concluído** (`jvmti-generated-headers`): a exploração da sequência de
+  `vm_init_globals()`/`init_globals()`/`init_globals2()`
+  (`share/runtime/init.cpp`) revelou que o bloqueio real não era "qual
+  GC" — `universe.cpp` (necessário **independente** da escolha de GC)
+  exigia `jvmtifiles/jvmti.h`, um arquivo **gerado** do HotSpot (nunca
+  código-fonte) que nunca tinha sido produzido neste projeto, apesar do
+  gerador real (`jvmtiGen.java`) e do spec real (`jvmti.xml`) já estarem
+  vendorizados. Novo `scripts/jvmti/generate-jvmti-headers.sh` (mesma
+  convenção de `scripts/cross/build-newlib.sh`) roda esse gerador de
+  verdade, produzindo `jvmtifiles/jvmti.h`/`jvmtifiles/jvmtiEnv.hpp`
+  vendorizados (não versionados no Git). **Achado real sobre o
+  impacto**: 18 dos 21 arquivos `share/prims/jvmti*.cpp` passaram a
+  compilar limpo (`-fsyntax-only`) só com isso — incluindo
+  `jvmtiExport.cpp`, incluído transitivamente por vários arquivos
+  centrais de `share/runtime` (`thread.cpp`/`threads.cpp`/
+  `javaThread.cpp`). Nova dependência de ferramental: um JDK no `PATH`
+  do ambiente de build (instalado via `apt` nesta change —
+  `openjdk-25-jdk-headless`).
+  - **Escolha de GC confirmada**: `share/gc/epsilon` (15 arquivos, 6
+    `.cpp`) — já compilava limpo mesmo antes desta change, reconfirmado
+    aqui. Por comparação, `share/gc/serial` (29 arquivos) tem 2 de 11
+    `.cpp` bloqueados pela mesma família de arquivo gerado que bloqueava
+    `jvmtiExport.cpp` antes desta change — confirma Epsilon como a
+    escolha de menor atrito, não só de menor contagem de arquivos.
+    Nenhuma integração real a `GCConfig`/`universe_init()` ainda — só a
+    decisão registrada e o código-fonte já existente confirmado
+    compilável.
+  - **Dois achados novos, cada um seu próprio subsistema, documentados
+    como bloqueios separados** (nenhum resolvido nesta change): (1)
+    `jimage.hpp` — nunca vendorizado de `src/java.base`, bloqueia
+    `classLoader.hpp`/`universe.cpp`/`threads.cpp` e 1 dos 3
+    `jvmti*.cpp` restantes — pertence ao roadmap item 4
+    (`classfile`/`oops`); (2) `jfrfiles/jfrEventClasses.hpp` — outra
+    família de arquivo gerado, para JFR (Java Flight Recorder), incluída
+    **incondicionalmente** por `jfr/jfrEvents.hpp` (independente da
+    flag `-DINCLUDE_JFR=0` já usada desde `os-javaos-skeleton`) —
+    bloqueia `thread.cpp`/`javaThread.cpp` e os outros 2
+    `jvmti*.cpp` restantes. Subsistema inteiramente novo, nunca antes
+    mapeado em nenhum lugar deste roadmap.
+- **Próximo passo imediato**: nenhuma exploração ainda, nenhuma change
+  aberta. Dois caminhos abertos pelos achados acima, de tamanhos
+  parecidos: (1) vendorizar `jimage.hpp` de `src/java.base` (acrescenta
+  a mais um arquivo pontual já vendorizado de lá, mesma convenção de
+  `os-javaos-skeleton`) — desbloqueia `classLoader.hpp`/`universe.cpp`/
+  `threads.cpp`, mas `classLoader.hpp` puxa o resto do roadmap item 4
+  (`classfile`/`oops`, ~83+125 arquivos) atrás de si; (2) mapear e gerar
+  os arquivos JFR (`jfrfiles/jfrEventClasses.hpp` e o que mais
+  `jfr/jfrEvents.hpp` exigir) — desbloqueia `thread.cpp`/`javaThread.cpp`,
+  subsistema menor e mais isolado, mas ainda não investigado em
+  profundidade (gerador/spec do JFR não conferidos nesta exploração).
 
 ### Longo prazo
 - Modelo híbrido de execução de JVM (runtime compartilhado vs. JVM isolada por
@@ -648,13 +688,19 @@ real (`os-javaos-memory-pd`), `PlatformMutex`/`PlatformMonitor` reais
       `vm_init_globals()`/`init_globals()`/`init_globals2()`
       (`share/runtime/init.cpp`) em si, que começa pela escolha de GC
       (item 2 abaixo).
-   2. **Escolha do coletor de lixo mais simples para o primeiro porte**:
-      `share/gc/epsilon` (~15 arquivos — nunca coleta, só aloca até o heap
-      estourar, zero lógica de marcação/compactação) é o candidato mais
-      óbvio para uma primeira integração, frente a `share/gc/serial` (~29
-      arquivos, o GC "de verdade" mais simples do HotSpot). `share/gc/
-      shared` (~209 arquivos) é a base comum inevitável com qualquer
-      escolha.
+   2. ~~Escolha do coletor de lixo mais simples para o primeiro porte~~ —
+      **concluído** (`jvmti-generated-headers`): `share/gc/epsilon` (15
+      arquivos — nunca coleta, só aloca até o heap estourar, zero lógica
+      de marcação/compactação) confirmado e registrado como a escolha,
+      com todos os 6 arquivos `.cpp` verificados por compilação real
+      contra a árvore vendorizada. Frente a `share/gc/serial` (29
+      arquivos, o GC "de verdade" mais simples do HotSpot, mas com 2 de
+      11 `.cpp` bloqueados por uma família de arquivo gerado que também
+      bloqueava JVMTI). `share/gc/shared` (~209 arquivos) continua a
+      base comum inevitável com qualquer escolha. **Ainda não
+      integrado** a `GCConfig`/`universe_init()` de verdade — só a
+      decisão registrada e o código-fonte já existente confirmado
+      compilável (ver "Próximo passo imediato" acima).
    3. **Interpretador**: `share/interpreter` (~36 arquivos —
       `templateInterpreter`/`templateTable`) é a infraestrutura do
       interpretador **com geração de código de máquina**, usada pelos
