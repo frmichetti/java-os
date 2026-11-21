@@ -1,5 +1,41 @@
 # Known Issues
 
+## Testes de `kernel::acpi` sobre `ISA_IRQ_OVERRIDES` falham de forma intermitente quando rodados em paralelo (ABERTO)
+
+**Status:** descoberto durante a verificação em boot real da change `pthread-create-thread`, ao rodar `cargo test -p kernel --lib` repetidamente (nenhuma relação com o código desta change — `kernel::acpi` não foi tocado). Causa raiz pré-existente desde `kernel-acpi-madt`, nunca corrigida — registrado aqui, não corrigido, por estar fora do escopo de `pthread-create-thread`.
+
+**Sintoma observado:** `cargo test -p kernel --lib` falha de forma não determinística com:
+```
+test acpi::tests::resolve_isa_irq_gsi_identity_maps_when_no_override_is_registered ... FAILED
+```
+Rodar exatamente esse teste sozinho (`cargo test ... resolve_isa_irq_gsi_identity_maps_when_no_override_is_registered -- --test-threads=1`) sempre passa — a falha só aparece quando a suíte completa roda com o paralelismo padrão do harness de testes do Rust (múltiplas threads de host, não relacionado a `cli`/`sti` nem a qualquer instrução privilegiada).
+
+**Causa raiz (confirmada por leitura de código):** `kernel::acpi::tests` tem três testes que compartilham o mesmo `static ISA_IRQ_OVERRIDES: Mutex<[Option<u8>; 16]>` sem nenhum isolamento entre si:
+```rust
+#[test]
+fn resolve_isa_irq_gsi_identity_maps_when_no_override_is_registered() {
+    *ISA_IRQ_OVERRIDES.lock() = [None; 16];
+    assert_eq!(resolve_isa_irq_gsi(1), 1);
+}
+
+#[test]
+fn resolve_isa_irq_gsi_uses_the_registered_override() {
+    let mut overrides = [None; 16];
+    overrides[1] = Some(9);
+    *ISA_IRQ_OVERRIDES.lock() = overrides;
+    assert_eq!(resolve_isa_irq_gsi(1), 9);
+    assert_eq!(resolve_isa_irq_gsi(2), 2);
+    *ISA_IRQ_OVERRIDES.lock() = [None; 16];
+}
+```
+Como o harness de testes do Rust roda os testes de um mesmo binário em threads concorrentes por padrão, `resolve_isa_irq_gsi_uses_the_registered_override` pode gravar `overrides[1] = Some(9)` exatamente na janela entre a gravação de `[None; 16]` e a leitura (`resolve_isa_irq_gsi(1)`) de `resolve_isa_irq_gsi_identity_maps_when_no_override_is_registered`, rodando numa thread diferente — fazendo o segundo observar `9` em vez de `1` e falhar. O `Mutex` protege contra corrupção de dados (nunca lê um estado parcialmente escrito), mas não contra essa intercalação lógica entre testes — cada um assume, incorretamente, posse exclusiva do estado global entre sua própria escrita e sua própria leitura.
+
+**Correção NÃO aplicada (fora de escopo desta change)** — abordagens possíveis para quando alguém priorizar isto:
+1. Um lock dedicado só para teste (`#[test]` + um `Mutex` de serialização entre os três testes deste grupo), ou
+2. Reescrever `resolve_isa_irq_gsi` para aceitar o estado de overrides como parâmetro explícito (em vez de ler de um `static` global), eliminando o estado compartilhado por completo — mudança mais invasiva, provavelmente a correção "certa" a longo prazo, mas fora do escopo de qualquer change atual.
+
+**Nota metodológica para investigações futuras:** uma falha nesta função específica (ou em `resolve_isa_irq_gsi_uses_the_registered_override`) em `cargo test -p kernel --lib`, que desaparece ao rodar o teste isolado ou com `--test-threads=1`, é esta causa já conhecida — não um bug introduzido pela mudança que estava sendo testada no momento.
+
 ## ~~Rótulos de dados sem prefixo em `global_asm!` colidem entre diferentes programas de teste de modo usuário~~ (RESOLVIDO)
 
 **Status:** descoberto durante a implementação da change `kernel-fpu-context-switch` (ver `openspec/changes/kernel-fpu-context-switch/design.md`), ao rodar `cargo test -p kernel --lib` depois de uma mudança em `kernel/src/lib.rs` (adição de `pub mod fpu;`) invalidar o cache incremental e forçar uma recompilação completa. **Corrigido** na mesma sessão (tarefa de pré-requisito antes do restante da change poder ser verificada).

@@ -192,6 +192,15 @@ const ABI_ALIGNMENT_PAD: u64 = 8;
 /// `stack_top` (ver [`init_kernel_stack`]); para uma thread de modo
 /// usuário, o topo de uma stack de usuário separada.
 ///
+/// `arg` é o valor gravado no slot de `RDI` (índice `i = 5` do laço abaixo,
+/// na mesma ordem `rax, rbx, rcx, rdx, rsi, rdi, rbp, r8..r15` empilhada
+/// por `kernel::scheduler::timer_entry`/`block_entry`) — o primeiro
+/// registrador que a thread enxerga assim que começa a executar, pela
+/// convenção SysV de "primeiro argumento de uma função chamada". `0`
+/// preserva o comportamento de antes desta change (`libc-pthread-create`
+/// via `kernel-user-thread-create`'s `SYSCALL_THREAD_CREATE`): os demais 14
+/// registradores continuam sempre zerados.
+///
 /// # Safety
 /// `stack_top` deve ser o topo de uma stack de kernel mapeada e exclusiva
 /// desta thread, com pelo menos `HW_FRAME_SIZE + SAVED_GPR_COUNT * 8` bytes
@@ -199,8 +208,9 @@ const ABI_ALIGNMENT_PAD: u64 = 8;
 /// endereço válido para uso como stack (de kernel ou de usuário, conforme
 /// `cs`/`ss`) assim que `entry` começar a executar. `entry` deve apontar
 /// para código válido e executável com o privilégio de `cs`.
-pub unsafe fn init_stack(stack_top: u64, entry: u64, cs: u16, ss: u16, landing_rsp: u64) -> u64 {
+pub unsafe fn init_stack(stack_top: u64, entry: u64, cs: u16, ss: u16, landing_rsp: u64, arg: u64) -> u64 {
     let frame_size = HW_FRAME_SIZE + SAVED_GPR_COUNT * 8;
+    const RDI_INDEX: u64 = 5;
 
     unsafe {
         ((stack_top - 8) as *mut u64).write(ss as u64);
@@ -209,7 +219,8 @@ pub unsafe fn init_stack(stack_top: u64, entry: u64, cs: u16, ss: u16, landing_r
         ((stack_top - 32) as *mut u64).write(cs as u64);
         ((stack_top - 40) as *mut u64).write(entry);
         for i in 0..SAVED_GPR_COUNT {
-            ((stack_top - 48 - i * 8) as *mut u64).write(0);
+            let value = if i == RDI_INDEX { arg } else { 0 };
+            ((stack_top - 48 - i * 8) as *mut u64).write(value);
         }
     }
 
@@ -219,13 +230,15 @@ pub unsafe fn init_stack(stack_top: u64, entry: u64, cs: u16, ss: u16, landing_r
 /// Conveniência para o caso mais comum (uma thread de kernel, que executa
 /// com os seletores de kernel sobre a própria stack de kernel): calcula o
 /// `landing_rsp` já ajustado para o alinhamento de ABI (ver
-/// `ABI_ALIGNMENT_PAD`) e delega a [`init_stack`].
+/// `ABI_ALIGNMENT_PAD`) e delega a [`init_stack`]. Threads de kernel nunca
+/// recebem argumento (sempre `arg = 0`) — só threads de usuário criadas via
+/// `SYSCALL_THREAD_CREATE` podem (ver [`create_user_thread`]).
 ///
 /// # Safety
 /// Mesmos requisitos de [`init_stack`].
 pub unsafe fn init_kernel_stack(stack_top: u64, entry: extern "C" fn() -> !) -> u64 {
     unsafe {
-        init_stack(stack_top, entry as *const () as u64, KERNEL_CODE_SELECTOR, KERNEL_DATA_SELECTOR, stack_top - ABI_ALIGNMENT_PAD)
+        init_stack(stack_top, entry as *const () as u64, KERNEL_CODE_SELECTOR, KERNEL_DATA_SELECTOR, stack_top - ABI_ALIGNMENT_PAD, 0)
     }
 }
 
@@ -324,6 +337,7 @@ fn create_user_thread<S: FrameStore>(
     user_stack_virt_base: u64,
     user_stack_size: u64,
     tls_template: Option<&TlsTemplate>,
+    arg: u64,
 ) -> Result<Thread, ProcessError> {
     let kernel_stack_top = stack::alloc_thread_stack(frame_allocator)?;
 
@@ -343,7 +357,7 @@ fn create_user_thread<S: FrameStore>(
     };
 
     let rsp = unsafe {
-        init_stack(kernel_stack_top, entry, USER_CODE_SELECTOR, USER_DATA_SELECTOR, user_stack_top - ABI_ALIGNMENT_PAD)
+        init_stack(kernel_stack_top, entry, USER_CODE_SELECTOR, USER_DATA_SELECTOR, user_stack_top - ABI_ALIGNMENT_PAD, arg)
     };
     let id = next_thread_id();
     Ok(Thread { id, process, context: Context { rsp, kernel_stack_top, address_space_root: root, fpu_state: 0, syscall_rsp_slot: 0, timed_out: false, process, tls_base } })
@@ -393,6 +407,7 @@ impl Process {
         user_stack_virt_base: u64,
         user_stack_size: u64,
         tls_template: Option<TlsTemplate>,
+        arg: u64,
     ) -> Result<(Process, Thread), ProcessError> {
         let process_id = next_process_id();
         let root = address_space.root();
@@ -404,6 +419,7 @@ impl Process {
             user_stack_virt_base,
             user_stack_size,
             tls_template.as_ref(),
+            arg,
         )?;
         let process = Process { id: process_id, address_space, threads: alloc::vec![thread.id], tls_template };
         Ok((process, thread))
@@ -432,6 +448,7 @@ impl Process {
         entry: u64,
         user_stack_virt_base: u64,
         user_stack_size: u64,
+        arg: u64,
     ) -> Result<Thread, ProcessError> {
         let root = self.address_space.root();
         let thread = create_user_thread(
@@ -442,6 +459,7 @@ impl Process {
             user_stack_virt_base,
             user_stack_size,
             self.tls_template.as_ref(),
+            arg,
         )?;
         self.threads.push(thread.id);
         Ok(thread)
@@ -490,6 +508,7 @@ mod tests {
                 USER_CODE_SELECTOR,
                 USER_DATA_SELECTOR,
                 user_landing_rsp,
+                0,
             )
         };
 
@@ -501,6 +520,32 @@ mod tests {
         assert_eq!(read_u64(kernel_stack_top - 8) & 0x3, 3, "SS deve ter RPL 3");
         assert_eq!(read_u64(kernel_stack_top - 16), user_landing_rsp, "RSP do frame deve apontar para a stack de usuario, nao a de kernel");
         assert_eq!(saved_rsp, kernel_stack_top - (HW_FRAME_SIZE + SAVED_GPR_COUNT * 8), "rsp salvo continua na stack de kernel");
+    }
+
+    #[test]
+    fn init_stack_writes_arg_at_the_rdi_slot_and_zeroes_the_other_fourteen() {
+        // Mesma ordem de push/pop de timer_entry/block_entry (scheduler.rs):
+        // rax, rbx, rcx, rdx, rsi, rdi, rbp, r8..r15 - RDI e' o indice 5. Ver
+        // design.md da change `pthread-create-thread`.
+        let mut buf = alloc::vec![0xAAu8; 4096];
+        let stack_top = buf.as_mut_ptr() as u64 + buf.len() as u64;
+        let arg = 0xdead_beef_1234_5678u64;
+
+        unsafe {
+            init_stack(stack_top, dummy_entry as *const () as u64, USER_CODE_SELECTOR, USER_DATA_SELECTOR, stack_top - ABI_ALIGNMENT_PAD, arg)
+        };
+
+        let read_u64 = |addr: u64| unsafe { (addr as *const u64).read() };
+        const RDI_INDEX: u64 = 5;
+
+        for i in 0..SAVED_GPR_COUNT {
+            let value = read_u64(stack_top - 48 - i * 8);
+            if i == RDI_INDEX {
+                assert_eq!(value, arg, "slot de RDI (indice {i}) deve conter o arg informado");
+            } else {
+                assert_eq!(value, 0, "registrador de indice {i} (!= RDI) deve continuar zerado");
+            }
+        }
     }
 
     #[test]

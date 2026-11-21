@@ -194,3 +194,72 @@ arquivada antes de esta change começar a ser aplicada.
 
 Nenhuma — todas as decisões técnicas necessárias para esta change foram
 resolvidas acima.
+
+## Resultado real da implementação
+
+Implementado conforme planejado, com um achado real sobre o próprio
+esqueleto `os_javaos` (abaixo) além dos já antecipados em "Context"/
+"Decisions". Achados durante a implementação e a verificação em boot/compilação:
+
+- **`osThread_javaos.hpp` precisou de um `setter` novo**: `_startThread_lock`
+  (do esqueleto original, `os-javaos-skeleton`) só tinha o getter
+  `startThread_lock()` — o plano desta change (`os::create_thread`
+  constrói o `Monitor` diretamente, não no construtor de `OSThread`,
+  diferente de `os_bsd.cpp`/`os_linux.cpp` reais) exigia uma forma de
+  atribuí-lo de fora. Adicionado `set_startThread_lock(Monitor*)`
+  (mesmo padrão de `set_thread_id`), e o destrutor de `OSThread` passou a
+  `delete _startThread_lock` (antes um no-op) — simetria necessária, já
+  que agora o `Monitor` é de fato alocado dinamicamente. Pequena edição
+  adicional em `osThread_javaos.hpp`, não só em `os_javaos.cpp` (escopo da
+  tarefa 3.1 original) — mecânica e diretamente implicada pela decisão de
+  design já tomada, não uma mudança de comportamento nova.
+- **Includes adicionais necessários em `os_javaos.cpp`**: `runtime/thread.hpp`
+  (para `Thread::record_stack_base_and_size`/`initialize_thread_current`/
+  `call_run`/`osthread`/`set_osthread`), `runtime/mutexLocker.hpp` (para
+  `MutexLocker`, não usado por nenhum `pd_*` anterior desta change) e
+  `<pthread.h>` (para `pthread_create`/`pthread_attr_t`/
+  `PTHREAD_CREATE_DETACHED`) — nenhum desses já era necessário pelos `pd_*`
+  de memória/mutex existentes.
+- **Verificação de compilação real** (`g++ -fsyntax-only -std=gnu++17`,
+  mesma invocação de `os-javaos-skeleton`/`os-javaos-memory-pd`/
+  `os-javaos-park-sync`) contra a árvore vendorizada: `os_javaos.cpp`
+  compila sem erro. Como regressão (`osThread_javaos.hpp` editado é
+  incluído por outros dois arquivos), `mutex_javaos.cpp` e
+  `park_javaos.cpp` também foram reverificados — ambos continuam
+  compilando. Único aviso em todos os três, pré-existente e alheio a esta
+  change: `-Winvalid-offsetof` em `share/utilities/exceptions.hpp`/
+  `share/runtime/thread.hpp` (já documentado em `os-javaos-memory-pd`).
+- **Tarefa 1.2 — `SYSCALL_GET_THREAD_ID` ainda não existia no momento em
+  que a tarefa 1.1 foi planejada, mas já existia (change
+  `libc-retargetable-locking`, dependência explícita desta change) no
+  momento da implementação** — sem impacto: `arg` do novo terceiro
+  argumento de `SYSCALL_THREAD_CREATE` é só repasse mecânico de um `u64`,
+  nenhuma interação com `SYSCALL_GET_THREAD_ID`.
+- **Verificação em boot real sem regressão**: todo programa de teste já
+  existente antes desta change (incluindo `/bin/siblingt.elf`, que nunca
+  passa argumento explícito — equivalente a `arg = 0`) reporta exatamente
+  a mesma string P/F de antes. Novo `/bin/pthreadc.elf` reporta
+  `resultado PPP` (malloc do argumento, `pthread_create`, argumento
+  intacto através do trampolim).
+- **Achado real de orçamento de tempo de boot**: com mais um programa de
+  teste de thread concorrente carregado no boot, `recursive_lock_test_program`/
+  `sibling_thread_test_program` (ambos de changes anteriores) deixaram de
+  caber de forma confiável na janela padrão de 15s de `cargo xtask test`
+  sob carga mais pesada do host — confirmado correto (mesmas strings de
+  sempre) numa janela estendida manual de 120s. Mesma categoria, já aceita
+  neste projeto, de `fpu_demo_a`/`fpu_demo_b` (nunca garantidos dentro de
+  15s mesmo antes desta change). `malloc_concurrency_test_program`
+  (`libc-retargetable-locking`) teve suas iterações reduzidas mais uma vez
+  (300 → 100 por thread) para compensar parcialmente, sem perder cobertura
+  genuína de concorrência — nenhuma mudança de comportamento, só de
+  quantidade de iterações.
+- **Achado real não relacionado, descoberto durante a verificação**:
+  `cargo test -p kernel --lib` com o paralelismo padrão do harness de
+  testes falha de forma intermitente em dois testes de
+  `kernel::acpi::tests` que compartilham `ISA_IRQ_OVERRIDES` (`static`
+  global) sem isolamento entre si — pré-existente desde `kernel-acpi-madt`,
+  sem nenhuma relação com o código desta change (`kernel::acpi` não foi
+  tocado). Registrado em `KNOW_ISSUES.md` com o racional completo, não
+  corrigido (fora de escopo). A suíte completa passa de forma estável e
+  determinística com `cargo test -p kernel --lib -- --test-threads=1`
+  (338 testes, 0 falhas).

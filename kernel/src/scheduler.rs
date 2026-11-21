@@ -425,9 +425,10 @@ pub(crate) fn spawn_user_thread_in_process<S: FrameStore>(
     entry: u64,
     user_stack_virt_base: u64,
     user_stack_size: u64,
+    arg: u64,
 ) -> Option<Result<ThreadId, ProcessError>> {
     with_process_mut(process_id, |process| {
-        process.spawn_user_thread(frame_allocator, entry, user_stack_virt_base, user_stack_size)
+        process.spawn_user_thread(frame_allocator, entry, user_stack_virt_base, user_stack_size, arg)
     })
     .map(|result| result.map(register_thread))
 }
@@ -475,6 +476,7 @@ pub fn spawn_user_demo<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>) -
         USER_DEMO_STACK_VIRT,
         USER_DEMO_STACK_SIZE,
         None,
+        0,
     )?;
     let thread_id = register_thread(thread);
     with_interrupts_disabled(|| PROCESSES.lock().push(process));
@@ -518,6 +520,7 @@ pub fn spawn_user_posix_demo<S: FrameStore>(frame_allocator: &mut FrameAllocator
         USER_POSIX_DEMO_STACK_VIRT,
         USER_POSIX_DEMO_STACK_SIZE,
         None,
+        0,
     )?;
     let thread_id = register_thread(thread);
     with_interrupts_disabled(|| PROCESSES.lock().push(process));
@@ -559,6 +562,7 @@ pub fn spawn_file_syscalls_demo<S: FrameStore>(frame_allocator: &mut FrameAlloca
         FILE_SYSCALLS_DEMO_STACK_VIRT,
         FILE_SYSCALLS_DEMO_STACK_SIZE,
         None,
+        0,
     )?;
     let thread_id = register_thread(thread);
     with_interrupts_disabled(|| PROCESSES.lock().push(process));
@@ -610,6 +614,7 @@ pub fn spawn_exit_demo<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>) -
         EXIT_DEMO_STACK_VIRT,
         EXIT_DEMO_STACK_SIZE,
         None,
+        0,
     )?;
     let thread_id = register_thread(thread);
     with_interrupts_disabled(|| PROCESSES.lock().push(process));
@@ -733,6 +738,14 @@ pub const MALLOC_CONCURRENCY_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_
 pub const RECURSIVE_LOCK_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_1500_0000_0000;
 pub const RECURSIVE_LOCK_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
 
+/// Endereço virtual, na metade inferior, onde a stack de usuário (da
+/// thread **principal**) do executável de teste de `pthread_create` real
+/// (`/bin/pthreadc.elf`, change `pthread-create-thread`) é mapeada — mesmo
+/// papel de `RECURSIVE_LOCK_TEST_PROGRAM_STACK_VIRT`, endereço distinto só
+/// por clareza em despejos de depuração.
+pub const PTHREAD_CREATE_TEST_PROGRAM_STACK_VIRT: u64 = 0x0000_1600_0000_0000;
+pub const PTHREAD_CREATE_TEST_PROGRAM_STACK_SIZE: u64 = crate::paging::PAGE_SIZE;
+
 /// Endereços virtuais das duas variantes de `kernel::fpu_demo` (change
 /// `kernel-fpu-context-switch`) — mesma faixa baixa e mesmo racional de
 /// `EXIT_DEMO_CODE_VIRT`/`LIBC_TEST_PROGRAM_STACK_VIRT` (bem abaixo do
@@ -765,7 +778,7 @@ pub fn spawn_fpu_demo<S: FrameStore>(frame_allocator: &mut FrameAllocator<S>) ->
         unsafe { copy_fn(code_hhdm_addr) };
 
         let (process, thread) =
-            Process::finish_new_user(frame_allocator, address_space, code_virt, stack_virt, FPU_DEMO_STACK_SIZE, None)?;
+            Process::finish_new_user(frame_allocator, address_space, code_virt, stack_virt, FPU_DEMO_STACK_SIZE, None, 0)?;
         let thread_id = register_thread(thread);
         with_interrupts_disabled(|| PROCESSES.lock().push(process));
         Ok(thread_id)
@@ -839,6 +852,7 @@ pub fn spawn_from_elf<S: FrameStore>(
         user_stack_virt_base,
         user_stack_size,
         tls_template,
+        0,
     )
     .map_err(crate::elf::ElfError::Process)?;
     let thread_id = register_thread(thread);

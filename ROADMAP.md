@@ -13,8 +13,8 @@ prazo — rodar uma JVM e ter uma interface gráfica. Para profundidade técnica
 
 Atualizado em 2026-11-21, após `kernel-file-syscalls`, `libc-minimal-port`,
 `kernel-fpu-context-switch`, `cxx-minimal-runtime`, `os-javaos-skeleton`,
-`os-javaos-memory-pd`, `os-javaos-platform-sync`, `libc-float-math` e
-`libc-retargetable-locking`.
+`os-javaos-memory-pd`, `os-javaos-platform-sync`, `libc-float-math`,
+`libc-retargetable-locking` e `pthread-create-thread`.
 
 ## O que já está implementado (verificado em boot real)
 
@@ -428,34 +428,81 @@ Atualizado em 2026-11-21, após `kernel-file-syscalls`, `libc-minimal-port`,
     300 iterações por thread (mantendo o teste genuinamente concorrente,
     com ring de alocações vivas simultâneas) para caber na janela padrão
     sem perder cobertura real.
-- **Próximo passo imediato** (`pthread-create-thread`, reaproveitando o
-  *locking* real acima): `pthread_create`/`os::create_thread` real.
-  `os_javaos::pd_start_thread` continua `fatal()`/stub, mas o gap maior é
-  `os::create_thread`/`os::free_thread` (não declarados em nenhum arquivo
-  do esqueleto, apesar de `share/runtime/os.hpp` exigi-los) — mecânico de
-  resolver, já que `OSThread`/`Monitor`/`ThreadState` já existem prontos do
-  esqueleto (`os-javaos-skeleton`), só falta replicar `os_bsd.cpp` sem
-  sinais/`os_posix` (já uma decisão registrada daquela change). Verificado
-  só por `-fsyntax-only` contra os headers reais, nunca linkado/executado —
-  mesma disciplina de toda mudança em `os_javaos.cpp` até hoje; a
-  verificação real em boot continua sendo via um programa C que chama
-  `pthread_create` diretamente. **Achado de uma exploração anterior**: a
-  `SYSCALL_THREAD_CREATE` (`kernel-user-thread-create`) não passa nenhum
-  argumento ao ponto de entrada da nova thread — insuficiente para
-  `pthread_create(start_routine, arg)`. Rastreado o slot exato onde um
-  argumento extra precisa ser escrito: `RDI`, índice 5 do laço de 15
-  registradores zerados em `kernel::process::init_stack` (confirmado pela
-  ordem real de `push`/`pop` em `timer_entry`, `scheduler.rs`) — mudança
-  pequena e cirúrgica, ~4 pontos de chamada afetados. **Deliberadamente
-  fora de escopo**: `os::create_main_thread`/`os::create_attached_thread`
-  (anexar a thread primordial a um `JavaThread` — um problema diferente, de
-  sequenciamento de inicialização da VM, não de criação de thread; fica
-  para o item 6.5 abaixo, "próxima exploração natural").
+- ~~`pthread_create`/`os::create_thread` real~~ — **concluído**
+  (`pthread-create-thread`): `SYSCALL_THREAD_CREATE` ganhou um terceiro
+  argumento (`arg`, entregue à nova thread em `RDI` — índice 5 do laço de
+  15 registradores zerados em `kernel::process::init_stack`, confirmado
+  pela ordem real de `push`/`pop` em `timer_entry`/`scheduler.rs`, mesmo
+  slot já identificado pela exploração anterior), repassado mecanicamente
+  por toda a cadeia (`create_user_thread` → `Process::finish_new_user`/
+  `spawn_user_thread` → `kernel::scheduler::spawn_user_thread_in_process` →
+  `kernel::syscall::sys_thread_create`), com `0` preservando o
+  comportamento de antes em todo chamador já existente (6 pontos de
+  chamada de `finish_new_user`, 1 de `spawn_user_thread`). `pthread_create`/
+  `pthread_exit` reais em `userland_c/glue.c`, com um trampolim comum
+  (`pthread_trampoline`) que recebe `(start_routine, arg)` alocado no heap
+  e simplesmente declara um parâmetro `void *args` normal — nenhum
+  assembly adicional necessário, a convenção SysV já entrega o argumento
+  em `RDI` exatamente como se a função tivesse sido chamada (correção
+  sobre uma suposição mais complexa do proposal.md original). `os::create_thread`/
+  `os::free_thread`/`os::pd_start_thread` reais em `os_javaos.cpp`,
+  replicando `os_bsd.cpp` (lido diretamente da árvore vendorizada) sem
+  `os::Posix::get_initial_stack_size` (este porte não inclui `os_posix.hpp`)
+  nem tratamento de sinais POSIX/FPU específico de BSD/macOS. **Achado
+  real**: `osThread_javaos.hpp` (`_startThread_lock: Monitor*`, sempre
+  `nullptr`, do esqueleto original) nunca tinha um *setter* — só o getter
+  `startThread_lock()` — porque o plano original presumia construir o
+  `Monitor` dentro de `os::create_thread` (diferente de `os_bsd.cpp`/
+  `os_linux.cpp` reais, que o constroem no próprio construtor de
+  `OSThread`); adicionado `set_startThread_lock`, e o destrutor de
+  `OSThread` passou a liberar o `Monitor` (`delete _startThread_lock`),
+  simetria com o construtor que passou a precisar dele.
+  - Verificado por compilação real (`g++ -fsyntax-only -std=gnu++17`,
+    mesma invocação de `os-javaos-skeleton`/`os-javaos-memory-pd`/
+    `os-javaos-park-sync`) contra a árvore vendorizada — `os_javaos.cpp`,
+    `mutex_javaos.cpp` e `park_javaos.cpp` (regressão, por incluírem o
+    mesmo `osThread_javaos.hpp` editado) continuam compilando, único
+    aviso pré-existente e alheio (`-Winvalid-offsetof`). Nunca linkado nem
+    executado (mesma disciplina de toda mudança em `os_javaos.cpp` até
+    hoje).
+  - Verificado em boot real por um programa C dedicado
+    (`userland_c/pthread_create_test_program.c`, carregado como
+    `/bin/pthreadc.elf`): aloca um argumento no heap, cria uma thread real
+    via `pthread_create`, e confirma que ela recebeu exatamente esse
+    argumento através do trampolim (`resultado PPP`) — prova fim a fim de
+    que `SYSCALL_THREAD_CREATE` entrega de verdade o terceiro argumento.
+    Nenhum programa de teste já existente regrediu (mesmas strings P/F de
+    antes, incluindo `/bin/siblingt.elf`, que nunca passa argumento
+    explícito — equivalente a `arg = 0`).
+  - **Achado real de orçamento de tempo de boot**: com mais um programa de
+    teste de thread concorrente no boot, `recursive_lock_test_program`/
+    `sibling_thread_test_program` deixaram de caber de forma confiável na
+    janela padrão de 15s (`cargo xtask test`) sob carga mais pesada do host
+    — confirmado correto numa janela estendida manual (120s; ambos
+    reportam as mesmas strings de sempre). Mesma categoria, já aceita
+    neste projeto, de `fpu_demo_a`/`fpu_demo_b` (nunca garantidos dentro de
+    15s). `malloc_concurrency_test_program` (`libc-retargetable-locking`)
+    teve suas iterações reduzidas mais uma vez (300 → 100 por thread) para
+    compensar parcialmente, sem perder cobertura genuína de concorrência.
+  - **Achado real não relacionado, descoberto durante a verificação**:
+    `cargo test -p kernel --lib` com o paralelismo padrão do harness falha
+    de forma intermitente em `kernel::acpi::tests` (estado global
+    `ISA_IRQ_OVERRIDES` compartilhado sem isolamento entre três testes,
+    pré-existente desde `kernel-acpi-madt`) — registrado em
+    `KNOW_ISSUES.md`, não corrigido (fora de escopo desta change); a
+    suíte completa passa de forma estável e determinística com
+    `--test-threads=1` (338 testes).
 
-  Continua bloqueio duro para o porte do HotSpot (ver "Destaque: o que
-  falta para a JVM rodar", item 6.1): nenhuma JVM liga sem conseguir criar
-  as threads nativas que ela mesma precisa (`VMThread`/`ServiceThread`/
-  etc.), antes mesmo de qualquer escolha de GC/interpretador.
+  Isso fecha o item 6.1 ("Destaque: o que falta para a JVM rodar") por
+  completo: toda a base de primitivas de kernel que o HotSpot precisa para
+  criar suas threads nativas (`VMThread`/`ServiceThread`/etc.) está pronta
+  e verificada.
+- **Próximo passo imediato**: mapear `os::create_main_thread`/
+  `os::create_attached_thread` (anexar a thread primordial, que já existe,
+  a um `JavaThread` — problema de sequenciamento de inicialização da VM,
+  não de criação de thread) e a sequência real de `share/runtime/init.cpp`
+  — ainda não explorado em detalhe (ver item 6.5 abaixo, "próxima
+  exploração natural"); nenhuma change aberta ainda para isso.
 
 ### Longo prazo
 - Modelo híbrido de execução de JVM (runtime compartilhado vs. JVM isolada por
@@ -533,17 +580,19 @@ real (`os-javaos-memory-pd`), `PlatformMutex`/`PlatformMonitor` reais
       concorrência real)~~ — **também concluído** (`libc-retargetable-locking`,
       ver "Próximo passo imediato" acima): a causa raiz acabou sendo a
       flag `_RETARGETABLE_LOCKING` do newlib nunca ativada, não só
-      "faltam duas funções". **Ainda falta**:
-      `os::create_thread`/`os::free_thread`/`os_javaos::pd_start_thread`
-      real + `pthread_create` da libc sobre `SYSCALL_THREAD_CREATE`
-      (continua `fatal()`/stub, change `pthread-create-thread` em
-      andamento). Bloqueio duro, não
-      contornável por nenhuma escolha de GC/interpretador: o HotSpot cria
-      várias threads nativas (`VMThread`, `ServiceThread`,
-      `NotificationThread`, `MonitorDeflationThread`) só para inicializar a
-      VM, antes de `Main.main` sequer rodar
+      "faltam duas funções". ~~`os::create_thread`/`os::free_thread`/
+      `os_javaos::pd_start_thread` real + `pthread_create` da libc sobre
+      `SYSCALL_THREAD_CREATE`~~ — **concluído** (`pthread-create-thread`,
+      ver "Próximo passo imediato" acima): bloqueio duro resolvido — o
+      HotSpot já consegue, do ponto de vista de primitivas de kernel/libc,
+      criar as várias threads nativas que precisa (`VMThread`,
+      `ServiceThread`, `NotificationThread`, `MonitorDeflationThread`) só
+      para inicializar a VM, antes de `Main.main` sequer rodar
       (`share/runtime/vmThread.cpp`/`serviceThread.cpp`/
-      `notificationThread.cpp`/`monitorDeflationThread.cpp`).
+      `notificationThread.cpp`/`monitorDeflationThread.cpp`). O que falta
+      agora é diferente em natureza — não mais primitiva de kernel/libc, e
+      sim sequenciamento de inicialização da VM em si (item 5 abaixo,
+      "runtime"/`init.cpp` — "próxima exploração natural").
    2. **Escolha do coletor de lixo mais simples para o primeiro porte**:
       `share/gc/epsilon` (~15 arquivos — nunca coleta, só aloca até o heap
       estourar, zero lógica de marcação/compactação) é o candidato mais

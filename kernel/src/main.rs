@@ -615,6 +615,24 @@ extern "C" fn continue_boot() -> ! {
             },
             Err(e) => kernel::serial_println!("recursive_lock: falha ao montar sistema de arquivos: {:?}", e),
         }
+        // Verificação de `pthread_create` real (change
+        // `pthread-create-thread`) — prova que a API POSIX padrão (sobre
+        // `SYSCALL_THREAD_CREATE` estendida com um terceiro argumento)
+        // entrega intacto, através do trampolim de `glue.c`, um argumento
+        // não-trivial informado pelo chamador.
+        match kernel::fat32::mount_boot_partition() {
+            Ok(fs) => match kernel::scheduler::spawn_from_elf(
+                &mut frame_allocator,
+                &fs,
+                "/bin/pthreadc.elf",
+                kernel::scheduler::PTHREAD_CREATE_TEST_PROGRAM_STACK_VIRT,
+                kernel::scheduler::PTHREAD_CREATE_TEST_PROGRAM_STACK_SIZE,
+            ) {
+                Ok(_) => kernel::serial_println!("pthread_create: /bin/pthreadc.elf carregado e em execucao"),
+                Err(e) => kernel::serial_println!("pthread_create: falha ao carregar /bin/pthreadc.elf: {:?}", e),
+            },
+            Err(e) => kernel::serial_println!("pthread_create: falha ao montar sistema de arquivos: {:?}", e),
+        }
         // Thread de demonstração do teclado (ver `design.md` da change
         // `kernel-keyboard`): compartilha o espaço de endereçamento da
         // thread de boot (não precisa de isolamento próprio), evitando uma

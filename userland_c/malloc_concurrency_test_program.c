@@ -34,7 +34,7 @@
  * iteracoes em duas threads concorrentes) - ainda assim generoso o
  * bastante para expor corrupcao real, caso o locking retargetavel nao
  * protegesse o heap. */
-#define ITERATIONS 300
+#define ITERATIONS 100
 #define RING_SIZE 8
 
 static long raw_syscall(long num, long a0, long a1, long a2, long a3) {

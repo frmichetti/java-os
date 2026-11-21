@@ -103,7 +103,10 @@ pub const SYSCALL_MUTEX_TRYLOCK: u64 = 22;
 /// entrada (endereço virtual, dentro de uma página executável e acessível
 /// a partir do modo usuário no processo chamador); `arg1` = tamanho
 /// pedido para a stack de usuário da nova thread (`0 < arg1 <=
-/// kernel::stack::USER_THREAD_STACK_MAX_SIZE`); retorno = identificador da
+/// kernel::stack::USER_THREAD_STACK_MAX_SIZE`); `arg2` = argumento
+/// entregue à nova thread em `RDI` assim que ela começa a executar (`0`
+/// preserva o comportamento de antes da change `pthread-create-thread`,
+/// que estendeu esta syscall para aceitá-lo); retorno = identificador da
 /// nova thread (`ThreadId.0`), ou um código de erro. A nova thread
 /// compartilha o mesmo espaço de endereçamento do processo chamador.
 pub const SYSCALL_THREAD_CREATE: u64 = 23;
@@ -587,12 +590,15 @@ fn sys_close(handle: u64) -> u64 {
 
 /// Cria uma nova thread de usuário dentro do processo chamador,
 /// compartilhando seu espaço de endereçamento — cobre
-/// `SYSCALL_THREAD_CREATE`. `EFAULT` se `entry` não corresponder a uma
-/// página executável e acessível a partir do modo usuário já mapeada no
-/// processo chamador; `EINVAL` se `stack_size` for zero ou maior que
+/// `SYSCALL_THREAD_CREATE`. `arg` é entregue à nova thread em `RDI` assim
+/// que ela começa a executar (ver design.md da change
+/// `pthread-create-thread`) — `0` preserva o comportamento de antes dessa
+/// change. `EFAULT` se `entry` não corresponder a uma página executável e
+/// acessível a partir do modo usuário já mapeada no processo chamador;
+/// `EINVAL` se `stack_size` for zero ou maior que
 /// `kernel::stack::USER_THREAD_STACK_MAX_SIZE`. Ver design.md da change
 /// `kernel-user-thread-create`.
-fn sys_thread_create(entry: u64, stack_size: u64) -> u64 {
+fn sys_thread_create(entry: u64, stack_size: u64, arg: u64) -> u64 {
     if stack_size == 0 || stack_size > crate::stack::USER_THREAD_STACK_MAX_SIZE {
         return syscall_err(EINVAL);
     }
@@ -614,7 +620,7 @@ fn sys_thread_create(entry: u64, stack_size: u64) -> u64 {
     let caller = crate::scheduler::current_process_id();
 
     let mut frame_allocator = crate::phys::FRAME_ALLOCATOR.lock();
-    match crate::scheduler::spawn_user_thread_in_process(&mut frame_allocator, caller, entry, stack_base, aligned_stack_size) {
+    match crate::scheduler::spawn_user_thread_in_process(&mut frame_allocator, caller, entry, stack_base, aligned_stack_size, arg) {
         Some(Ok(thread_id)) => thread_id.0,
         // Falha de mapeamento (ex.: sem frames físicos livres) — nenhum dos
         // dois casos de `ProcessError` (`AddressSpace`/`Stack`) corresponde a
@@ -679,7 +685,7 @@ unsafe extern "C" fn dispatch(number: u64, arg0: u64, arg1: u64, arg2: u64, _arg
         SYSCALL_CLOSE => sys_close(arg0),
         SYSCALL_EXIT => sys_exit(),
         SYSCALL_MUTEX_TRYLOCK => sys_mutex_trylock(arg0),
-        SYSCALL_THREAD_CREATE => sys_thread_create(arg0, arg1),
+        SYSCALL_THREAD_CREATE => sys_thread_create(arg0, arg1, arg2),
         SYSCALL_GET_THREAD_ID => sys_get_thread_id(),
         _ => syscall_err(ENOSYS),
     }
@@ -808,6 +814,24 @@ mod tests {
         let oversized = crate::stack::USER_THREAD_STACK_MAX_SIZE + crate::paging::PAGE_SIZE;
         assert_eq!(unsafe { dispatch(SYSCALL_THREAD_CREATE, 0x1000, oversized, 0, 0) }, syscall_err(EINVAL));
     }
+
+    // O terceiro argumento de `SYSCALL_THREAD_CREATE` (`arg`, change
+    // `pthread-create-thread`) não é testado aqui além dos dois testes
+    // acima (que nem chegam a lê-lo, por curto-circuitarem antes) — o
+    // caminho que de fato usa `arg` (`sys_thread_create` →
+    // `spawn_user_thread_in_process` → `create_user_thread` → `init_stack`)
+    // passa por `validate_user_executable`/`Process::spawn_user_thread`,
+    // que tocam `CR3`/HHDM reais (mesma limitação já documentada em
+    // `kernel::paging`, "`translate_rejects_misaligned_address_without_touching_cr3`"
+    // — nenhum teste deste crate jamais exercita a caminhada real de
+    // tabelas em host). A entrega correta de `arg` no slot de `RDI` é
+    // verificada sem hardware em
+    // `kernel::process::tests::init_stack_writes_arg_at_the_rdi_slot_and_zeroes_the_other_fourteen`;
+    // o restante do encadeamento (`dispatch` → `sys_thread_create` →
+    // `spawn_user_thread_in_process` → `Process::spawn_user_thread` →
+    // `create_user_thread`) é só repasse mecânico do mesmo `u64`, sem
+    // nenhuma transformação — verificado fim a fim em boot real via
+    // `/bin/pthreadc.elf` (tarefa 4).
 
     #[test]
     fn get_ticks_dispatches_to_the_real_tick_counter() {

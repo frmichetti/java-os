@@ -337,9 +337,12 @@ O kernel SHALL fornecer uma chamada de sistema que termina a thread chamadora, r
 
 ### Requirement: Chamada de Criação de Thread
 O kernel SHALL fornecer uma chamada de sistema que cria uma nova thread de
-usuário dentro do processo chamador, a partir de um ponto de entrada e uma
-stack de usuário informados pelo chamador, devolvendo um identificador
-utilizável para essa thread.
+usuário dentro do processo chamador, a partir de um ponto de entrada, uma
+stack de usuário, e um argumento opcional informados pelo chamador,
+devolvendo um identificador utilizável para essa thread. O argumento
+informado SHALL ser entregue à nova thread, acessível a partir do seu
+ponto de entrada, sem exigir nenhum mecanismo adicional de comunicação
+entre a thread chamadora e a nova thread.
 
 #### Scenario: Criação bem-sucedida devolve um identificador de thread utilizável
 - **WHEN** um processo em modo usuário invoca a chamada de criação de thread
@@ -367,6 +370,21 @@ utilizável para essa thread.
   virtual livre disponível para stacks de thread
 - **THEN** o kernel devolve o código de erro `EINVAL`, sem criar nenhuma
   thread
+
+#### Scenario: Argumento informado é entregue à nova thread
+- **WHEN** um processo em modo usuário invoca a chamada de criação de
+  thread com um argumento diferente de zero
+- **THEN** a nova thread, ao começar a executar a partir do ponto de
+  entrada fornecido, SHALL ter esse mesmo argumento acessível a partir do
+  seu próprio ponto de entrada, sem precisar consultar nenhuma variável
+  compartilhada para obtê-lo
+
+#### Scenario: Ausência de argumento preserva o comportamento já existente
+- **WHEN** um processo em modo usuário invoca a chamada de criação de
+  thread sem informar nenhum argumento (equivalente a informar zero)
+- **THEN** o comportamento SHALL ser idêntico ao de antes desta capacidade
+  aceitar um argumento — a nova thread começa a executar normalmente a
+  partir do ponto de entrada fornecido
 
 ### Requirement: Chamada de Consulta da ThreadId Corrente
 O kernel SHALL fornecer uma chamada de sistema que devolve ao chamador o

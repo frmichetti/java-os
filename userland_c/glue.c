@@ -88,6 +88,7 @@ extern int errno;
 #define SYS_CLOSE 20
 #define SYS_EXIT 21
 #define SYS_MUTEX_TRYLOCK 22
+#define SYS_THREAD_CREATE 23
 #define SYS_GET_THREAD_ID 24
 
 /* kernel::syscall::syscall_err codifica um erro POSIX como `-errno`
@@ -645,4 +646,68 @@ void __retarget_lock_release_recursive(_LOCK_T lock) {
         lock->owner_tid = -1;
         javaos_syscall(SYS_MUTEX_UNLOCK, lock->mutex_handle, 0, 0, 0);
     }
+}
+
+/* pthread_create/pthread_exit reais sobre SYSCALL_THREAD_CREATE, estendida
+ * com um terceiro argumento (`arg`, entregue em RDI à nova thread — ver
+ * change `pthread-create-thread`, design.md). Toda thread criada aqui é
+ * sempre destacada (`PTHREAD_CREATE_DETACHED`) — nenhum `pthread_join` real
+ * existe neste porte (Non-Goal documentado em design.md): o valor de
+ * retorno de `start_routine` é descartado, e `attr->detachstate` é lido só
+ * por completude (mesmo subconjunto de atributo que `os::create_thread`
+ * real de `os_bsd.cpp` usa), sem alterar esse comportamento. */
+
+/* Tamanho de stack padrão quando `attr` é `NULL` ou não especifica
+ * `stacksize` — mesma ordem de grandeza já usada pelos programas de teste
+ * de thread-irmã existentes (`SIBLING_STACK_SIZE`). */
+#define PTHREAD_DEFAULT_STACK_SIZE (64UL * 1024)
+
+struct pthread_trampoline_args {
+    void *(*start_routine)(void *);
+    void *arg;
+};
+
+/* Primeira função que a nova thread executa — o kernel a "chama" com
+ * `args_ptr` já em `RDI` (`kernel::process::init_stack`, change
+ * `pthread-create-thread`), exatamente como se tivesse sido chamada
+ * normalmente pela convenção SysV: nenhum assembly extra é necessário para
+ * ler o argumento (achado real do design.md, "Correção sobre a suposição
+ * do proposal.md" — declarar um parâmetro comum já basta). */
+static void pthread_trampoline(void *args_ptr) {
+    struct pthread_trampoline_args *args = (struct pthread_trampoline_args *)args_ptr;
+    void *(*start_routine)(void *) = args->start_routine;
+    void *arg = args->arg;
+    free(args);
+    start_routine(arg);
+    pthread_exit(NULL);
+}
+
+int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine)(void *), void *arg) {
+    long stack_size = PTHREAD_DEFAULT_STACK_SIZE;
+    if (attr != NULL && attr->stacksize != 0) {
+        stack_size = (long)attr->stacksize;
+    }
+    (void)(attr != NULL ? attr->detachstate : PTHREAD_CREATE_DETACHED);
+
+    struct pthread_trampoline_args *args = malloc(sizeof(struct pthread_trampoline_args));
+    if (args == NULL) {
+        return EAGAIN;
+    }
+    args->start_routine = start_routine;
+    args->arg = arg;
+
+    long id = javaos_syscall(SYS_THREAD_CREATE, (long)pthread_trampoline, stack_size, (long)args, 0);
+    if (is_syscall_error(id)) {
+        free(args);
+        return (int)-id;
+    }
+    *thread = (pthread_t)id;
+    return 0;
+}
+
+void pthread_exit(void *value_ptr) {
+    (void)value_ptr; /* sem pthread_join real - valor de retorno nunca recebido (Non-Goal) */
+    javaos_syscall(SYS_EXIT, 0, 0, 0, 0);
+    for (;;) {
+    } /* nunca alcançado: SYSCALL_EXIT nunca retorna */
 }
